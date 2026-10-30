@@ -49,7 +49,8 @@ fn ctl_socket() -> Result<OwnedFd> {
 fn ioctl(fd: &OwnedFd, req: libc::c_ulong, arg: *mut libc::c_void, what: &str) -> Result<()> {
     // SAFETY: `arg` points at the struct `req` expects (ifreq / rtentry).
     if unsafe { libc::ioctl(fd.as_raw_fd(), req as _, arg) } < 0 {
-        bail!("{what}: {}", Error::last_os_error());
+        // Kept as an io::Error: the caller tells permission problems apart.
+        return Err(anyhow::Error::new(Error::last_os_error()).context(what.to_string()));
     }
     Ok(())
 }
@@ -60,7 +61,7 @@ pub fn create_tun(name: &CStr) -> Result<OwnedFd> {
     // SAFETY: plain syscall on a constant path; the fd is owned right away.
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
-        bail!("open /dev/net/tun: {}", Error::last_os_error());
+        return Err(anyhow::Error::new(Error::last_os_error()).context("open /dev/net/tun"));
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut r = ifreq(name);

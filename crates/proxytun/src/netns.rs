@@ -104,19 +104,16 @@ pub const SETUP_ARG: &str = "__proxytun_setup";
 pub struct Setup {
     pub argv: Vec<String>,
     pub fake_range: Ipv4Net,
-    /// File to bind-mount over /etc/resolv.conf.
-    pub resolv: PathBuf,
 }
 
 impl Setup {
-    /// `proxytun SETUP_ARG <ctl fd> <fake range> <resolv> -- argv...`
+    /// `proxytun SETUP_ARG <ctl fd> <fake range> -- argv...`
     fn to_args(&self, exe: &str, ctl: RawFd) -> Vec<String> {
         let mut a = vec![
             exe.to_string(),
             SETUP_ARG.to_string(),
             ctl.to_string(),
             self.fake_range.to_string(),
-            self.resolv.display().to_string(),
             "--".to_string(),
         ];
         a.extend(self.argv.iter().cloned());
@@ -124,7 +121,7 @@ impl Setup {
     }
 
     fn from_args(args: &[String]) -> Option<(Setup, RawFd)> {
-        let [_, mode, ctl, range, resolv, dashes, argv @ ..] = args else {
+        let [_, mode, ctl, range, dashes, argv @ ..] = args else {
             return None;
         };
         if mode != SETUP_ARG || dashes != "--" || argv.is_empty() {
@@ -133,7 +130,6 @@ impl Setup {
         let setup = Setup {
             argv: argv.to_vec(),
             fake_range: range.parse().ok()?,
-            resolv: PathBuf::from(resolv),
         };
         Some((setup, ctl.parse().ok()?))
     }
@@ -146,6 +142,10 @@ pub struct Child {
 }
 
 impl Child {
+    pub fn new(pid: libc::pid_t, ctl: OwnedFd) -> Child {
+        Child { pid, ctl }
+    }
+
     /// Let the program run: its packets are being served now.
     pub fn go(&self) -> Result<()> {
         // SAFETY: plain write of one byte on a socket we own.
@@ -156,7 +156,91 @@ impl Child {
     }
 }
 
-const OK: &[u8] = b"OK";
+/// Creating the namespace failed for lack of usable user namespaces (disabled,
+/// limited to 0, or stripped of capabilities by an LSM): sudo may help.
+#[derive(Debug)]
+pub struct UsernsUnusable(pub String);
+
+impl std::fmt::Display for UsernsUnusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "user namespaces are not usable here: {}", self.0)
+    }
+}
+
+impl std::error::Error for UsernsUnusable {}
+
+/// Read the setup's answer on `ctl`: the TUN device, the listener, and what
+/// followed "OK" (empty, or the sudo helper's report). `pid` is reaped on
+/// failure.
+pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<(String, OwnedFd, TcpListener)> {
+    let mut buf = vec![0u8; 4096];
+    let mut cmsg = nix::cmsg_space!([RawFd; 2]);
+    let (n, fds) = {
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        let msg = recvmsg::<()>(ctl.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)
+            .context("waiting for the namespace setup")?;
+        let mut fds = Vec::new();
+        for c in msg.cmsgs().context("reading passed fds")? {
+            if let ControlMessageOwned::ScmRights(r) = c {
+                // SAFETY: the kernel just installed these fds for us.
+                fds.extend(r.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+            }
+        }
+        (msg.bytes, fds)
+    };
+    let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+    match reply.strip_prefix("OK") {
+        Some(rest) if fds.len() == 2 => {
+            let mut fds = fds.into_iter();
+            let tun = fds.next().expect("two fds");
+            let listener = TcpListener::from(fds.next().expect("two fds"));
+            Ok((rest.trim_start().to_string(), tun, listener))
+        }
+        _ => {
+            if let Some(pid) = pid {
+                reap(pid);
+            }
+            if let Some(why) = reply.strip_prefix("ERR userns ") {
+                return Err(UsernsUnusable(why.to_string()).into());
+            }
+            match reply.strip_prefix("ERR ") {
+                Some(why) => bail!("{why}"),
+                None => bail!("namespace setup failed (the setup process exited)"),
+            }
+        }
+    }
+}
+
+/// Report a failed setup on `ctl` (the "ERR" answer `recv_setup` reads).
+pub fn send_error(ctl: &OwnedFd, e: &SetupError) {
+    let msg = format!("ERR {}{:#}", if e.userns { "userns " } else { "" }, e.err);
+    let _ = sendmsg::<()>(
+        ctl.as_raw_fd(),
+        &[IoSlice::new(msg.as_bytes())],
+        &[],
+        MsgFlags::empty(),
+        None,
+    );
+}
+
+/// Hand the TUN device and the listener over on `ctl`, with `report` after "OK".
+pub fn send_ok(ctl: &OwnedFd, tun: &OwnedFd, listener: &TcpListener, report: &str) -> Result<()> {
+    let msg = if report.is_empty() {
+        "OK".to_string()
+    } else {
+        format!("OK {report}")
+    };
+    let fds = [tun.as_raw_fd(), listener.as_raw_fd()];
+    sendmsg::<()>(
+        ctl.as_raw_fd(),
+        &[IoSlice::new(msg.as_bytes())],
+        &[ControlMessage::ScmRights(&fds)],
+        MsgFlags::empty(),
+        None,
+    )
+    .context("handing the namespace over")?;
+    Ok(())
+}
 
 /// Start the setup process for the program and wait for its namespace; the
 /// program itself waits for `Child::go` before exec. Returns it with the TUN
@@ -194,34 +278,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, OwnedFd, TcpListener)> {
         }
     }
     drop(theirs);
-
-    let mut buf = vec![0u8; 4096];
-    let mut cmsg = nix::cmsg_space!([RawFd; 2]);
-    let (n, fds) = {
-        let mut iov = [IoSliceMut::new(&mut buf)];
-        let msg = recvmsg::<()>(ours.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)
-            .context("waiting for the namespace setup")?;
-        let mut fds = Vec::new();
-        for c in msg.cmsgs().context("reading passed fds")? {
-            if let ControlMessageOwned::ScmRights(r) = c {
-                // SAFETY: the kernel just installed these fds for us.
-                fds.extend(r.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
-            }
-        }
-        (msg.bytes, fds)
-    };
-    let reply = &buf[..n];
-    if reply != OK || fds.len() != 2 {
-        reap(pid);
-        let why = String::from_utf8_lossy(reply.strip_prefix(b"ERR ").unwrap_or(reply));
-        if why.is_empty() {
-            bail!("namespace setup failed (the setup process exited)");
-        }
-        bail!("{why}");
-    }
-    let mut fds = fds.into_iter();
-    let tun = fds.next().expect("two fds");
-    let listener = TcpListener::from(fds.next().expect("two fds"));
+    let (_, tun, listener) = recv_setup(&ours, Some(pid))?;
     Ok((Child { pid, ctl: ours }, tun, listener))
 }
 
@@ -242,44 +299,72 @@ pub fn setup_main(args: &[String]) -> ! {
     let ctl = unsafe { OwnedFd::from_raw_fd(ctl) };
     // SAFETY: plain fcntl; the program must not inherit the socket.
     unsafe { libc::fcntl(ctl.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
-    let (tun, listener) = match setup_namespace(&s) {
+    // Run as root (proxytun started by root): the program stays root, so no
+    // user namespace, which would confine its capabilities to the namespace.
+    let userns = !nix::unistd::geteuid().is_root();
+    let (tun, listener) = match setup_namespace(s.fake_range, userns) {
         Ok(v) => v,
         Err(e) => {
-            let msg = format!("ERR {e:#}");
-            let _ = sendmsg::<()>(
-                ctl.as_raw_fd(),
-                &[IoSlice::new(msg.as_bytes())],
-                &[],
-                MsgFlags::empty(),
-                None,
-            );
+            send_error(&ctl, &e);
             std::process::exit(126);
         }
     };
-    let fds = [tun.as_raw_fd(), listener.as_raw_fd()];
-    if sendmsg::<()>(
-        ctl.as_raw_fd(),
-        &[IoSlice::new(OK)],
-        &[ControlMessage::ScmRights(&fds)],
-        MsgFlags::empty(),
-        None,
-    )
-    .is_err()
-    {
+    if send_ok(&ctl, &tun, &listener, "").is_err() {
         std::process::exit(126);
     }
     drop((tun, listener));
-    // Wait for proxytun to serve the TUN device; EOF means it went away.
+    wait_go(&ctl);
+    drop(ctl);
+    std::process::exit(exec(&s.argv))
+}
+
+/// Block until proxytun serves the TUN device; exit if it went away instead.
+pub fn wait_go(ctl: &OwnedFd) {
     let mut go = [0u8; 1];
     // SAFETY: plain read into a local buffer.
     if unsafe { libc::read(ctl.as_raw_fd(), go.as_mut_ptr() as *mut _, 1) } != 1 {
         std::process::exit(125);
     }
-    drop(ctl);
-    std::process::exit(exec(&s.argv))
 }
 
-fn setup_namespace(s: &Setup) -> Result<(OwnedFd, TcpListener)> {
+/// A failed namespace setup; `userns` = the failure is a lack of usable user
+/// namespaces, which sudo may get around.
+pub struct SetupError {
+    pub userns: bool,
+    pub err: anyhow::Error,
+}
+
+/// EPERM / EACCES anywhere in the chain: a missing capability.
+fn is_permission(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let code = c
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.raw_os_error())
+            .or_else(|| c.downcast_ref::<nix::errno::Errno>().map(|e| *e as i32));
+        matches!(code, Some(libc::EPERM | libc::EACCES))
+    })
+}
+
+/// Create the namespace (in this process) with the TUN device and the
+/// listener. With `userns`, inside a new user namespace mapping our uid/gid
+/// to themselves (needs no privilege); without, as root.
+pub fn setup_namespace(range: Ipv4Net, userns: bool) -> std::result::Result<(OwnedFd, TcpListener), SetupError> {
+    if userns {
+        enter_user_namespace().map_err(|err| SetupError { userns: true, err })?;
+    } else {
+        unshare(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS)
+            .context("create network and mount namespaces")
+            .map_err(|err| SetupError { userns: false, err })?;
+    }
+    // A user namespace whose capabilities an LSM withholds (Ubuntu's AppArmor
+    // restriction) fails here instead, with EPERM.
+    configure(range).map_err(|err| SetupError {
+        userns: userns && is_permission(&err),
+        err,
+    })
+}
+
+fn enter_user_namespace() -> Result<()> {
     let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS)
         .map_err(|e| anyhow!("cannot create a user namespace: {e}"))?;
@@ -291,9 +376,12 @@ fn setup_namespace(s: &Setup) -> Result<(OwnedFd, TcpListener)> {
     }
     std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).context("write /proc/self/uid_map")?;
     std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).context("write /proc/self/gid_map")?;
-    private_resolv_conf(&s.resolv)?;
-    let addrs = Addrs::new(s.fake_range);
+    Ok(())
+}
 
+fn configure(range: Ipv4Net) -> Result<(OwnedFd, TcpListener)> {
+    let addrs = Addrs::new(range);
+    private_resolv_conf(addrs.dns)?;
     netcfg::link_up(c"lo").context("bring lo up")?;
     let tun = netcfg::create_tun(TUN_NAME)?;
     netcfg::set_addr(TUN_NAME, addrs.tun, Addrs::PREFIX, MTU).context("configure tun0")?;
@@ -303,10 +391,17 @@ fn setup_namespace(s: &Setup) -> Result<(OwnedFd, TcpListener)> {
     Ok((tun, listener))
 }
 
-/// Bind-mount `src` over /etc/resolv.conf in our own mount namespace. Mount
-/// events must not propagate back to the host, hence MS_PRIVATE first.
-fn private_resolv_conf(src: &Path) -> Result<()> {
+/// Point /etc/resolv.conf at `dns` in our own mount namespace. The file is
+/// written here, by whoever sets up the namespace (root, for sudo), never
+/// taken from a path someone else chose. Mount events must not propagate
+/// back to the host, hence MS_PRIVATE first.
+fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
     use nix::mount::{mount, MsFlags};
+    let host = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let dir = TempDir::new()?;
+    let file = dir.path().join("resolv.conf");
+    std::fs::write(&file, resolv_conf(&host, dns)).context("write resolv.conf")?;
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
     mount(
         None::<&str>,
         "/",
@@ -316,8 +411,9 @@ fn private_resolv_conf(src: &Path) -> Result<()> {
     )
     .context("make mounts private")?;
     // The target may be a symlink (systemd-resolved, WSL): mount follows it.
+    // The mount keeps the file alive after `dir` is removed.
     mount(
-        Some(src),
+        Some(&file),
         "/etc/resolv.conf",
         None::<&str>,
         MsFlags::MS_BIND,
@@ -331,7 +427,7 @@ fn private_resolv_conf(src: &Path) -> Result<()> {
 /// exec; proxytun blocked some signals for its signalfd. Signals the caller
 /// ignored (nohup, `cmd &`) stay ignored by themselves: dispositions survive
 /// both execs and proxytun installs its own handlers only after the fork.
-fn exec(argv: &[String]) -> i32 {
+pub fn exec(argv: &[String]) -> i32 {
     let argv: Vec<CString> = match argv.iter().map(|a| CString::new(a.as_str())).collect() {
         Ok(v) => v,
         Err(_) => return 127, // checked by proxytun before we got here
@@ -378,14 +474,12 @@ mod tests {
         let s = Setup {
             argv: vec!["curl".into(), "--".into(), "-x".into(), "a b".into()],
             fake_range: "198.18.0.0/15".parse().unwrap(),
-            resolv: "/tmp/proxytun-x/resolv.conf".into(),
         };
         let args = s.to_args("proxytun", 7);
         assert_eq!(Setup::from_args(&args), Some((s, 7)));
         let none = Setup {
             argv: vec!["true".into()],
             fake_range: "10.0.0.0/8".parse().unwrap(),
-            resolv: "/r".into(),
         };
         assert_eq!(Setup::from_args(&none.to_args("p", 3)), Some((none, 3)));
         assert_eq!(Setup::from_args(&["p".into(), SETUP_ARG.into()]), None, "truncated");

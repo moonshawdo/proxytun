@@ -298,6 +298,12 @@ fn write_cfg(dir: &Path, proxy: SocketAddr, top: &str, rules: &str) -> PathBuf {
 fn run(cfg: &Path, extra: &[&str], argv: &[&str], env: &[(&str, &str)]) -> Out {
     let mut cmd = Command::new(BIN);
     cmd.arg("-c").arg(cfg).args(extra).arg("--").args(argv);
+    run_cmd(cmd, env)
+}
+
+/// Run `cmd` (proxytun, or something that starts it) with a clean proxy
+/// environment plus `env`, and capture everything.
+fn run_cmd(mut cmd: Command, env: &[(&str, &str)]) -> Out {
     for k in [
         "http_proxy",
         "https_proxy",
@@ -1643,4 +1649,279 @@ fn gdb_attaches_from_outside_to_a_running_program() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
     assert!(text.contains(&format!("process {pid}")), "{text}");
+}
+
+// ------------------------------------------------ sudo mode (CentOS 7) --
+
+/// A stand-in for sudo. Installed setuid in a user namespace where we are
+/// root, it really makes its caller root there. Like sudo it resets the
+/// environment, closes inherited fds and records the caller in SUDO_UID.
+const C_FAKE_SUDO: &str = r#"
+#define _GNU_SOURCE
+#include <grp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (getenv("FAKE_SUDO_FAIL")) { fprintf(stderr, "fake sudo: authentication failure\n"); return 1; }
+    int new_pgrp = getenv("FAKE_SUDO_NEW_PGRP") != NULL, new_session = getenv("FAKE_SUDO_SETSID") != NULL;
+    int to_root = getenv("FAKE_SUDO_CHDIR") != NULL;
+    char uid[32], gid[32];
+    const char *forced = getenv("FAKE_SUDO_UID");
+    if (forced) snprintf(uid, sizeof uid, "%s", forced); else snprintf(uid, sizeof uid, "%u", getuid());
+    snprintf(gid, sizeof gid, "%u", getgid());
+    if (argc < 3 || strcmp(argv[1], "--") != 0) { fprintf(stderr, "fake sudo: usage: sudo -- cmd\n"); return 1; }
+    clearenv();
+    setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1);
+    setenv("HOME", "/root", 1);
+    setenv("SUDO_UID", uid, 1);
+    setenv("SUDO_GID", gid, 1);
+    for (int fd = 3; fd < 1024; fd++) close(fd);
+    /* Like sudo variants that give the command a group, or (use_pty) a whole
+       session, of its own. */
+    if (new_pgrp) setpgid(0, 0);
+    if (new_session) setsid();
+    /* Like sudo with `runcwd` in sudoers, or -D. */
+    if (to_root && chdir("/") != 0) return 1;
+    if (setgroups(0, NULL) || setresgid(0, 0, 0) || setresuid(0, 0, 0)) { perror("fake sudo"); return 1; }
+    execv(argv[2], argv + 2);
+    perror("fake sudo: exec");
+    return 127;
+}
+"#;
+
+/// A directory holding the fake `sudo`, built once.
+fn fake_sudo_dir() -> Option<PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tmp_dir("fake-sudo");
+        let src = dir.join("sudo.c");
+        std::fs::write(&src, C_FAKE_SUDO).unwrap();
+        let bin = dir.join("sudo");
+        let ok = Command::new("cc")
+            .arg("-o")
+            .arg(&bin)
+            .arg(&src)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return None;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        // Everything inside the namespace runs as uids we do not own: let
+        // them into our per-test directories.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Some(dir)
+    })
+    .clone()
+}
+
+/// Can we build a CentOS-7-like world: a user namespace with subordinate
+/// uids where nested user namespaces are forbidden?
+fn centos7_simulation_works() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let ok = have("cc")
+            && have("setpriv")
+            && Command::new("unshare")
+                .args(["--user", "--map-auto", "--map-root-user", "--", "true"])
+                .status()
+                .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!(
+                "SKIP: cannot simulate a host without user namespaces (needs cc, setpriv, newuidmap and /etc/subuid)"
+            );
+        }
+        ok
+    })
+}
+
+macro_rules! require_centos7 {
+    ($($tool:expr),*) => {{
+        require!($($tool),*);
+        if !centos7_simulation_works() { return; }
+    }};
+}
+
+/// Run proxytun like on CentOS 7: in a user namespace where nested user
+/// namespaces are forbidden (max_user_namespaces = 0), as uid 1000 with
+/// groups 1000 and 1001 (`as_user`) or as root, with our fake sudo on PATH.
+fn run_like_centos7(cfg: &Path, extra: &[&str], argv: &[&str], as_user: bool, env: &[(&str, &str)]) -> Out {
+    let sudo_dir = fake_sudo_dir().expect("fake sudo builds");
+    let mut cmd = Command::new("unshare");
+    cmd.args(["--user", "--map-auto", "--map-root-user", "--", "sh", "-c"]);
+    let drop = if as_user {
+        "setpriv --reuid=1000 --regid=1000 --groups=1000,1001 --"
+    } else {
+        ""
+    };
+    cmd.arg(format!(
+        "echo 0 > /proc/sys/user/max_user_namespaces && PATH=\"$0:$PATH\" exec {drop} \"$@\""
+    ));
+    cmd.arg(&sudo_dir)
+        .arg(BIN)
+        .arg("-c")
+        .arg(cfg)
+        .args(extra)
+        .arg("--")
+        .args(argv);
+    run_cmd(cmd, env)
+}
+
+/// A test directory that uids other than ours (inside the namespace) can use.
+fn shared_dir(name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp_dir(name);
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+    d
+}
+
+#[test]
+fn without_user_namespaces_sudo_sets_up_and_the_program_runs_as_the_user() {
+    require_centos7!("curl");
+    let origin = start_origin();
+    let mock = start_mock_proxy(origin);
+    let dir = shared_dir("sudo-ok");
+    let cfg = write_cfg(&dir, mock.addr, "sniff = false", "");
+    let script = "id -u; id -G; grep -E '^Cap(Eff|Prm)' /proc/self/status; grep nameserver /etc/resolv.conf; \
+                  sleep 0.3; echo parent=$(cat /proc/$(cut -d' ' -f4 /proc/$$/stat)/comm); \
+                  curl -sS --max-time 20 http://sudo.test/";
+    let out = run_like_centos7(&cfg, &[], &["sh", "-c", script], true, &[]);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(out.code, 0, "{}", out.dump());
+    assert!(out.stderr.contains("asking sudo"), "{}", out.dump());
+    assert_eq!(lines[0], "1000", "the user's uid, not root's\n{}", out.dump());
+    assert_eq!(lines[1], "1000 1001", "the user's own groups\n{}", out.dump());
+    assert_eq!(lines[2], "CapPrm:\t0000000000000000", "{}", out.dump());
+    assert_eq!(lines[3], "CapEff:\t0000000000000000", "{}", out.dump());
+    assert_eq!(lines[4], "nameserver 198.19.255.53", "{}", out.dump());
+    assert_eq!(lines[5], "parent=proxytun", "the root helper is gone\n{}", out.dump());
+    assert!(out.stdout.ends_with(BODY), "{}", out.dump());
+    assert_eq!(mock.hosts(), ["sudo.test"]);
+}
+
+#[test]
+fn the_users_environment_and_directory_survive_sudo() {
+    require_centos7!();
+    let dir = shared_dir("sudo-env");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let mut cmd = Command::new("unshare");
+    let sudo_dir = fake_sudo_dir().unwrap();
+    // Start from the test directory with a variable sudo would reset.
+    cmd.current_dir(&dir);
+    cmd.args(["--user", "--map-auto", "--map-root-user", "--", "sh", "-c"]);
+    cmd.arg("echo 0 > /proc/sys/user/max_user_namespaces && PATH=\"$0:$PATH\" exec setpriv --reuid=1000 --regid=1000 --groups=1000 -- \"$@\"");
+    cmd.arg(&sudo_dir)
+        .arg(BIN)
+        .arg("-c")
+        .arg(&cfg)
+        .args(["--", "sh", "-c", "echo $MARK; pwd; echo $HOME"]);
+    // FAKE_SUDO_CHDIR: a sudo that changes directory (runcwd, -D) must not
+    // move the program.
+    let out = run_cmd(
+        cmd,
+        &[("MARK", "kept"), ("HOME", "/home/someone"), ("FAKE_SUDO_CHDIR", "1")],
+    );
+    assert_eq!(out.code, 0, "{}", out.dump());
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(
+        lines,
+        ["kept", dir.to_str().unwrap(), "/home/someone"],
+        "{}",
+        out.dump()
+    );
+}
+
+#[test]
+fn no_sudo_refuses_when_user_namespaces_are_unusable() {
+    require_centos7!();
+    let dir = shared_dir("no-sudo");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let marker = dir.join("ran");
+    let touch = format!("touch {}", marker.display());
+    let out = run_like_centos7(&cfg, &["--no-sudo"], &["sh", "-c", &touch], true, &[]);
+    assert_ne!(out.code, 0, "{}", out.dump());
+    assert!(out.stderr.contains("user namespaces are not usable"), "{}", out.dump());
+    assert!(out.stderr.contains("--no-sudo"), "{}", out.dump());
+    assert!(!marker.exists(), "the program must not run");
+}
+
+#[test]
+fn a_failed_sudo_is_reported_and_nothing_runs() {
+    require_centos7!();
+    let dir = shared_dir("sudo-fail");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let marker = dir.join("ran");
+    let touch = format!("touch {}", marker.display());
+    let out = run_like_centos7(&cfg, &[], &["sh", "-c", &touch], true, &[("FAKE_SUDO_FAIL", "1")]);
+    assert_ne!(out.code, 0, "{}", out.dump());
+    assert!(out.stderr.contains("sudo failed"), "{}", out.dump());
+    assert!(!marker.exists(), "the program must not run");
+}
+
+#[test]
+fn the_helper_serves_only_the_user_sudo_was_run_by() {
+    require_centos7!();
+    let dir = shared_dir("sudo-wrong-uid");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let marker = dir.join("ran");
+    let touch = format!("touch {}", marker.display());
+    // sudo claims another caller than the owner of proxytun's socket.
+    let out = run_like_centos7(&cfg, &[], &["sh", "-c", &touch], true, &[("FAKE_SUDO_UID", "1234")]);
+    assert_ne!(out.code, 0, "{}", out.dump());
+    assert!(out.stderr.contains("sudo was run by uid 1234"), "{}", out.dump());
+    assert!(!marker.exists(), "the program must not run");
+}
+
+#[test]
+fn root_gets_a_namespace_without_sudo_and_stays_root() {
+    require_centos7!("curl");
+    let origin = start_origin();
+    let mock = start_mock_proxy(origin);
+    let dir = shared_dir("root");
+    let cfg = write_cfg(&dir, mock.addr, "sniff = false", "");
+    let script = "id -u; grep '^CapEff' /proc/self/status; curl -sS --max-time 20 http://root.test/";
+    let out = run_like_centos7(&cfg, &[], &["sh", "-c", script], false, &[]);
+    assert_eq!(out.code, 0, "{}", out.dump());
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines[0], "0", "{}", out.dump());
+    assert_ne!(
+        lines[1],
+        "CapEff:\t0000000000000000",
+        "root keeps its capabilities\n{}",
+        out.dump()
+    );
+    assert!(!out.stderr.contains("sudo"), "{}", out.dump());
+    assert!(out.stdout.ends_with(BODY), "{}", out.dump());
+    assert_eq!(mock.hosts(), ["root.test"]);
+}
+
+#[test]
+fn the_program_joins_proxytuns_process_group_whatever_sudo_does() {
+    require_centos7!();
+    let dir = shared_dir("sudo-pgrp");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // The program's group, and its parent's (proxytun, once the helper is gone).
+    let script = "sleep 0.3; P=$(cut -d' ' -f4 /proc/$$/stat); \
+                  echo $(cut -d' ' -f5 /proc/$$/stat) $(cut -d' ' -f5 /proc/$P/stat)";
+    // sudo putting its command into a group of its own: the program still
+    // joins ours, so terminal and group signals reach it.
+    let out = run_like_centos7(&cfg, &[], &["sh", "-c", script], true, &[("FAKE_SUDO_NEW_PGRP", "1")]);
+    assert_eq!(out.code, 0, "{}", out.dump());
+    let groups: Vec<&str> = out.stdout.split_whitespace().collect();
+    assert_eq!(groups.len(), 2, "{}", out.dump());
+    assert_eq!(
+        groups[0],
+        groups[1],
+        "program and proxytun share a process group\n{}",
+        out.dump()
+    );
+    assert!(!out.stderr.contains("session of its own"), "{}", out.dump());
+
+    // A session of its own (sudo's use_pty) cannot be undone: say so.
+    let out = run_like_centos7(&cfg, &[], &["true"], true, &[("FAKE_SUDO_SETSID", "1")]);
+    assert_eq!(out.code, 0, "{}", out.dump());
+    assert!(out.stderr.contains("session of its own"), "{}", out.dump());
 }

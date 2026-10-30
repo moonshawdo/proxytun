@@ -9,6 +9,7 @@ mod nat;
 mod netcfg;
 mod netns;
 mod packet;
+mod sudo;
 mod witness;
 
 use anyhow::{Context, Result};
@@ -58,6 +59,10 @@ struct Cli {
     /// http://[user:pass@]host:port). Also read from $PROXYTUN_PROXY.
     #[arg(long, value_name = "URL")]
     proxy: Option<String>,
+
+    /// Never fall back to sudo: fail if user namespaces are not usable.
+    #[arg(long)]
+    no_sudo: bool,
 
     /// Log errors only (same as --log-level error).
     #[arg(short, long, conflicts_with_all = ["verbose", "log_level"])]
@@ -134,9 +139,12 @@ fn init_logging(filter: &str, file: Option<&Path>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    if std::env::args_os().nth(1).is_some_and(|a| a == netns::SETUP_ARG) {
+    match std::env::args_os().nth(1) {
         // We are the process that sets up the namespace and becomes the program.
-        netns::setup_main(&std::env::args().collect::<Vec<_>>());
+        Some(a) if a == netns::SETUP_ARG => netns::setup_main(&std::env::args().collect::<Vec<_>>()),
+        // We are the root helper, run through sudo.
+        Some(a) if a == sudo::HELPER_ARG => sudo::helper_main(&std::env::args().collect::<Vec<_>>()),
+        _ => {}
     }
     let cli = Cli::parse();
     init_logging(
@@ -148,6 +156,7 @@ fn main() -> Result<()> {
     let code = app::run(Args {
         config: cli.config,
         proxy: cli.proxy,
+        no_sudo: cli.no_sudo,
         argv: cli.argv,
     })
     // Returning the error prints it to stderr; a log file needs its own copy.

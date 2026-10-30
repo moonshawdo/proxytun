@@ -6,7 +6,8 @@
 
 use crate::capture::{self, Shared, Stats};
 use crate::nat::Nat;
-use crate::netns::{self, Addrs, Setup, TempDir};
+use crate::netns::{self, Addrs, Setup, UsernsUnusable};
+use crate::sudo;
 use crate::witness::{self, Witness};
 use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
@@ -16,7 +17,6 @@ use proxytun_core::net::fakeip::FakePool;
 use proxytun_core::net::relay::build_live;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 pub struct Args {
     pub config: PathBuf,
     pub proxy: Option<String>,
+    pub no_sudo: bool,
     pub argv: Vec<String>,
 }
 
@@ -119,23 +120,30 @@ pub fn run(args: Args) -> Result<i32> {
     let upstream_dns = cfg.upstream_dns_addr()?;
     let live = Arc::new(build_live(&cfg)?);
 
-    // The program's resolv.conf. Once bind-mounted in the namespace the host
-    // copy is not needed: the mount keeps the file alive.
-    let tmp = TempDir::new()?;
-    let resolv = tmp.path().join("resolv.conf");
-    let host_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    std::fs::write(&resolv, netns::resolv_conf(&host_resolv, addrs.dns)).context("write resolv.conf")?;
-    std::fs::set_permissions(&resolv, std::fs::Permissions::from_mode(0o644))?;
-
     // Orphans of the program's tree are re-parented to us, so we can wait for
     // all of it (as proxyhook does).
     unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    let (child, tun, listener) = netns::spawn(&Setup {
+    let setup = Setup {
         argv: args.argv.clone(),
         fake_range: fake_net,
-        resolv: resolv.clone(),
-    })?;
-    drop(tmp);
+    };
+    let (child, tun, listener) = match netns::spawn(&setup) {
+        Err(e) if e.is::<UsernsUnusable>() => {
+            if args.no_sudo {
+                return Err(e.context("--no-sudo forbids falling back to sudo"));
+            }
+            tracing::warn!("{e}; asking sudo to create the namespace (--no-sudo refuses)");
+            let (child, tun, listener, joined) = sudo::spawn(&setup)?;
+            if !joined {
+                tracing::warn!(
+                    "sudo started the program in a terminal session of its own (sudoers `use_pty`?): \
+                     Ctrl+C on this terminal will not reach it"
+                );
+            }
+            (child, tun, listener)
+        }
+        r => r?,
+    };
     let main_pid = Arc::new(AtomicI32::new(child.pid));
     let SocketAddr::V4(listen) = listener.local_addr()? else {
         anyhow::bail!("the capture listener is not IPv4");
