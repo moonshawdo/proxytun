@@ -7,6 +7,7 @@
 use crate::capture::{self, Shared, Stats};
 use crate::nat::Nat;
 use crate::netns::{self, Addrs, Setup, TempDir};
+use crate::witness::{self, Witness};
 use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use proxytun_core::config::{url_has_credentials, Config};
@@ -94,6 +95,16 @@ pub fn run(args: Args) -> Result<i32> {
         .filter(|s| !ignored.contains(s))
         .collect();
     let exit_fd = exit_signal_fd(&exit_sigs);
+    // Still single-threaded, signals blocked, not yet a subreaper: see witness.rs.
+    let witness = match exit_fd {
+        Some(_) => Witness::start(&exit_sigs)
+            .inspect_err(|e| {
+                tracing::warn!("{e:#}; a signal sent to the whole process group may reach the program twice")
+            })
+            .ok()
+            .map(Arc::new),
+        None => None,
+    };
     let cfg = load_config(&args.config, proxy_override.as_deref()).context("load config")?;
     // A load from a missing file only succeeds through the --proxy fallback.
     if args.config.exists() {
@@ -123,7 +134,6 @@ pub fn run(args: Args) -> Result<i32> {
         argv: args.argv.clone(),
         fake_range: fake_net,
         resolv: resolv.clone(),
-        ignored: ignored.clone(),
     })?;
     drop(tmp);
     let main_pid = Arc::new(AtomicI32::new(child.pid));
@@ -168,7 +178,7 @@ pub fn run(args: Args) -> Result<i32> {
             *health_task.lock().unwrap() = Some(health::spawn(live.registry.nodes.clone(), health_cfg));
             spawn_signal_handlers(sh, cfg_path, proxy_override, health_task);
             if let Some(fd) = exit_fd {
-                spawn_exit_signal_task(fd, main_pid);
+                spawn_exit_signal_task(fd, main_pid, witness);
             }
             Ok::<_, anyhow::Error>(())
         })?;
@@ -253,7 +263,7 @@ enum ExitSignal {
     Exit(i32),
     /// The program got it too; nothing to do.
     Leave,
-    /// Pass it on to the program.
+    /// Pass it on to the program unless it got it too (see `already_delivered`).
     Forward,
 }
 
@@ -271,10 +281,23 @@ fn on_exit_signal(sig: libc::c_int, code: i32, program_running: bool, terms: u32
     if code == libc::SI_KERNEL {
         return ExitSignal::Leave;
     }
+    // From a process: `kill <proxytun>`, or `kill -- -<group>` / `kill %1` /
+    // systemd, which look the same from here.
     ExitSignal::Forward
 }
 
-fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>) {
+/// Did a signal from a process reach the program as well as us? It did if
+/// it was sent to our whole group (the witness has it) and the program is
+/// still in that group.
+fn already_delivered(witness_saw: bool, program_pgrp: Option<libc::pid_t>, our_pgrp: libc::pid_t) -> bool {
+    witness_saw && program_pgrp == Some(our_pgrp)
+}
+
+/// How long to wait before asking the witness: a group-wide signal is
+/// delivered to the members one after another, and we may run first.
+const WITNESS_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option<Arc<Witness>>) {
     tokio::spawn(async move {
         // SAFETY: an OwnedFd stays open and is the same fd for as long as the
         // AsyncFd owns it.
@@ -298,16 +321,25 @@ fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>) {
                 terms += 1;
             }
             let pid = main_pid.load(Ordering::SeqCst);
-            match on_exit_signal(sig, info.ssi_code, pid > 0, terms) {
-                ExitSignal::Exit(code) => {
-                    tracing::info!(sig, code, "exiting on a signal");
-                    std::process::exit(code)
-                }
-                ExitSignal::Leave => {}
-                ExitSignal::Forward => unsafe {
-                    libc::kill(pid, sig);
-                },
+            let action = on_exit_signal(sig, info.ssi_code, pid > 0, terms);
+            if let ExitSignal::Exit(code) = action {
+                tracing::info!(sig, code, "exiting on a signal");
+                std::process::exit(code)
             }
+            let witness = witness.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(WITNESS_DELAY).await;
+                let saw = witness.as_ref().is_some_and(|w| w.saw(sig));
+                // SAFETY: plain syscall.
+                let ours = unsafe { libc::getpgrp() };
+                if action == ExitSignal::Forward && !already_delivered(saw, witness::pgrp_of(pid), ours) {
+                    tracing::debug!(sig, pid, "forwarding the signal to the program");
+                    unsafe { libc::kill(pid, sig) };
+                }
+                if let Some(w) = witness {
+                    w.clear();
+                }
+            });
         }
     });
 }
@@ -378,5 +410,18 @@ mod tests {
             ExitSignal::Forward,
             "only SIGTERM counts"
         );
+    }
+
+    #[test]
+    fn a_signal_is_only_held_back_when_the_program_shares_our_group() {
+        // Sent to the group, and the program is in it: it has its own copy.
+        assert!(already_delivered(true, Some(7), 7));
+        // Sent to proxytun alone.
+        assert!(!already_delivered(false, Some(7), 7));
+        // Sent to our group, but the program moved to its own (setsid, a
+        // shell's job control): the group signal never reached it.
+        assert!(!already_delivered(true, Some(9), 7));
+        // Program already gone: nothing to hold back for.
+        assert!(!already_delivered(true, None, 7));
     }
 }

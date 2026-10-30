@@ -106,22 +106,17 @@ pub struct Setup {
     pub fake_range: Ipv4Net,
     /// File to bind-mount over /etc/resolv.conf.
     pub resolv: PathBuf,
-    /// Signals the program starts with ignored (they were ignored when we
-    /// started).
-    pub ignored: Vec<libc::c_int>,
 }
 
 impl Setup {
-    /// `proxytun SETUP_ARG <ctl fd> <fake range> <resolv> <ignored,...> -- argv...`
+    /// `proxytun SETUP_ARG <ctl fd> <fake range> <resolv> -- argv...`
     fn to_args(&self, exe: &str, ctl: RawFd) -> Vec<String> {
-        let ignored: Vec<String> = self.ignored.iter().map(|s| s.to_string()).collect();
         let mut a = vec![
             exe.to_string(),
             SETUP_ARG.to_string(),
             ctl.to_string(),
             self.fake_range.to_string(),
             self.resolv.display().to_string(),
-            ignored.join(","),
             "--".to_string(),
         ];
         a.extend(self.argv.iter().cloned());
@@ -129,22 +124,16 @@ impl Setup {
     }
 
     fn from_args(args: &[String]) -> Option<(Setup, RawFd)> {
-        let [_, mode, ctl, range, resolv, ignored, dashes, argv @ ..] = args else {
+        let [_, mode, ctl, range, resolv, dashes, argv @ ..] = args else {
             return None;
         };
         if mode != SETUP_ARG || dashes != "--" || argv.is_empty() {
             return None;
         }
-        let ignored = if ignored.is_empty() {
-            Vec::new()
-        } else {
-            ignored.split(',').map(|s| s.parse().ok()).collect::<Option<_>>()?
-        };
         let setup = Setup {
             argv: argv.to_vec(),
             fake_range: range.parse().ok()?,
             resolv: PathBuf::from(resolv),
-            ignored,
         };
         Some((setup, ctl.parse().ok()?))
     }
@@ -287,7 +276,7 @@ pub fn setup_main(args: &[String]) -> ! {
         std::process::exit(125);
     }
     drop(ctl);
-    std::process::exit(exec(&s.argv, &s.ignored))
+    std::process::exit(exec(&s.argv))
 }
 
 fn setup_namespace(s: &Setup) -> Result<(OwnedFd, TcpListener)> {
@@ -339,8 +328,10 @@ fn private_resolv_conf(src: &Path) -> Result<()> {
 
 /// Become the program. Undo what our runtime changed, as std::process::Command
 /// does: Rust ignores SIGPIPE at startup and an ignored disposition survives
-/// exec; proxytun blocked some signals for its signalfd.
-fn exec(argv: &[String], ignored: &[libc::c_int]) -> i32 {
+/// exec; proxytun blocked some signals for its signalfd. Signals the caller
+/// ignored (nohup, `cmd &`) stay ignored by themselves: dispositions survive
+/// both execs and proxytun installs its own handlers only after the fork.
+fn exec(argv: &[String]) -> i32 {
     let argv: Vec<CString> = match argv.iter().map(|a| CString::new(a.as_str())).collect() {
         Ok(v) => v,
         Err(_) => return 127, // checked by proxytun before we got here
@@ -350,9 +341,6 @@ fn exec(argv: &[String], ignored: &[libc::c_int]) -> i32 {
     // SAFETY: plain syscalls on prepared, NUL-terminated buffers.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-        for &sig in ignored {
-            libc::signal(sig, libc::SIG_IGN);
-        }
         let mut empty: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut empty);
         libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
@@ -391,7 +379,6 @@ mod tests {
             argv: vec!["curl".into(), "--".into(), "-x".into(), "a b".into()],
             fake_range: "198.18.0.0/15".parse().unwrap(),
             resolv: "/tmp/proxytun-x/resolv.conf".into(),
-            ignored: vec![libc::SIGHUP, libc::SIGINT],
         };
         let args = s.to_args("proxytun", 7);
         assert_eq!(Setup::from_args(&args), Some((s, 7)));
@@ -399,7 +386,6 @@ mod tests {
             argv: vec!["true".into()],
             fake_range: "10.0.0.0/8".parse().unwrap(),
             resolv: "/r".into(),
-            ignored: vec![],
         };
         assert_eq!(Setup::from_args(&none.to_args("p", 3)), Some((none, 3)));
         assert_eq!(Setup::from_args(&["p".into(), SETUP_ARG.into()]), None, "truncated");

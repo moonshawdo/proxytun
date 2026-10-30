@@ -87,6 +87,13 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 
 - 与 proxyhook 一致:proxytun 是 subreaper,等整棵进程树结束才退出;退出码透传(信号终止为 128+信号);
   Ctrl+C 交给程序;只发给 proxytun 的 TERM/INT/QUIT 转发给程序,发给整个进程组的不重复;SIGHUP 热加载;SIGUSR1 打印统计。
+- **"发给整个进程组的不重复"怎么做到**(M2 实现时确定):proxyhook 靠 ptrace 看见程序收到信号;proxytun 没有 ptrace,
+  而 `kill <pid>` 与 `kill -- -<pgid>`/`kill %1`/systemd 逐进程发送,在 proxytun 看来都是 `SI_USER`。为此启动一个**见证进程**:
+  与 proxytun 同一进程组、屏蔽 INT/QUIT/TERM(其余信号一律忽略,终端挂断或 Ctrl+Z 不会杀死/停住它)。
+  proxytun 收到 `SI_USER` 信号后等 50 ms,读 `/proc/<见证>/status` 的待处理信号:见证也收到且程序仍在本进程组 → 程序已有一份,不转发;
+  否则转发。每次判断后清空见证的待处理信号。见证 double-fork(不是 proxytun 的子进程,不影响"等整棵树退出"),管道断开即退出。
+  比 proxyhook 多覆盖一种情况:用 `sigwait`/`signalfd` 收信号的程序被整组 kill 时也不会收到两次。
+  程序自己离开了 proxytun 的进程组(`setsid`、shell 作业控制)时,整组信号到不了它,照常转发。
 - proxytun 异常退出(`kill -9`、崩溃):**不杀程序**。TUN 随 fd 关闭消失,程序只剩回环,等于断网,不会绕过代理直连;日志与文档写明。
 - 热加载范围同 proxyhook;主机端口转发、地址规划、`fake_ip_range`、`upstream_dns` 需要重启。
 - 凭据保护同 proxyhook:程序环境里去掉 `PROXYTUN_PROXY`(原值就地清零),proxytun 设为 non-dumpable;`--proxy` 带密码时 warn。

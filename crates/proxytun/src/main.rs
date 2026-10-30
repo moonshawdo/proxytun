@@ -9,6 +9,7 @@ mod nat;
 mod netcfg;
 mod netns;
 mod packet;
+mod witness;
 
 use anyhow::{Context, Result};
 use app::Args;
