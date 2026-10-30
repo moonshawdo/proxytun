@@ -1925,3 +1925,141 @@ fn the_program_joins_proxytuns_process_group_whatever_sudo_does() {
     assert_eq!(out.code, 0, "{}", out.dump());
     assert!(out.stderr.contains("session of its own"), "{}", out.dump());
 }
+
+// ------------------------------------------------ host ports and doctor --
+
+/// Does this host have IPv6 on loopback?
+fn have_ipv6_loopback() -> bool {
+    std::net::TcpListener::bind("[::1]:0").is_ok()
+}
+
+#[test]
+fn the_hosts_loopback_listeners_are_reachable_inside() {
+    require!("curl");
+    let mock = start_mock_proxy(1); // must stay untouched
+    let dir = tmp_dir("hostports");
+    let cfg = write_cfg(&dir, mock.addr, "", "");
+    let lo = start_origin_on("127.0.0.1:0");
+    let any = start_origin_on("0.0.0.0:0");
+    let mut urls = vec![format!("http://127.0.0.1:{lo}/"), format!("http://127.0.0.1:{any}/")];
+    if have_ipv6_loopback() {
+        let v6 = start_origin_on("[::1]:0");
+        urls.push(format!("http://[::1]:{v6}/"));
+    } else {
+        eprintln!("SKIP (part): no IPv6 on loopback");
+    }
+    let mut argv = vec!["curl", "-sS", "--max-time", "10"];
+    argv.extend(urls.iter().map(String::as_str));
+    let out = run(&cfg, &[], &argv, &[]);
+    assert_eq!(out.code, 0, "{}", out.dump());
+    assert_eq!(out.stdout, BODY.repeat(urls.len()), "{}", out.dump());
+    assert!(
+        mock.seen().is_empty(),
+        "the host's own ports never go through the proxy"
+    );
+    assert!(out.stderr.contains("host ports reachable inside:"), "{}", out.dump());
+    assert!(out.stderr.contains("routing to the host's own port"), "{}", out.dump());
+}
+
+#[test]
+fn excluded_ports_and_no_host_ports_leave_the_port_to_the_program() {
+    require!("curl", "python3");
+    let dir = tmp_dir("hostports-off");
+    let port = start_origin_on("127.0.0.1:0");
+    // The program listens on the same port itself, then talks to it.
+    let script = format!(
+        "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); \
+         s.bind(('127.0.0.1', {port})); s.listen(); print('own listener ok')"
+    );
+    for (top, extra) in [
+        (format!("host_ports_exclude = [{port}]"), &[][..]),
+        (String::new(), &["--no-host-ports"][..]),
+    ] {
+        let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), &top, "");
+        let out = run(&cfg, extra, &["python3", "-c", &script], &[]);
+        assert_eq!(out.stdout.trim(), "own listener ok", "{top} {extra:?}\n{}", out.dump());
+        let out = run(
+            &cfg,
+            extra,
+            &["curl", "-sS", "--max-time", "5", &format!("http://127.0.0.1:{port}/")],
+            &[],
+        );
+        assert_ne!(out.code, 0, "not forwarded: {top} {extra:?}\n{}", out.dump());
+    }
+}
+
+#[test]
+fn a_port_opened_after_start_is_not_forwarded() {
+    require!("curl", "sh");
+    let dir = tmp_dir("hostports-late");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let (go, port_file) = (dir.join("go"), dir.join("port"));
+    let _ = std::fs::remove_file(&go);
+    let script = format!(
+        // Succeeds only if the late port is NOT reachable inside.
+        "while [ ! -f {go} ]; do sleep 0.05; done; ! curl -sS --max-time 5 http://127.0.0.1:$(cat {pf})/",
+        go = go.display(),
+        pf = port_file.display()
+    );
+    let (mut child, _log) = spawn_bg(&cfg, &["sh", "-c", &script]);
+    std::thread::sleep(Duration::from_millis(300)); // proxytun has scanned
+    let port = start_origin_on("127.0.0.1:0");
+    std::fs::write(&port_file, port.to_string()).unwrap();
+    std::fs::write(&go, "").unwrap();
+    let st = child.wait().unwrap();
+    assert!(st.success(), "a listener opened after start-up was reachable inside");
+}
+
+#[test]
+fn doctor_reports_rootless_mode_and_each_proxy() {
+    require!();
+    let origin = start_origin();
+    let mock = start_mock_proxy(origin);
+    let dir = tmp_dir("doctor");
+    let (_dead, dead) = refused_addr();
+    let cfg = dir.join("doctor.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[[proxies]]\nname=\"good\"\ntype=\"socks5\"\naddr=\"{}\"\n[[proxies]]\nname=\"dead\"\ntype=\"socks5\"\naddr=\"{dead}\"\n\
+             [[groups]]\nname=\"default\"\nmembers=[\"good\",\"dead\"]\n",
+            mock.addr
+        ),
+    )
+    .unwrap();
+    let out = Command::new(BIN).arg("-c").arg(&cfg).arg("--doctor").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("[ OK ] namespace") && text.contains("rootless"), "{text}");
+    assert!(
+        text.contains("[ OK ] upstream proxy") && text.contains("good"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[FAIL] upstream proxy") && text.contains("dead"),
+        "{text}"
+    );
+    assert_eq!(out.status.code(), Some(1), "a dead proxy fails the doctor\n{text}");
+}
+
+#[test]
+fn doctor_reports_the_sudo_mode_without_running_sudo() {
+    require_centos7!();
+    let mock = start_mock_proxy(1);
+    let dir = shared_dir("doctor-sudo");
+    let cfg = write_cfg(&dir, mock.addr, "", "");
+    // A fake sudo that would fail loudly if --doctor ran it.
+    let out = run_like_centos7(&cfg, &["--doctor"], &[], true, &[("FAKE_SUDO_FAIL", "1")]);
+    assert!(out.stdout.contains("[WARN] namespace"), "{}", out.dump());
+    assert!(out.stdout.contains("max_user_namespaces=0"), "{}", out.dump());
+    assert!(out.stdout.contains("[ OK ] sudo mode"), "{}", out.dump());
+    assert!(
+        !out.stderr.contains("fake sudo"),
+        "--doctor must not run sudo\n{}",
+        out.dump()
+    );
+    assert_eq!(out.code, 0, "{}", out.dump());
+
+    let out = run_like_centos7(&cfg, &["--doctor", "--no-sudo"], &[], true, &[]);
+    assert!(out.stdout.contains("[FAIL] sudo mode"), "{}", out.dump());
+    assert_eq!(out.code, 1, "{}", out.dump());
+}

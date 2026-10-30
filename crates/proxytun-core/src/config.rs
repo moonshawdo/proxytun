@@ -79,6 +79,15 @@ pub struct Config {
     #[serde(default = "yes")]
     pub splice: bool,
 
+    /// Forward the host's loopback TCP listeners, as found at start-up, into
+    /// the namespace's own loopback (which is otherwise empty). Default true.
+    #[serde(default = "yes")]
+    pub host_ports_forward: bool,
+
+    /// Ports never forwarded: the program wants to listen on them itself.
+    #[serde(default)]
+    pub host_ports_exclude: Vec<u16>,
+
     #[serde(default)]
     pub health: HealthCfg,
 
@@ -631,6 +640,8 @@ mod tests {
         assert_eq!(c.localnet, vec!["127.0.0.0/8"]);
         assert_eq!(c.retries, 2);
         assert!(c.splice);
+        assert!(c.host_ports_forward);
+        assert!(c.host_ports_exclude.is_empty());
         assert!(c.sniff);
         assert_eq!(c.sniff_ports, vec![80, 443, 8443]);
         assert_eq!(c.sniff_timeout_ms, 300);

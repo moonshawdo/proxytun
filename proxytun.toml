@@ -38,6 +38,16 @@ sniff_skip_domains = ["cloudflare-ech.com"]
 # How long to wait for the program's first bytes before keeping the plain IP.
 sniff_timeout_ms = 300
 
+# The namespace's 127.0.0.1 is its own and starts empty. The host's loopback
+# TCP listeners found at start-up (a local database, a dev server, a proxy on
+# 127.0.0.1:7890) are forwarded into it, same address and port: 127.x.x.x:P
+# as is, 0.0.0.0:P as 127.0.0.1:P, [::]:P as 127.0.0.1:P and [::1]:P. Port 53
+# is never forwarded (DNS stays ours); listeners opened later are not seen.
+# Exclude a port the program wants to listen on itself. --no-host-ports turns
+# the whole thing off.
+host_ports_forward = true
+host_ports_exclude = []
+
 # When a proxy handshake fails, try up to this many other members of the group
 # before giving up (and closing the connection - it never falls back to direct).
 retries = 2

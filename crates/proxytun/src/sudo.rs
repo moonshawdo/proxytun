@@ -17,7 +17,7 @@
 //!   * hands the TUN device and listener back and exits: from then on no
 //!     process of ours runs as root.
 
-use crate::netns::{self, Child, Setup, TempDir};
+use crate::netns::{self, Child, Handover, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ipnet::Ipv4Net;
 use nix::sys::socket::{
@@ -26,7 +26,7 @@ use nix::sys::socket::{
 };
 use std::ffi::{CString, OsString};
 use std::io::{IoSlice, IoSliceMut};
-use std::net::TcpListener;
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::Duration;
@@ -40,12 +40,14 @@ struct Request {
     fake_range: Ipv4Net,
     /// proxytun's process group, for the program to join.
     pgrp: libc::pid_t,
+    /// Host ports to bind inside.
+    forwards: Vec<SocketAddr>,
     argv: Vec<String>,
     env: Vec<OsString>,
 }
 
 impl Request {
-    /// NUL-separated: version, range, pgrp, argc, argv..., env...
+    /// NUL-separated: version, range, pgrp, forwards, argc, argv..., env...
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut field = |b: &[u8]| {
@@ -55,6 +57,7 @@ impl Request {
         field(b"1");
         field(self.fake_range.to_string().as_bytes());
         field(self.pgrp.to_string().as_bytes());
+        field(netns::join_addrs(&self.forwards).as_bytes());
         field(self.argv.len().to_string().as_bytes());
         for a in &self.argv {
             field(a.as_bytes());
@@ -73,6 +76,7 @@ impl Request {
         }
         let fake_range = text()?.parse().ok()?;
         let pgrp = text()?.parse().ok()?;
+        let forwards = netns::split_addrs(&text()?)?;
         let argc: usize = text()?.parse().ok()?;
         let argv = (0..argc).map(|_| text()).collect::<Option<Vec<_>>>()?;
         if argv.is_empty() {
@@ -82,6 +86,7 @@ impl Request {
         Some(Request {
             fake_range,
             pgrp,
+            forwards,
             argv,
             env,
         })
@@ -141,10 +146,10 @@ fn seqpacket(flags: SockFlag) -> Result<OwnedFd> {
 // ------------------------------------------------------------ proxytun --
 
 /// Have sudo start the helper and wait for the namespace. Returns the
-/// waiting program, the TUN device, the listener, and whether the program
-/// could join our process group (not when sudo gave it a terminal session
-/// of its own: `use_pty`).
-pub fn spawn(s: &Setup) -> Result<(Child, OwnedFd, TcpListener, bool)> {
+/// waiting program, the namespace, and whether the program could join our
+/// process group (not when sudo gave it a terminal session of its own:
+/// `use_pty`).
+pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
     let dir = TempDir::new()?;
     let path = dir.path().join("ctl");
     // Non-blocking: while waiting we must notice sudo giving up.
@@ -184,6 +189,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, OwnedFd, TcpListener, bool)> {
         fake_range: s.fake_range,
         // SAFETY: plain syscall.
         pgrp: unsafe { libc::getpgrp() },
+        forwards: s.forwards.clone(),
         argv: s.argv.clone(),
         env: std::env::vars_os()
             .map(|(k, v)| {
@@ -209,13 +215,15 @@ pub fn spawn(s: &Setup) -> Result<(Child, OwnedFd, TcpListener, bool)> {
         None,
     )
     .context("send the request to the helper (environment too large?)")?;
-    let (report, tun, listener) = netns::recv_setup(&ctl, None)?;
-    let (pid, joined) = report
-        .split_once(' ')
-        .and_then(|(p, j)| Some((p.parse().ok()?, j == "joined")))
+    let handover = netns::recv_setup(&ctl, None)?;
+    let report = &handover.report;
+    let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
+    let pid = value("pid=")
+        .and_then(|p| p.parse().ok())
         .ok_or_else(|| anyhow!("bad report from the helper: {report:?}"))?;
+    let joined = value("pgrp=") == Some("joined");
     drop(dir);
-    Ok((Child::new(pid, ctl), tun, listener, joined))
+    Ok((Child::new(pid, ctl), handover, joined))
 }
 
 // -------------------------------------------------------------- helper --
@@ -284,7 +292,7 @@ fn helper(args: &[String]) -> Result<()> {
     let req = Request::decode(&buf[..n]).ok_or_else(|| anyhow!("malformed request"))?;
     let [stdin, stdout, stderr, cwd]: [OwnedFd; 4] = fds.try_into().map_err(|_| anyhow!("expected 4 fds"))?;
 
-    let (tun, listener) = match netns::setup_namespace(req.fake_range, false) {
+    let ns = match netns::setup_namespace(req.fake_range, false, &req.forwards) {
         Ok(v) => v,
         Err(e) => {
             netns::send_error(&ctl, &e);
@@ -298,7 +306,7 @@ fn helper(args: &[String]) -> Result<()> {
         bail!("fork: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
-        drop((tun, listener));
+        drop(ns);
         let why = prepared.become_user(&who, [&stdin, &stdout, &stderr], &cwd, &ctl, &req.argv);
         // Only reached on failure; stderr is the user's by now, or ours.
         eprintln!("proxytun (sudo helper): {why}");
@@ -308,12 +316,8 @@ fn helper(args: &[String]) -> Result<()> {
     // (and so make setpgid fail) before the go-ahead, which follows our report.
     // SAFETY: plain syscall.
     let joined = unsafe { libc::setpgid(pid, req.pgrp) } == 0 || crate::witness::pgrp_of(pid) == Some(req.pgrp);
-    netns::send_ok(
-        &ctl,
-        &tun,
-        &listener,
-        &format!("{pid} {}", if joined { "joined" } else { "alone" }),
-    )?;
+    let report = format!("pid={pid} pgrp={}", if joined { "joined" } else { "alone" });
+    netns::send_ok(&ctl, &ns, &report)?;
     Ok(())
 }
 
@@ -396,6 +400,7 @@ mod tests {
         let r = Request {
             fake_range: "198.18.0.0/15".parse().unwrap(),
             pgrp: 4242,
+            forwards: vec!["127.0.0.1:5432".parse().unwrap(), "[::1]:80".parse().unwrap()],
             argv: vec!["curl".into(), "".into(), "a b=c".into()],
             env: vec![
                 OsString::from("HOME=/home/u"),
@@ -406,14 +411,15 @@ mod tests {
         let no_env = Request {
             fake_range: "10.0.0.0/8".parse().unwrap(),
             pgrp: 1,
+            forwards: vec![],
             argv: vec!["true".into()],
             env: vec![],
         };
         assert_eq!(Request::decode(&no_env.encode()), Some(no_env));
         assert_eq!(Request::decode(b"2\0x\0"), None, "unknown version");
-        assert_eq!(Request::decode(b"1\x0010.0.0.0/8\x001\x000\0"), None, "no program");
+        assert_eq!(Request::decode(b"1\x0010.0.0.0/8\x001\0-\x000\0"), None, "no program");
         assert_eq!(
-            Request::decode(b"1\x0010.0.0.0/8\x001\x005\0a\0"),
+            Request::decode(b"1\x0010.0.0.0/8\x001\0-\x005\0a\0"),
             None,
             "argv cut short"
         );

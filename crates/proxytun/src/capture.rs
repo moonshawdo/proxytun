@@ -46,9 +46,15 @@ pub struct Shared {
     /// Rules and proxies, swapped on SIGHUP.
     pub live: RwLock<Arc<Live>>,
     pub stats: Stats,
+    /// Last connection id handed out (TUN-captured and host-port alike).
+    pub last_id: AtomicU64,
 }
 
 impl Shared {
+    pub fn next_conn_id(&self) -> u64 {
+        self.last_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     pub fn live(&self) -> Arc<Live> {
         self.live.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -171,7 +177,6 @@ fn write_packet(tun: &AsyncFd<OwnedFd>, b: &[u8]) {
 
 /// Accept captured connections and relay each one.
 pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
-    let mut id: u64 = 0;
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -181,7 +186,7 @@ pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
                 continue;
             }
         };
-        id += 1;
+        let id = sh.next_conn_id();
         // Every line about this connection names it. Error level: present
         // whenever anything is logged, so a proxy failing at warn names it too.
         let span = tracing::error_span!("conn", id, target = field::Empty);
@@ -305,6 +310,7 @@ mod tests {
             upstream_dns: "127.0.0.1:9".parse().unwrap(),
             live: RwLock::new(Arc::new(relay::build_live(&cfg).unwrap())),
             stats: Stats::default(),
+            last_id: AtomicU64::new(0),
         }
     }
 

@@ -7,8 +7,8 @@
 use crate::capture::{self, Shared, Stats};
 use crate::nat::Nat;
 use crate::netns::{self, Addrs, Setup, UsernsUnusable};
-use crate::sudo;
 use crate::witness::{self, Witness};
+use crate::{hostports, sudo};
 use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use proxytun_core::config::{url_has_credentials, Config};
@@ -18,13 +18,14 @@ use proxytun_core::net::relay::build_live;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub struct Args {
     pub config: PathBuf,
     pub proxy: Option<String>,
     pub no_sudo: bool,
+    pub no_host_ports: bool,
     pub argv: Vec<String>,
 }
 
@@ -126,24 +127,39 @@ pub fn run(args: Args) -> Result<i32> {
     let setup = Setup {
         argv: args.argv.clone(),
         fake_range: fake_net,
+        forwards: if cfg.host_ports_forward && !args.no_host_ports {
+            hostports::scan(&cfg.host_ports_exclude)
+        } else {
+            Vec::new()
+        },
     };
-    let (child, tun, listener) = match netns::spawn(&setup) {
+    let (child, ns) = match netns::spawn(&setup) {
         Err(e) if e.is::<UsernsUnusable>() => {
             if args.no_sudo {
                 return Err(e.context("--no-sudo forbids falling back to sudo"));
             }
             tracing::warn!("{e}; asking sudo to create the namespace (--no-sudo refuses)");
-            let (child, tun, listener, joined) = sudo::spawn(&setup)?;
+            let (child, ns, joined) = sudo::spawn(&setup)?;
             if !joined {
                 tracing::warn!(
                     "sudo started the program in a terminal session of its own (sudoers `use_pty`?): \
                      Ctrl+C on this terminal will not reach it"
                 );
             }
-            (child, tun, listener)
+            (child, ns)
         }
         r => r?,
     };
+    let netns::Handover {
+        tun,
+        listener,
+        forwards,
+        ..
+    } = ns;
+    if !forwards.is_empty() {
+        let list: Vec<String> = forwards.iter().map(|(a, _)| a.to_string()).collect();
+        tracing::info!("host ports reachable inside: {}", list.join(", "));
+    }
     let main_pid = Arc::new(AtomicI32::new(child.pid));
     let SocketAddr::V4(listen) = listener.local_addr()? else {
         anyhow::bail!("the capture listener is not IPv4");
@@ -157,6 +173,7 @@ pub fn run(args: Args) -> Result<i32> {
         upstream_dns,
         live: RwLock::new(live.clone()),
         stats: Stats::default(),
+        last_id: AtomicU64::new(0),
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -182,6 +199,14 @@ pub fn run(args: Args) -> Result<i32> {
                 }
             });
             tokio::spawn(capture::run_relay(listener, sh.clone()));
+            for (addr, l) in forwards {
+                l.set_nonblocking(true)?;
+                tokio::spawn(hostports::serve(
+                    tokio::net::TcpListener::from_std(l)?,
+                    addr,
+                    sh.clone(),
+                ));
+            }
             tokio::spawn(capture::run_sweeper(sh.clone()));
             *health_task.lock().unwrap() = Some(health::spawn(live.registry.nodes.clone(), health_cfg));
             spawn_signal_handlers(sh, cfg_path, proxy_override, health_task);

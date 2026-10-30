@@ -187,7 +187,9 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-async fn pump(a: &mut TcpStream, b: &mut TcpStream, use_splice: bool) -> Result<()> {
+/// Copy both ways until both sides are done: splice(2) when asked for and
+/// possible, else a userspace copy.
+pub async fn pump(a: &mut TcpStream, b: &mut TcpStream, use_splice: bool) -> Result<()> {
     a.set_nodelay(true).ok();
     if use_splice {
         match splice_bidirectional(a, b).await {

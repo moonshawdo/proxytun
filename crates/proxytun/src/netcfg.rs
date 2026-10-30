@@ -124,3 +124,18 @@ pub fn listen(addr: SocketAddrV4) -> Result<TcpListener> {
     }
     Ok(l)
 }
+
+/// A TCP listener on `addr` (IPv4 or IPv6), with the same backlog as `listen`.
+pub fn listen_any(addr: std::net::SocketAddr) -> Result<TcpListener> {
+    match addr {
+        std::net::SocketAddr::V4(a) => listen(a),
+        std::net::SocketAddr::V6(_) => {
+            let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+            // SAFETY: plain syscall on a socket we own.
+            if unsafe { libc::listen(l.as_raw_fd(), 4096) } < 0 {
+                bail!("listen {addr}: {}", Error::last_os_error());
+            }
+            Ok(l)
+        }
+    }
+}

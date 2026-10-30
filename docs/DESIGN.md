@@ -75,9 +75,13 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   |---|---|---|
   | `127.x.x.x:P` | 同一地址 `127.x.x.x:P` | `127.x.x.x:P` |
   | `0.0.0.0:P` | `127.0.0.1:P` | `127.0.0.1:P` |
-  | `[::1]:P`、`[::]:P` | `[::1]:P` | `[::1]:P` |
+  | `[::1]:P` | `[::1]:P` | `[::1]:P` |
+  | `[::]:P` | `127.0.0.1:P` 与 `[::1]:P` | 同左 |
 
+  - `[::]:P` 两个地址都开(M4 实现时确定,原表只有 `[::1]`):双栈监听在主机上也接受 IPv4,
+    只开 `[::1]` 的话 `curl http://127.0.0.1:P` 在主机上能通、在命名空间里不通。
   - 只转发 TCP;跳过 53 端口(DNS 必须由假 DNS 应答);不区分监听者属主。
+  - 一次最多 250 个(一条 SCM_RIGHTS 最多 253 个 fd,另有 TUN 与捕获监听),超出的在 warn 里列出。
   - 监听 socket 在建命名空间时一次性建好;之后主机上新增的监听不处理,需要时重启程序。
   - `host_ports_forward = true`(默认)/ `--no-host-ports` 整体开关;`host_ports_exclude = [...]` 排除个别端口(程序自己要监听同号端口时用)。
   - 启动时以 info 级别列出转发了哪些端口。
@@ -112,8 +116,10 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   `--log-level`、`--log-file`、`--doctor`;新增 `--no-sudo`、`--no-host-ports`。环境变量 `PROXYTUN_PROXY`、`PROXYTUN_LOG`。
 - 配置文件格式与 `proxyhook.toml` 相同,可直接拿来用;proxytun 用不到的键(`verify_peer_uid`、`block_quic`、`dns_udp_unconnected`)
   和拼错的键,启动时 warn 并忽略。
-- `--doctor`:报告将使用哪种模式(userns / sudo),在临时命名空间里实际试建 TUN、配地址、bind-mount;userns 不可用时说明原因
-  (`max_user_namespaces=0`、AppArmor 限制、内核未开),检查 `sudo` 是否存在但不调用;沿用代理连通性检测。
+- `--doctor`:报告将使用哪种模式(userns / sudo / root)。不靠猜 sysctl,而是按真实运行的路径建一次命名空间、以 `true` 为程序跑完;
+  userns 不可用时说明原因并列出相关 sysctl(`max_user_namespaces`、`unprivileged_userns_clone`、AppArmor 限制),
+  检查 PATH 里有没有 `sudo` 但不调用;另查 `/dev/net/tun`、Yama(`gdb -p` 的范围)、将转发的主机端口、每个代理(SOCKS5/HTTP 探测)。
+  有 FAIL 时退出码为 1;配置读不出时把它记为一项 FAIL,其余照查。
 
 ## 8. 代码组织
 

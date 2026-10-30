@@ -20,7 +20,7 @@ use nix::sys::socket::{
 };
 use std::ffi::{CStr, CString};
 use std::io::{IoSlice, IoSliceMut};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
@@ -104,16 +104,34 @@ pub const SETUP_ARG: &str = "__proxytun_setup";
 pub struct Setup {
     pub argv: Vec<String>,
     pub fake_range: Ipv4Net,
+    /// Host loopback listeners to bind inside (see hostports.rs).
+    pub forwards: Vec<SocketAddr>,
+}
+
+/// `a,b,c`, or `-` for none (an empty argument is easy to lose).
+pub fn join_addrs(a: &[SocketAddr]) -> String {
+    if a.is_empty() {
+        return "-".into();
+    }
+    a.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
+}
+
+pub fn split_addrs(s: &str) -> Option<Vec<SocketAddr>> {
+    if s == "-" {
+        return Some(Vec::new());
+    }
+    s.split(',').map(|a| a.parse().ok()).collect()
 }
 
 impl Setup {
-    /// `proxytun SETUP_ARG <ctl fd> <fake range> -- argv...`
+    /// `proxytun SETUP_ARG <ctl fd> <fake range> <forwards> -- argv...`
     fn to_args(&self, exe: &str, ctl: RawFd) -> Vec<String> {
         let mut a = vec![
             exe.to_string(),
             SETUP_ARG.to_string(),
             ctl.to_string(),
             self.fake_range.to_string(),
+            join_addrs(&self.forwards),
             "--".to_string(),
         ];
         a.extend(self.argv.iter().cloned());
@@ -121,7 +139,7 @@ impl Setup {
     }
 
     fn from_args(args: &[String]) -> Option<(Setup, RawFd)> {
-        let [_, mode, ctl, range, dashes, argv @ ..] = args else {
+        let [_, mode, ctl, range, forwards, dashes, argv @ ..] = args else {
             return None;
         };
         if mode != SETUP_ARG || dashes != "--" || argv.is_empty() {
@@ -130,6 +148,7 @@ impl Setup {
         let setup = Setup {
             argv: argv.to_vec(),
             fake_range: range.parse().ok()?,
+            forwards: split_addrs(forwards)?,
         };
         Some((setup, ctl.parse().ok()?))
     }
@@ -169,12 +188,22 @@ impl std::fmt::Display for UsernsUnusable {
 
 impl std::error::Error for UsernsUnusable {}
 
-/// Read the setup's answer on `ctl`: the TUN device, the listener, and what
-/// followed "OK" (empty, or the sudo helper's report). `pid` is reaped on
-/// failure.
-pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<(String, OwnedFd, TcpListener)> {
-    let mut buf = vec![0u8; 4096];
-    let mut cmsg = nix::cmsg_space!([RawFd; 2]);
+/// What a successful setup hands over.
+pub struct Handover {
+    pub tun: OwnedFd,
+    /// Where captured TCP is rewritten to.
+    pub listener: TcpListener,
+    /// Host ports bound inside, each with its listener (a bind that failed,
+    /// e.g. [::1] without IPv6, is simply missing).
+    pub forwards: Vec<(SocketAddr, TcpListener)>,
+    /// The rest of the report (the sudo helper's `pid=... pgrp=...`).
+    pub report: String,
+}
+
+/// Read the setup's answer on `ctl`. `pid` is reaped on failure.
+pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<Handover> {
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut cmsg = nix::cmsg_space!([RawFd; 253]);
     let (n, fds) = {
         let mut iov = [IoSliceMut::new(&mut buf)];
         let msg = recvmsg::<()>(ctl.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)
@@ -189,14 +218,32 @@ pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<(String, Ow
         (msg.bytes, fds)
     };
     let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
-    match reply.strip_prefix("OK") {
-        Some(rest) if fds.len() == 2 => {
-            let mut fds = fds.into_iter();
-            let tun = fds.next().expect("two fds");
-            let listener = TcpListener::from(fds.next().expect("two fds"));
-            Ok((rest.trim_start().to_string(), tun, listener))
+    let ok = reply.strip_prefix("OK ").and_then(|rest| {
+        let mut forwards = None;
+        let mut report = Vec::new();
+        for token in rest.split(' ') {
+            match token.strip_prefix("fwd=") {
+                Some(list) => forwards = Some(split_addrs(list)?),
+                None => report.push(token),
+            }
         }
-        _ => {
+        let forwards = forwards?;
+        (fds.len() == 2 + forwards.len()).then_some((forwards, report.join(" ")))
+    });
+    match ok {
+        Some((forwards, report)) => {
+            let mut fds = fds.into_iter();
+            let tun = fds.next().expect("counted");
+            let listener = TcpListener::from(fds.next().expect("counted"));
+            let forwards = forwards.into_iter().zip(fds.map(TcpListener::from)).collect();
+            Ok(Handover {
+                tun,
+                listener,
+                forwards,
+                report,
+            })
+        }
+        None => {
             if let Some(pid) = pid {
                 reap(pid);
             }
@@ -223,14 +270,16 @@ pub fn send_error(ctl: &OwnedFd, e: &SetupError) {
     );
 }
 
-/// Hand the TUN device and the listener over on `ctl`, with `report` after "OK".
-pub fn send_ok(ctl: &OwnedFd, tun: &OwnedFd, listener: &TcpListener, report: &str) -> Result<()> {
-    let msg = if report.is_empty() {
-        "OK".to_string()
-    } else {
-        format!("OK {report}")
-    };
-    let fds = [tun.as_raw_fd(), listener.as_raw_fd()];
+/// Hand the namespace over on `ctl`, with `report` appended for the reader.
+pub fn send_ok(ctl: &OwnedFd, ns: &Namespace, report: &str) -> Result<()> {
+    let bound: Vec<SocketAddr> = ns.forwards.iter().map(|(a, _)| *a).collect();
+    let mut msg = format!("OK fwd={}", join_addrs(&bound));
+    if !report.is_empty() {
+        msg.push(' ');
+        msg.push_str(report);
+    }
+    let mut fds = vec![ns.tun.as_raw_fd(), ns.listener.as_raw_fd()];
+    fds.extend(ns.forwards.iter().map(|(_, l)| l.as_raw_fd()));
     sendmsg::<()>(
         ctl.as_raw_fd(),
         &[IoSlice::new(msg.as_bytes())],
@@ -245,7 +294,7 @@ pub fn send_ok(ctl: &OwnedFd, tun: &OwnedFd, listener: &TcpListener, report: &st
 /// Start the setup process for the program and wait for its namespace; the
 /// program itself waits for `Child::go` before exec. Returns it with the TUN
 /// device and the listener for captured TCP.
-pub fn spawn(s: &Setup) -> Result<(Child, OwnedFd, TcpListener)> {
+pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
     if s.argv.is_empty() {
         bail!("no program given");
     }
@@ -278,8 +327,8 @@ pub fn spawn(s: &Setup) -> Result<(Child, OwnedFd, TcpListener)> {
         }
     }
     drop(theirs);
-    let (_, tun, listener) = recv_setup(&ours, Some(pid))?;
-    Ok((Child { pid, ctl: ours }, tun, listener))
+    let handover = recv_setup(&ours, Some(pid))?;
+    Ok((Child { pid, ctl: ours }, handover))
 }
 
 fn reap(pid: libc::pid_t) {
@@ -302,17 +351,17 @@ pub fn setup_main(args: &[String]) -> ! {
     // Run as root (proxytun started by root): the program stays root, so no
     // user namespace, which would confine its capabilities to the namespace.
     let userns = !nix::unistd::geteuid().is_root();
-    let (tun, listener) = match setup_namespace(s.fake_range, userns) {
+    let ns = match setup_namespace(s.fake_range, userns, &s.forwards) {
         Ok(v) => v,
         Err(e) => {
             send_error(&ctl, &e);
             std::process::exit(126);
         }
     };
-    if send_ok(&ctl, &tun, &listener, "").is_err() {
+    if send_ok(&ctl, &ns, "").is_err() {
         std::process::exit(126);
     }
-    drop((tun, listener));
+    drop(ns);
     wait_go(&ctl);
     drop(ctl);
     std::process::exit(exec(&s.argv))
@@ -345,10 +394,21 @@ fn is_permission(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Create the namespace (in this process) with the TUN device and the
-/// listener. With `userns`, inside a new user namespace mapping our uid/gid
-/// to themselves (needs no privilege); without, as root.
-pub fn setup_namespace(range: Ipv4Net, userns: bool) -> std::result::Result<(OwnedFd, TcpListener), SetupError> {
+/// A namespace ready to serve, as created by the setup process.
+pub struct Namespace {
+    pub tun: OwnedFd,
+    pub listener: TcpListener,
+    pub forwards: Vec<(SocketAddr, TcpListener)>,
+}
+
+/// Create the namespace (in this process) with the TUN device, the listener
+/// and the host-port listeners. With `userns`, inside a new user namespace
+/// mapping our uid/gid to themselves (needs no privilege); without, as root.
+pub fn setup_namespace(
+    range: Ipv4Net,
+    userns: bool,
+    forwards: &[SocketAddr],
+) -> std::result::Result<Namespace, SetupError> {
     if userns {
         enter_user_namespace().map_err(|err| SetupError { userns: true, err })?;
     } else {
@@ -358,9 +418,20 @@ pub fn setup_namespace(range: Ipv4Net, userns: bool) -> std::result::Result<(Own
     }
     // A user namespace whose capabilities an LSM withholds (Ubuntu's AppArmor
     // restriction) fails here instead, with EPERM.
-    configure(range).map_err(|err| SetupError {
+    let (tun, listener) = configure(range).map_err(|err| SetupError {
         userns: userns && is_permission(&err),
         err,
+    })?;
+    // Bound now, while we may (ports below 1024 too). One that cannot be bound
+    // (no IPv6 inside) is left out; proxytun lists what was.
+    let forwards = forwards
+        .iter()
+        .filter_map(|a| Some((*a, netcfg::listen_any(*a).ok()?)))
+        .collect();
+    Ok(Namespace {
+        tun,
+        listener,
+        forwards,
     })
 }
 
@@ -474,12 +545,14 @@ mod tests {
         let s = Setup {
             argv: vec!["curl".into(), "--".into(), "-x".into(), "a b".into()],
             fake_range: "198.18.0.0/15".parse().unwrap(),
+            forwards: vec!["127.0.0.1:5432".parse().unwrap(), "[::1]:8080".parse().unwrap()],
         };
         let args = s.to_args("proxytun", 7);
         assert_eq!(Setup::from_args(&args), Some((s, 7)));
         let none = Setup {
             argv: vec!["true".into()],
             fake_range: "10.0.0.0/8".parse().unwrap(),
+            forwards: vec![],
         };
         assert_eq!(Setup::from_args(&none.to_args("p", 3)), Some((none, 3)));
         assert_eq!(Setup::from_args(&["p".into(), SETUP_ARG.into()]), None, "truncated");

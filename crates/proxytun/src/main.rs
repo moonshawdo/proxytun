@@ -5,6 +5,8 @@
 
 mod app;
 mod capture;
+mod doctor;
+mod hostports;
 mod nat;
 mod netcfg;
 mod netns;
@@ -64,6 +66,14 @@ struct Cli {
     #[arg(long)]
     no_sudo: bool,
 
+    /// Do not forward the host's loopback listeners into the namespace.
+    #[arg(long)]
+    no_host_ports: bool,
+
+    /// Check this host (namespaces, TUN, sudo, proxies, host ports) and exit.
+    #[arg(long)]
+    doctor: bool,
+
     /// Log errors only (same as --log-level error).
     #[arg(short, long, conflicts_with_all = ["verbose", "log_level"])]
     quiet: bool,
@@ -84,7 +94,7 @@ struct Cli {
     /// The program to run and its arguments, e.g. `curl -c jar https://x`
     // Parsing stops at the program name, so its own options (`-c` there) are
     // not taken for ours, as with proxychains and graftcp.
-    #[arg(trailing_var_arg = true, required = true)]
+    #[arg(trailing_var_arg = true, required_unless_present = "doctor")]
     argv: Vec<String>,
 }
 
@@ -152,11 +162,35 @@ fn main() -> Result<()> {
         cli.log_file.as_deref(),
     )?;
 
+    if cli.doctor {
+        let proxy = cli.proxy.clone().or_else(|| std::env::var("PROXYTUN_PROXY").ok());
+        let (cfg, problem) = match app::load_config(&cli.config, proxy.as_deref()) {
+            Ok(c) => (c, None),
+            // Still check the host, with the default settings and no proxy.
+            Err(e) => {
+                let mut c = proxytun_core::config::Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n")?;
+                c.proxies.clear();
+                (c, Some(format!("{e:#}")))
+            }
+        };
+        let mut checks = Vec::new();
+        if let Some(p) = problem {
+            checks.push(doctor::Check {
+                name: "config",
+                status: doctor::Status::Fail,
+                detail: p,
+            });
+        }
+        checks.extend(doctor::run_checks(&cfg, cli.no_sudo));
+        std::process::exit(doctor::report(&checks));
+    }
+
     let to_file = cli.log_file.is_some();
     let code = app::run(Args {
         config: cli.config,
         proxy: cli.proxy,
         no_sudo: cli.no_sudo,
+        no_host_ports: cli.no_host_ports,
         argv: cli.argv,
     })
     // Returning the error prints it to stderr; a log file needs its own copy.
@@ -212,6 +246,10 @@ mod tests {
         // `--` still lets a program whose name starts with '-' through.
         assert_eq!(parse(&["--", "-odd", "a"]).unwrap().argv, ["-odd", "a"]);
         assert!(parse(&[]).is_err(), "nothing to run");
+        assert!(
+            parse(&["--doctor"]).unwrap().argv.is_empty(),
+            "--doctor needs no program"
+        );
         assert!(
             parse(&["--proxi", "x", "curl"]).is_err(),
             "a mistyped option is not a program"
