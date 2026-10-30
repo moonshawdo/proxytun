@@ -9,7 +9,7 @@ use crate::net::splice::splice_bidirectional;
 use crate::policy::Policy;
 use crate::proxy;
 use crate::sniff::{self, Sniffed};
-use crate::types::{Decision, Pending, Target};
+use crate::types::{Decision, Dest, Pending, Target};
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::io::copy_bidirectional_with_sizes;
@@ -85,18 +85,32 @@ pub fn build_live(cfg: &Config) -> Result<Live> {
 /// caller's span, which names the connection in every log line.
 pub async fn route(live: &Live, mut inbound: TcpStream, pending: Pending) -> Result<()> {
     let Pending { target, guard } = pending;
+    // localnet and the program's own proxies: straight out, untouched.
+    let passthrough = match target {
+        Target::V4(ip, port) => live.policy.is_passthrough(&Dest::V4(ip, port)),
+        Target::V6(ip, port) => live.policy.is_passthrough(&Dest::V6(ip, port)),
+        Target::Domain(..) => false,
+    };
     // `target` is what we connect to, `rule_target` what the rules look at.
     let (mut target, mut rule_target) = (target.clone(), target);
-    if let Some(domain) = maybe_sniff(&inbound, &target, &live.sniff, &live.policy).await {
-        tracing::debug!(ip = ?target, %domain, "recovered hostname from the first bytes");
-        rule_target = Target::Domain(domain, target.port());
-        if live.sniff.override_destination {
-            target = rule_target.clone();
+    if !passthrough {
+        if let Some(domain) = maybe_sniff(&inbound, &target, &live.sniff, &live.policy).await {
+            tracing::debug!(ip = ?target, %domain, "recovered hostname from the first bytes");
+            rule_target = Target::Domain(domain, target.port());
+            if live.sniff.override_destination {
+                target = rule_target.clone();
+            }
         }
     }
-    let decision = live.policy.decide(&rule_target);
     Span::current().record("target", field::debug(&target));
-    tracing::info!(?decision, "routing");
+    let decision = if passthrough {
+        tracing::info!(decision = ?Decision::Direct, "routing (localnet)");
+        Decision::Direct
+    } else {
+        let d = live.policy.decide(&rule_target);
+        tracing::info!(decision = ?d, "routing");
+        d
+    };
     // Pin the fake-ip mapping for as long as this connection lives.
     let _pin = guard;
 
@@ -355,6 +369,32 @@ mod tests {
         c.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"hello from origin");
         assert!(seen.lock().unwrap().is_empty(), "direct must bypass the proxy");
+    }
+
+    #[tokio::test]
+    async fn localnet_targets_go_direct_whatever_the_rules_say() {
+        let (proxy, seen) = echo_socks5().await;
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            s.write_all(b"hello from the lan").await.unwrap();
+        });
+        // The default localnet is 127.0.0.0/8; the rules would proxy everything,
+        // and a TLS-looking first packet would otherwise be sniffed.
+        let live = mk_live(proxy, "[[rules]]\nmatch=\"final\"\naction=\"proxy\"");
+        let mut c = relay_pending(&live, pending(Target::V4(Ipv4Addr::LOCALHOST, origin_port))).await;
+        let mut got = Vec::new();
+        // The echoing proxy would never close: bound the wait so a regression
+        // fails instead of hanging.
+        let read = tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut got)).await;
+        assert!(
+            read.is_ok(),
+            "no reply from the origin; got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(got, b"hello from the lan");
+        assert!(seen.lock().unwrap().is_empty(), "localnet never reaches the proxy");
     }
 
     #[tokio::test]

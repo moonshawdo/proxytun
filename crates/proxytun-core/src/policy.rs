@@ -2,9 +2,10 @@
 //! environment. Pure logic: no I/O, so every branch is unit-tested.
 //!
 //! Two layers decide what happens to a connect():
-//!   1. `is_passthrough` (ptrace layer): localnet CIDRs and the proxy endpoints
-//!      named in the program's `*_proxy` env vars. These are not touched at all.
-//!   2. `decide` (relay layer): the rule list, first match wins.
+//!   1. `is_passthrough`: localnet CIDRs and the proxy endpoints named in the
+//!      program's `*_proxy` env vars. These go straight out: no sniffing, no
+//!      rules, no proxy.
+//!   2. `decide`: the rule list, first match wins.
 
 use crate::config::{Action, Config, EnvProxies, RuleKind, DEFAULT_GROUP};
 use crate::types::{Decision, Dest, Target};
@@ -58,7 +59,7 @@ impl Policy {
         Ok(Policy { localnet, env, rules })
     }
 
-    /// Should this destination be left completely alone by the tracer?
+    /// Should this destination bypass sniffing, the rules and the proxy?
     pub fn is_passthrough(&self, dest: &Dest) -> bool {
         let (ip, port) = match dest {
             Dest::V4(ip, p) => (IpAddr::V4(*ip), *p),

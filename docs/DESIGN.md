@@ -37,6 +37,10 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 | 之后 | 相同:fd 交给 proxytun,整棵树里没有 root 进程 | 同左 |
 
 - 能用 user namespace 就用;不能用时自动走 sudo,先打印一行说明原因;`--no-sudo` 禁止调用 sudo(直接报错)。
+- **准备进程是重新 exec 的 proxytun**(M1 实现时确定):proxytun 启动即设为 non-dumpable(保护代理凭据),fork 出的子进程会继承,
+  其 `/proc/self/uid_map` 等文件因此归 root、写不进去;而让子进程恢复 dumpable 又会暴露从父进程复制来的内存(含凭据)。
+  所以子进程 fork 后立即 `execv("/proc/self/exe", ["proxytun", "__proxytun_setup", ...])`:新映像里没有凭据,也恢复为 dumpable。
+  它完成命名空间准备、交回 fd、等待放行后 exec 目标程序(pid 不变)。sudo 模式的特权助手走同一条路径。
 - 不推荐用户直接 `sudo proxytun`:CentOS 7 默认 sudoers 有 `always_set_home`、`env_reset`、`secure_path`,程序会拿到 `HOME=/root`、被替换的 `PATH`、丢失的 `http_proxy`。
 - **特权助手的边界**:
   - 只做:建网络 + 挂载命名空间、建 TUN、bind-mount `resolv.conf`、建主机端口转发的监听 socket、fork 出程序;fd 交回后立即退出,程序由 proxytun(subreaper)收养。

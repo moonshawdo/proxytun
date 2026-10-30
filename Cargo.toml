@@ -9,7 +9,7 @@ license = "GPL-2.0-only"
 
 [workspace.dependencies]
 proxytun-core = { path = "crates/proxytun-core" }
-nix = { version = "0.31", features = ["process", "signal", "fs", "sched", "mount", "user"] }
+nix = { version = "0.31", features = ["sched", "mount", "user", "socket", "uio"] }
 libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
 ipnet = "2"
@@ -17,6 +17,7 @@ hickory-proto = "0.24"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+serde_ignored = "0.1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

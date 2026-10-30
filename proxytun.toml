@@ -1,40 +1,28 @@
-# proxyhook example config.
+# proxytun example config.
 # Top-level keys must come before any [table] in TOML, so they are all here.
+# A proxyhook.toml works as is: keys proxytun has no use for are reported at
+# start-up and ignored.
 
 # --- fake-ip DNS ---------------------------------------------------------
 # Domains the program resolves get an address from this pool, which is how the
-# real hostname survives until the proxy. Prefix must be between /8 and /30.
+# real hostname survives until the proxy. The last /24 of the range is kept
+# for proxytun's own addresses inside the namespace (the TUN device, the DNS
+# server), so the prefix must be between /8 and /22.
 fake_ip_range = "198.18.0.0/15"
 
 # Used to answer non-A queries (MX/TXT/...) and nothing else. Must be ip:port.
+# Reached directly from the host, not through the proxy.
 upstream_dns = "1.1.1.1:53"
 
 # --- behaviour switches --------------------------------------------------
-# Destinations the traced program reaches directly, untouched and with zero
-# overhead (like proxychains' "localnet"). The proxy endpoints named in the
-# program's own http_proxy / https_proxy / all_proxy variables are added
-# automatically. Add your LAN here if it should bypass the proxy, e.g.
-#   localnet = ["127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16"]
+# Destinations reached directly from the host instead of through the proxy
+# (like proxychains' "localnet"). The proxy endpoints named in the program's
+# own http_proxy / https_proxy / all_proxy variables are added automatically.
+# Add your LAN here if it should bypass the proxy, e.g.
+#   localnet = ["10.0.0.0/8", "192.168.0.0/16"]
+# (127.0.0.0/8 inside the namespace is the namespace's own loopback; it never
+# reaches proxytun.)
 localnet = ["127.0.0.0/8"]
-
-# SECURITY: only accept relay and DNS clients that belong to the same uid as
-# proxyhook. Protects against other local users on a shared host connecting to
-# the loopback relay/DNS ports. Default: true. Set to false only on a
-# single-user machine where `proxyhook --doctor` reports that connection owners
-# cannot be resolved.
-verify_peer_uid = true
-
-# Make UDP/443 (QUIC / HTTP3) fail fast so browsers fall back to TCP, which can
-# be proxied. If false, QUIC traffic bypasses the proxy entirely. Default: true.
-block_quic = true
-
-# Also intercept DNS sent with sendmsg/sendmmsg on UNCONNECTED UDP sockets.
-# DNS via connect()+send or sendto is ALWAYS handled, which covers glibc, curl,
-# Go (both resolvers), musl and dig - all verified with this left off.
-# Turning it on stops the tracer on EVERY sendmsg/recvmsg, local IPC included:
-# measured 60-90x slower IPC, a real cost for Chrome/Electron/D-Bus programs.
-# Enable only for a program that sends DNS that way. Default: false.
-dns_udp_unconnected = false
 
 # Recover the hostname of connections to a bare IP by peeking at the first
 # bytes the program sends (TLS SNI / HTTP Host). This catches programs that
@@ -62,7 +50,8 @@ timeout_ms = 3000
 
 # --- upstream proxies ----------------------------------------------------
 # Several can be listed and balanced; see [[groups]].
-# The address can be overridden at run time with --proxy URL or $PROXYHOOK_PROXY.
+# The address can be overridden at run time with --proxy URL or $PROXYTUN_PROXY.
+# proxytun dials the proxy from the host, so 127.0.0.1 here means the host.
 [[proxies]]
 name = "clash"
 type = "socks5"                  # "socks5" (domain sent as ATYP=3) or "http" (CONNECT host:port)

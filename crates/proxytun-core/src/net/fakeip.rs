@@ -85,9 +85,16 @@ impl Inner {
 
 impl FakePool {
     pub fn new(net: Ipv4Net) -> Self {
+        Self::with_reserved_tail(net, 0)
+    }
+
+    /// A pool over `net` that never hands out its last `reserved` addresses
+    /// (proxytun keeps the top /24 of the range for its own addresses).
+    pub fn with_reserved_tail(net: Ipv4Net, reserved: u32) -> Self {
         let span = 1u64 << (32 - net.prefix_len() as u32);
-        // Offsets 1..=span-2 are usable (skip network and broadcast address).
-        let usable = span.saturating_sub(2).min(u32::MAX as u64) as u32;
+        // Offsets 1..=span-2-reserved are usable (skip the network address,
+        // and the broadcast address or the address below the reserved block).
+        let usable = span.saturating_sub(2 + reserved as u64).min(u32::MAX as u64) as u32;
         FakePool(Arc::new(Mutex::new(Inner {
             base: net.network().into(),
             usable,
@@ -299,5 +306,17 @@ mod tests {
             }
         }
         assert_eq!(p.len(), 50);
+    }
+
+    #[test]
+    fn a_reserved_tail_is_never_handed_out() {
+        let p = FakePool::with_reserved_tail("10.0.0.0/22".parse().unwrap(), 256);
+        let ips: Vec<Ipv4Addr> = (0..766).map(|i| p.alloc(&format!("d{i}.test")).unwrap()).collect();
+        assert_eq!(ips[0], Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(*ips.last().unwrap(), Ipv4Addr::new(10, 0, 2, 254));
+        // Full: the next name recycles the oldest instead of entering 10.0.3.0/24.
+        assert_eq!(p.alloc("one.more").unwrap(), ips[0]);
+        assert_eq!(p.len(), 766);
+        assert_eq!(p.lookup(Ipv4Addr::new(10, 0, 3, 1)), None);
     }
 }

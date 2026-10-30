@@ -37,29 +37,11 @@ pub struct Config {
     #[serde(default = "default_upstream_dns")]
     pub upstream_dns: String,
 
-    /// Destinations that are never touched: connect() goes straight out of the
-    /// traced program (no relay hop, zero overhead). Like proxychains' localnet.
+    /// Destinations reached directly, never through rules or the proxy. Like
+    /// proxychains' localnet. (In the namespace 127.0.0.0/8 is the namespace's
+    /// own loopback and never reaches proxytun at all.)
     #[serde(default = "default_localnet")]
     pub localnet: Vec<String>,
-
-    /// Only accept relay/DNS clients owned by the current uid. Protects against
-    /// other local users on a shared host. Default true.
-    #[serde(default = "yes")]
-    pub verify_peer_uid: bool,
-
-    /// Make UDP/443 (QUIC) fail fast so HTTP/3 clients fall back to TCP, which
-    /// we can proxy. Default true.
-    #[serde(default = "yes")]
-    pub block_quic: bool,
-
-    /// Also intercept DNS sent with sendmsg/sendmmsg on UNCONNECTED UDP sockets
-    /// (and fix up recvmsg/recvmmsg reply sources). Default false: BPF cannot
-    /// tell these calls apart by socket type, so enabling it stops the tracer
-    /// on every sendmsg/recvmsg, including local IPC (measured 60-90x slower
-    /// for IPC-heavy programs such as Chrome). glibc, curl, Go, musl and dig
-    /// resolve fine without it (connect()+send or sendto, always handled).
-    #[serde(default = "no")]
-    pub dns_udp_unconnected: bool,
 
     /// How many other group members to try when a proxy handshake fails.
     #[serde(default = "default_retries")]
@@ -102,6 +84,32 @@ pub struct Config {
 
     #[serde(default)]
     pub rules: Vec<RuleCfg>,
+
+    /// Keys in the file that no field takes (typos, or proxyhook keys that mean
+    /// nothing here), e.g. `verify_peer_uid` or `proxies.0.usrname`. Not an
+    /// error: the caller warns about them.
+    #[serde(skip)]
+    pub ignored_keys: Vec<String>,
+}
+
+/// `proxies.0.usrname`: the key as written in the file. serde_ignored's own
+/// Display also shows the `Option`/newtype layers serde walks through (`?`).
+fn key_path(path: &serde_ignored::Path) -> String {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => String::new(),
+        Path::Seq { parent, index } => join(key_path(parent), &index.to_string()),
+        Path::Map { parent, key } => join(key_path(parent), key),
+        Path::Some { parent } | Path::NewtypeStruct { parent } | Path::NewtypeVariant { parent } => key_path(parent),
+    }
+}
+
+fn join(parent: String, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{parent}.{key}")
+    }
 }
 
 fn default_fakeip() -> String {
@@ -127,9 +135,6 @@ fn default_retries() -> u32 {
 }
 fn yes() -> bool {
     true
-}
-fn no() -> bool {
-    false
 }
 fn one() -> u32 {
     1
@@ -296,7 +301,11 @@ impl Config {
 
     /// Parse, normalise legacy forms and validate.
     pub fn parse(text: &str) -> Result<Self> {
-        let mut cfg: Config = toml::from_str(text).context("parsing config toml")?;
+        let mut ignored = Vec::new();
+        let de = toml::Deserializer::new(text);
+        let mut cfg: Config =
+            serde_ignored::deserialize(de, |path| ignored.push(key_path(&path))).context("parsing config toml")?;
+        cfg.ignored_keys = ignored;
         cfg.normalise();
         cfg.validate()?;
         Ok(cfg)
@@ -390,9 +399,10 @@ impl Config {
             .fake_ip_range
             .parse()
             .with_context(|| format!("bad fake_ip_range {:?}", self.fake_ip_range))?;
-        if net.prefix_len() < 8 || net.prefix_len() > 30 {
+        // The last /24 of the range holds proxytun's own namespace addresses.
+        if net.prefix_len() < 8 || net.prefix_len() > 22 {
             bail!(
-                "fake_ip_range prefix must be between /8 and /30, got /{}",
+                "fake_ip_range prefix must be between /8 and /22, got /{}",
                 net.prefix_len()
             );
         }
@@ -618,9 +628,6 @@ mod tests {
         assert_eq!(c.groups[0].name, "default");
         assert_eq!(c.groups[0].members, vec!["default"]);
         assert_eq!(c.fake_ip_range, "198.18.0.0/15");
-        assert!(c.verify_peer_uid, "verify_peer_uid defaults to true");
-        assert!(c.block_quic);
-        assert!(!c.dns_udp_unconnected, "off by default: it slows every sendmsg/recvmsg");
         assert_eq!(c.localnet, vec!["127.0.0.0/8"]);
         assert_eq!(c.retries, 2);
         assert!(c.splice);
@@ -687,9 +694,25 @@ mod tests {
     }
 
     #[test]
-    fn verify_peer_uid_can_be_disabled() {
-        let c = Config::parse(&format!("verify_peer_uid = false\n{MINIMAL}")).unwrap();
-        assert!(!c.verify_peer_uid);
+    fn unknown_keys_are_reported_not_rejected() {
+        // A proxyhook.toml must load as is; its ptrace-only switches and any
+        // typo are named so the user learns they have no effect.
+        let text = format!(
+            "verify_peer_uid = true\nblock_quic = false\ndns_udp_unconnected = true\nsnif = false\n{MINIMAL}usrname = \"u\"\n"
+        );
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(
+            c.ignored_keys,
+            [
+                "verify_peer_uid",
+                "block_quic",
+                "dns_udp_unconnected",
+                "snif",
+                "proxy.usrname"
+            ]
+        );
+        assert!(c.sniff, "the misspelt key changed nothing");
+        assert!(Config::parse(MINIMAL).unwrap().ignored_keys.is_empty());
     }
 
     #[test]
@@ -728,6 +751,8 @@ mod tests {
         // Top-level keys must precede the tables in TOML.
         for bad in [
             format!("fake_ip_range = \"198.18.0.0/31\"\n{MINIMAL}"),
+            // Too small to leave a /24 for the namespace's own addresses.
+            format!("fake_ip_range = \"198.18.0.0/23\"\n{MINIMAL}"),
             format!("fake_ip_range = \"10.0.0.0/4\"\n{MINIMAL}"),
             format!("fake_ip_range = \"nonsense\"\n{MINIMAL}"),
             format!("upstream_dns = \"dns.example\"\n{MINIMAL}"),
@@ -771,7 +796,11 @@ mod tests {
     fn shipped_example_config_is_valid() {
         let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proxytun.toml")).unwrap();
         let c = Config::parse(&text).unwrap();
-        assert!(c.verify_peer_uid);
+        assert!(
+            c.ignored_keys.is_empty(),
+            "example uses unknown keys: {:?}",
+            c.ignored_keys
+        );
     }
 
     #[test]
