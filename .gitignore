@@ -1,0 +1,10 @@
+target/
+*.log
+dist/
+
+# editor droppings: swap/backup files must never be committed
+*.swp
+*.swo
+*.swn
+*~
+.*.sw?

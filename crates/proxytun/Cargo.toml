@@ -1,0 +1,9 @@
+[package]
+name = "proxytun"
+description = "Run one program (and its children) through a SOCKS5/HTTP proxy via a private TUN network namespace, domain names preserved"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proxytun-core.workspace = true
