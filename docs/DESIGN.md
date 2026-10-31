@@ -51,6 +51,11 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   (它会连 `su -` 一起拒绝,且仍拦不住 systemd 启动的服务),改为在 README 写明只能用 sudo 授权 proxytun。
 - **特权助手的边界**:
   - 只做:建网络 + 挂载命名空间、建 TUN、bind-mount `resolv.conf`、建主机端口转发的监听 socket、fork 出程序;fd 交回后立即退出,程序由 proxytun(subreaper)收养。
+  - **root 进程从不接收客户端的 fd**(第五轮复查):关闭一个用户给的 fd 可能永久阻塞(设了 `SO_LINGER` 且发不出去的 socket、
+    用户自己 FUSE 挂载上的文件,后者连 SIGKILL 都无效),root 助手和等它的 sudo 就会挂着,用户杀不掉、也不计入他的进程数。
+    所以助手先建好空的命名空间并 fork 出程序;程序降为用户之后才读请求和 fd,再把请求原文(只有字节)经管道交给助手校验、配置。
+    客户端协议不变。助手自己从不关闭控制 socket(上面可能排着带 fd 的消息),留给内核在退出时关闭,那时不再 linger。
+    助手失败时 SIGKILL 程序但不等它(它退出时关闭用户的 fd 可能阻塞)。等程序回报最多 10 + 5 秒:那时它已是用户的进程,用户可以把它停住。
   - 由 sudo 以当前可执行文件的绝对路径 + 隐藏子命令启动;sudo 会关闭 fd≥3,双方经 0700 私有目录里的 unix socket 通信。
   - 只接受 real 与 effective uid 都为 0(sudo 的做法);setuid 启动时 real uid 是调用者,`SUDO_UID` 也由调用者设置,直接拒绝。
   - 以 `SUDO_UID`/`SUDO_GID` 为有效 uid/gid(`setresuid`/`setresgid` 只改有效 id,saved uid 仍为 0 以便切回;清空附加组)连接 socket:
@@ -62,9 +67,11 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
     不信任消息里自报的身份。
   - 任何人都能写自己的客户端,所以请求逐项重新校验:假 IP 段 /8–/22,进程组必须等于对端的进程组,转发地址只能是回环、
     端口非 0 非 53、不重复、最多 250 个。
-  - socket 收发超时 10 秒,客户端不说话时 root 进程不会一直挂着;读完请求后清除超时,因为程序继承同一个 socket、等放行要多久都行。
-  - 不读配置、不写日志、不以 root 打开用户给的任何路径;先降权(附加组 → gid → uid,确认 `setuid(0)` 失败且 CapPrm/CapEff 为 0),
-    再设置 `PR_SET_NO_NEW_PRIVS`:命名空间里的网络(DNS、路由)完全由用户的 proxytun 控制,setuid 程序(sudo、su,或经 LDAP/Kerberos 认证的 PAM)
+  - socket 收发超时 10 秒,客户端不说话时 root 进程不会一直挂着;程序读完请求后清除超时,因为它等放行要多久都行。
+  - 不读配置、不写日志、不以 root 打开用户给的任何路径;程序先降权(附加组 → gid → uid,确认 `setuid(0)` 失败且 CapPrm/CapEff 为 0;
+    读不到 `/proc/self/status`,例如调用者把 fd 上限设为 0,也按失败处理),换上一个自己的会话 keyring(RHEL 的 `/etc/pam.d/sudo` 里
+    `pam_keyinit` 可能给助手建了 root 的会话 keyring 并链着 root 的 user keyring,会话 keyring 跨 fork、setuid、exec 保留;
+    只有内核不支持 keyring 的 ENOSYS 放过,其余错误一律拒绝),再设置 `PR_SET_NO_NEW_PRIVS`:命名空间里的网络(DNS、路由)完全由用户的 proxytun 控制,setuid 程序(sudo、su,或经 LDAP/Kerberos 认证的 PAM)
     在里面拿到 root 就等于用户拿到 root。之后以用户身份 `chdir`、查 PATH、`exec`。
   - root 进程写 `resolv.conf` 一律放在 `/tmp` 下(不看 `$TMPDIR`):在用户能控制的目录里,mkdtemp 建的目录可能在写入前被换成指向 `/etc` 的链接;
     粘滞位的 `/tmp` 里别人改不了我们的目录名。文件用 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建,权限经 fd 设置。
@@ -77,10 +84,15 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
     程序没有控制终端,Ctrl+Z 与窗口大小变化到不了它:检测到时 warn。
   - 程序的进程属性与 userns 模式一致:umask 随请求传过去;非 close-on-exec 的 fd(≥3,最多 249 个,SCM_RIGHTS 一次 253 个减去固定的 4 个)
     随请求传过去(编号须小于 2^20),放行后先各自复制到不属于任何目标编号的最低空闲编号,再 `dup2` 回原编号:
-    继承的 fd 紧挨着上限时也不会超出调用者的 fd 上限;资源限制在降权前逐项降到调用者的值(`prlimit` 读调用者的 16 项,
-    只降不升:CentOS 7 的 `20-nproc.conf` 给 root 不限进程数,管理员给用户设的 nproc/memlock 必须仍然有效)。
+    继承的 fd 紧挨着上限时也不会超出调用者的 fd 上限;资源限制在降权前逐项设为调用者的值(`prlimit` 读调用者的 16 项)。
+    第五轮复查前是"只降不升"(取两者较小值),但 sudo 也会给 root 更低的限制:sudo 1.9.13 起命令的 core 上限为 0,
+    pam_limits 给 root 的 fd 软上限可能低于调用者,继承的 fd 编号超过它时 `dup2` 失败。现在与 userns 模式一样完全是调用者的值
+    (CentOS 7 的 `20-nproc.conf` 给 root 不限进程数,管理员给用户设的 nproc/memlock 照样有效);root 没有 `CAP_SYS_RESOURCE`
+    (容器)恢复不了更高的硬上限时,保留较低的那个。stdio 的 `dup2` 失败即报错。
   - sudoers 的 `ROLE`/`TYPE`(或 AppArmor profile)会让 sudo 在另一个安全上下文里运行助手,程序会带着它:比较
     `/proc/self/attr/current` 与调用者的,不同就拒绝。默认配置下 sudo 不改上下文。
+  - sudoers 的 `intercept` / `log_subcmds` 让 sudo 跟踪(ptrace)命令或给它加 seccomp 过滤器,程序的每次 exec 都会被 root 看到、
+    可被拦住:助手被跟踪(`TracerPid` 非 0)或 `Seccomp` / `Seccomp_filters` 与调用者不同就拒绝。容器给所有进程的过滤器调用者也有,不受影响。
 - 1024 以下端口:绑定检查的是"拥有该网络命名空间的 user namespace 里是否有 `CAP_NET_BIND_SERVICE`",
   建命名空间的那一步本来就有,所以转发低端口不需要额外的 root;建好的监听 socket 交给普通用户进程后 accept 不需要权限。
   程序自己在命名空间里监听低端口仍会失败,与它在主机上直接运行时一致。

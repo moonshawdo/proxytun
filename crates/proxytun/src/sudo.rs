@@ -13,24 +13,31 @@
 //!     SUDO_UID; the program's gid and groups are read from that process in
 //!     /proc (kernel-provided), never from the request;
 //!   * refuses when sudo would run it in another security context than the
-//!     caller's (sudoers ROLE/TYPE): the program would carry it;
+//!     caller's (sudoers ROLE/TYPE), traced, or under a syscall filter of its
+//!     own (sudoers intercept, log_subcmds): the program would carry them;
+//!   * never receives anything from the client but bytes: it creates the
+//!     (empty) namespaces and forks the program, which takes the caller's
+//!     resource limits, drops to the user (groups, gid, uid, a session
+//!     keyring of its own; no capability may survive) and sets
+//!     no_new_privs, so no setuid program can regain root in a network the
+//!     user controls; only then does the program read the request and the
+//!     fds (stdin, stdout, stderr, working directory, and those it
+//!     inherits), and pass the request on to the helper on a pipe. Closing
+//!     an fd the user chose may block (SO_LINGER, a file on their FUSE
+//!     mount): that happens to the user's process, never to root's;
 //!   * reads no config and opens no path the user chose: the request carries
-//!     only the fake-ip range, the argv, the environment, the umask, and the
-//!     fds (stdin, stdout, stderr, working directory, and those the program
-//!     inherits), and is checked again here, since anyone may write their own
-//!     client;
-//!   * gives up after `HELPER_TIMEOUT` on a client that does not talk;
-//!   * forks the program, puts it in proxytun's process group (or, when sudo
-//!     gave it a terminal session of its own, `use_pty`, out of that session
-//!     before it ends and hangs the program up), and has it lower its
-//!     resource limits to the caller's (PAM may give root more), drop to the
-//!     user (groups, gid,
-//!     uid; no capability may survive) and set no_new_privs, so no setuid
-//!     program can regain root in a network the user controls; then take the
-//!     user's umask, stdio, directory and environment, wait for the go-ahead,
-//!     and put the inherited fds back at their numbers;
-//!   * hands the TUN device and listener back and exits: from then on no
-//!     process of ours runs as root.
+//!     only the fake-ip range, the host ports, the process group, the argv,
+//!     the environment, the umask and the inherited fd numbers, and is
+//!     checked again here, since anyone may write their own client;
+//!   * gives up after `HELPER_TIMEOUT` (and a little) on a client, or a
+//!     program side, that does not talk;
+//!   * fills the namespaces, puts the program in proxytun's process group
+//!     (or, when sudo gave it a terminal session of its own, `use_pty`, has
+//!     it leave that session before it ends and hangs the program up),
+//!     hands the TUN device and listener back and exits: from then on no
+//!     process of ours runs as root. The program takes the user's umask,
+//!     stdio, directory and environment, waits for the go-ahead, and puts
+//!     the inherited fds back at their numbers.
 
 use crate::netns::{self, Child, Handover, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -41,8 +48,9 @@ use nix::sys::socket::{
 };
 use std::ffi::{CString, OsString};
 use std::io::IoSlice;
+use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::Duration;
 
@@ -248,7 +256,8 @@ fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
     Ok(())
 }
 
-/// The resource limits of `pid`: all 16 Linux has had since 2.6.25.
+/// The resource limits of `pid`: all 16 Linux has had since 2.6.25. The
+/// program takes them (see `adopt_limits`).
 fn limits_of(pid: libc::pid_t) -> Result<Vec<libc::rlimit>> {
     (0..16)
         .map(|r| {
@@ -372,7 +381,13 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
     let path = dir.path().join("ctl");
     // Non-blocking: while waiting we must notice sudo giving up.
     let l = seqpacket(SockFlag::SOCK_NONBLOCK)?;
-    bind(l.as_raw_fd(), &UnixAddr::new(&path)?).context("bind the helper socket")?;
+    let addr = UnixAddr::new(&path).with_context(|| {
+        format!(
+            "the helper socket {} is too long a path: set TMPDIR to a shorter directory",
+            path.display()
+        )
+    })?;
+    bind(l.as_raw_fd(), &addr).context("bind the helper socket")?;
     listen(&l, Backlog::new(1)?).context("listen")?;
     let exe = std::env::current_exe().context("locate our own executable for sudo")?;
     // stdio stays ours: sudo asks for the password on the terminal.
@@ -514,11 +529,14 @@ fn helper(args: &[OsString]) -> Result<()> {
     };
     let (sudo_uid, sudo_gid) = (id("SUDO_UID")?, id("SUDO_GID")?);
 
-    let ctl = seqpacket(SockFlag::empty())?;
+    // Never closed by us, only by the kernel when we exit: the client may
+    // queue fds on it, and the last close releases them, where a socket with
+    // SO_LINGER would keep root waiting. At exit lingering does not apply.
+    let ctl = ManuallyDrop::new(seqpacket(SockFlag::empty())?);
     set_timeouts(&ctl, HELPER_TIMEOUT)?;
     let addr = UnixAddr::new(path.as_os_str())?;
     as_caller(sudo_uid, sudo_gid, || connect(ctl.as_raw_fd(), &addr))?.context("connect to proxytun")?;
-    let cred = getsockopt(&ctl, sockopt::PeerCredentials).context("SO_PEERCRED")?;
+    let cred = getsockopt(&*ctl, sockopt::PeerCredentials).context("SO_PEERCRED")?;
     // The socket's creator must be the process that ran sudo: one of our
     // ancestors (sudo, sudo's pty monitor in between), alive, so its pid has
     // not been reused and its /proc entries are its own.
@@ -542,231 +560,397 @@ fn helper(args: &[OsString]) -> Result<()> {
             anyhow!("sudo runs its command in another security context than yours (sudoers ROLE/TYPE?)"),
         );
     }
-    let caller = crate::witness::proc_stat(cred.pid());
-    let caller_pgrp = caller.map_or(-1, |s| s.pgrp);
-
-    let mut buf = vec![0u8; 1 << 20];
-    let (n, fds) = netns::recv_with_fds(&ctl, &mut buf).context("read the request")?;
-    let Some(req) = Request::decode(&buf[..n]) else {
-        return refuse(&ctl, anyhow!("malformed request"));
-    };
-    if let Err(e) = validate(&req, caller_pgrp) {
+    let own = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    if let Err(e) = same_confinement(&own, &status) {
         return refuse(&ctl, e);
     }
-    if fds.len() != 4 + req.inherit.len() {
-        return refuse(&ctl, anyhow!("expected {} fds", 4 + req.inherit.len()));
-    }
-    let mut fds = fds.into_iter();
-    let mut next = || fds.next().expect("counted");
-    let (stdin, stdout, stderr, cwd) = (next(), next(), next(), next());
-    let inherit: Vec<(RawFd, OwnedFd)> = req.inherit.iter().map(|&n| (n, next())).collect();
+    let caller = crate::witness::proc_stat(cred.pid());
+    let caller_pgrp = caller.map_or(-1, |s| s.pgrp);
     let limits = match limits_of(cred.pid()) {
         Ok(l) => l,
         Err(e) => return refuse(&ctl, e),
     };
-    // The program shares this socket and waits on it for the go-ahead for as
-    // long as proxytun needs.
-    set_timeouts(&ctl, Duration::ZERO)?;
 
-    let ns = match netns::setup_namespace(req.fake_range, false, &req.forwards) {
-        Ok(v) => v,
-        Err(e) => {
-            netns::send_error(&ctl, &e);
-            return Err(e.err);
-        }
-    };
+    // The namespaces first, still empty: the program is forked into them
+    // before anything the client sends reaches a process of ours. The
+    // request and its fds go to the program, once it is the user; it passes
+    // the request on to us as bytes, on a pipe, which carries no fds.
+    if let Err(e) = netns::enter_namespace(false) {
+        netns::send_error(&ctl, &e);
+        return Err(e.err);
+    }
     // sudo gave us a terminal session of its own (`use_pty`): when its
     // leader, sudo's monitor, exits after us, the terminal hangs up whatever
     // is still in it. The program leaves first and tells us on this pipe.
     // SAFETY: plain syscall.
-    let detach = if caller.map(|s| s.session) != Some(unsafe { libc::getsid(0) }) {
-        let mut p = [0; 2];
-        // SAFETY: pipe2 fills both fds, owned right away.
-        if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            bail!("pipe: {}", std::io::Error::last_os_error());
-        }
-        Some(unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) })
+    let (left, detach) = if caller.map(|s| s.session) != Some(unsafe { libc::getsid(0) }) {
+        let (r, w) = pipe()?;
+        (Some(r), Some(w))
     } else {
-        None
+        (None, None)
     };
-    let (left, detach) = match detach {
-        Some((r, w)) => (Some(r), Some(w)),
-        None => (None, None),
-    };
-    let prepared = Prepared::new(&req, limits, inherit, detach)?;
-    // SAFETY: we are single-threaded; the child only uses prepared data.
+    let (from_program, to_parent) = pipe()?;
+    // SAFETY: we are single-threaded.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         bail!("fork: {}", std::io::Error::last_os_error());
     }
     if pid == 0 {
-        drop(ns);
-        let why = prepared.become_user(&who, [&stdin, &stdout, &stderr], &cwd, &ctl, &req.argv);
+        drop((left, from_program));
+        let why = become_program(&who, &limits, detach, &ctl, to_parent);
         // Only reached on failure; stderr is the user's by now, or ours.
-        eprintln!("proxytun (sudo helper): {why}");
+        // Empty: the parent got the reason, and says it.
+        if !why.is_empty() {
+            eprintln!("proxytun (sudo helper): {why}");
+        }
         unsafe { libc::_exit(126) };
     }
-    if let Some(left) = left {
-        drop(prepared); // our copy of the write end: EOF should the child die
-        let mut b = [0u8; 1];
-        // SAFETY: plain read into a local buffer.
-        unsafe { libc::read(left.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+    drop((detach, to_parent)); // EOF should the program side die
+    let served = (|| -> Result<()> {
+        if let Some(left) = left {
+            let mut b = [0u8; 1];
+            // SAFETY: plain read into a local buffer.
+            unsafe { libc::read(left.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+        }
+        let req = match read_report(&from_program) {
+            Ok(r) => r,
+            Err(e) => return refuse(&ctl, e),
+        };
+        if let Err(e) = validate(&req, caller_pgrp) {
+            return refuse(&ctl, e);
+        }
+        let ns = match netns::configure_namespace(req.fake_range, false, &req.forwards) {
+            Ok(v) => v,
+            Err(e) => {
+                netns::send_error(&ctl, &e);
+                return Err(e.err);
+            }
+        };
+        // Join proxytun's group. Safe from the parent alone: the program
+        // cannot exec (and so make setpgid fail) before the go-ahead, which
+        // follows our report.
+        // SAFETY: plain syscall.
+        let joined = unsafe { libc::setpgid(pid, req.pgrp) } == 0 || crate::witness::pgrp_of(pid) == Some(req.pgrp);
+        let report = format!("pid={pid} pgrp={}", if joined { "joined" } else { "alone" });
+        netns::send_ok(&ctl, &ns, &report)
+    })();
+    if served.is_err() {
+        // Not waited for: it holds the user's fds, and its exit may block on
+        // them.
+        // SAFETY: plain syscall on our own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
     }
-    // Join proxytun's group. Safe from the parent alone: the child cannot exec
-    // (and so make setpgid fail) before the go-ahead, which follows our report.
-    // SAFETY: plain syscall.
-    let joined = unsafe { libc::setpgid(pid, req.pgrp) } == 0 || crate::witness::pgrp_of(pid) == Some(req.pgrp);
-    let report = format!("pid={pid} pgrp={}", if joined { "joined" } else { "alone" });
-    netns::send_ok(&ctl, &ns, &report)?;
+    served
+}
+
+/// A close-on-exec pipe: (read end, write end).
+fn pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut p = [0; 2];
+    // SAFETY: pipe2 fills both fds, owned right away.
+    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        bail!("pipe: {}", std::io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) })
+}
+
+/// The longest request: the environment and argv of a program, as one
+/// message.
+const REQUEST_MAX: usize = 1 << 20;
+
+/// The program side's report: `R` and the request it got, or `E` and why it
+/// got none. It runs as the user by then, who may stop it: waited for a
+/// little longer than it waits for the client, no more.
+fn read_report(from: &OwnedFd) -> Result<Request> {
+    let deadline = std::time::Instant::now() + HELPER_TIMEOUT + Duration::from_secs(5);
+    let mut got = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut p = libc::pollfd {
+            fd: from.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: plain syscalls on a local pollfd and buffer.
+        let n = match unsafe { libc::poll(&mut p, 1, wait.as_millis() as libc::c_int) } {
+            0 => bail!("no request from the client"),
+            n if n < 0 => -1,
+            _ => unsafe { libc::read(from.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) },
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            ensure!(e.kind() == std::io::ErrorKind::Interrupted, "reading the request: {e}");
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&chunk[..n as usize]);
+        ensure!(got.len() <= 1 + REQUEST_MAX, "request too large");
+    }
+    match got.split_first() {
+        Some((b'R', req)) => Request::decode(req).ok_or_else(|| anyhow!("malformed request")),
+        Some((b'E', why)) => Err(anyhow!("{}", String::from_utf8_lossy(why))),
+        _ => Err(anyhow!("the program side died before reading the request")),
+    }
+}
+
+/// sudo may run its command traced, or under a syscall filter of its own
+/// (sudoers `intercept`, `log_subcmds`): the program would carry them, with
+/// root watching its every exec. Ours must be the caller's.
+fn same_confinement(own_status: &str, caller_status: &str) -> Result<()> {
+    let field = |s: &str, name: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(str::trim)
+            .map(str::to_owned)
+    };
+    ensure!(
+        field(own_status, "TracerPid:").as_deref() == Some("0"),
+        "sudo runs its command traced (sudoers intercept or log_subcmds?)"
+    );
+    for name in ["Seccomp:", "Seccomp_filters:"] {
+        ensure!(
+            field(own_status, name) == field(caller_status, name),
+            "sudo runs its command under a syscall filter of its own (sudoers intercept or log_subcmds?)"
+        );
+    }
     Ok(())
 }
 
-/// What the program takes from the user, built before fork.
-struct Prepared {
-    env: Vec<CString>,
-    /// The caller's resource limits, by resource number: the program's are
-    /// lowered to them.
-    limits: Vec<libc::rlimit>,
-    umask: libc::mode_t,
-    /// (number in proxytun, fd here).
-    inherit: Vec<(RawFd, OwnedFd)>,
-    /// Write end of the pipe the program reports leaving sudo's session on.
-    detach: Option<OwnedFd>,
+/// Did the drop to the user leave no capability, as `status` (our
+/// /proc/self/status) shows? Unreadable (an fd limit of 0) counts as no.
+fn capabilities_gone(status: Option<&str>) -> bool {
+    let zero = |name: &str| {
+        status
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix(name)))
+            .is_some_and(|v| v.trim().trim_start_matches('0').is_empty())
+    };
+    zero("CapPrm:") && zero("CapEff:")
 }
 
-impl Prepared {
-    fn new(
-        req: &Request,
-        limits: Vec<libc::rlimit>,
-        inherit: Vec<(RawFd, OwnedFd)>,
-        detach: Option<OwnedFd>,
-    ) -> Result<Self> {
-        let env = req
-            .env
-            .iter()
-            .map(|e| CString::new(e.as_bytes()).context("environment entry contains NUL"))
-            .collect::<Result<_>>()?;
-        Ok(Prepared {
-            env,
-            limits,
-            umask: req.umask,
-            inherit,
-            detach,
-        })
-    }
-
-    /// In the forked child: become the user, wait for the go-ahead on `ctl`,
-    /// then become the program. Returns only on failure, with the reason.
-    fn become_user(
-        &self,
-        who: &Identity,
-        stdio: [&OwnedFd; 3],
-        cwd: &OwnedFd,
-        ctl: &OwnedFd,
-        argv: &[OsString],
-    ) -> String {
-        // SAFETY: plain syscalls; the helper is single-threaded, so the
-        // child may use the environment and the allocator.
+/// Take the caller's resource limits, as userns mode leaves them: PAM may
+/// give root more (nproc, memlock), sudo less (no core dumps). A higher hard
+/// limit root cannot restore (without CAP_SYS_RESOURCE: a container) stays
+/// lower.
+fn adopt_limits(limits: &[libc::rlimit]) -> std::result::Result<(), String> {
+    for (r, l) in limits.iter().enumerate() {
+        // SAFETY: plain syscalls on local structs.
         unsafe {
-            if let Some(w) = &self.detach {
-                if libc::setsid() < 0 {
-                    return format!("leaving sudo's session: {}", std::io::Error::last_os_error());
-                }
-                libc::write(w.as_raw_fd(), b"s".as_ptr().cast(), 1);
+            if libc::setrlimit(r as _, l) == 0 {
+                continue;
             }
-            // The caller's limits wherever PAM gave root more (nproc, memlock:
-            // what the admin set for the user holds); only ever lowering.
-            for (r, l) in self.limits.iter().enumerate() {
-                let mut now = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                libc::getrlimit(r as _, &mut now);
-                let lower = libc::rlimit {
-                    rlim_cur: now.rlim_cur.min(l.rlim_cur),
-                    rlim_max: now.rlim_max.min(l.rlim_max),
-                };
-                if libc::setrlimit(r as _, &lower) != 0 {
-                    return format!("applying your resource limits: {}", std::io::Error::last_os_error());
-                }
-            }
-            if libc::setgroups(who.groups.len(), who.groups.as_ptr()) != 0
-                || libc::setresgid(who.gid, who.gid, who.gid) != 0
-                || libc::setresuid(who.uid, who.uid, who.uid) != 0
-            {
-                return format!("dropping to uid {}: {}", who.uid, std::io::Error::last_os_error());
-            }
-            let (mut r, mut e, mut s) = (0, 0, 0);
-            libc::getresuid(&mut r, &mut e, &mut s);
-            if (r, e, s) != (who.uid, who.uid, who.uid) || libc::setuid(0) == 0 {
-                return "privileges were not dropped".into();
-            }
-            let caps = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-            if caps.lines().any(|l| {
-                l.strip_prefix("CapEff:")
-                    .or_else(|| l.strip_prefix("CapPrm:"))
-                    .is_some_and(|v| !v.trim().trim_start_matches('0').is_empty())
-            }) {
-                return "capabilities survived the drop to the user".into();
-            }
-            // The network in here is the user's: a setuid program (sudo, su,
-            // anything PAM authenticates over the network) must not regain
-            // root in it.
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1
-            {
-                return format!("setting no_new_privs: {}", std::io::Error::last_os_error());
-            }
-            libc::umask(self.umask);
-            for (i, fd) in stdio.iter().enumerate() {
-                libc::dup2(fd.as_raw_fd(), i as libc::c_int);
-            }
-            // As the user: a directory it cannot enter is its problem, not
-            // something root opens for it.
-            if libc::fchdir(cwd.as_raw_fd()) != 0 {
-                return format!("entering the working directory: {}", std::io::Error::last_os_error());
-            }
-        }
-        // The user's environment; execvp then searches the user's PATH.
-        // SAFETY: single-threaded; the strings live in `self` until exec.
-        unsafe {
-            libc::clearenv();
-            for e in &self.env {
-                libc::putenv(e.as_ptr() as *mut _);
-            }
-        }
-        netns::wait_go(ctl);
-        // The inherited fds at the numbers they had in proxytun. Each is first
-        // copied to the lowest free number that is no one's target (a target
-        // may be held by one of them, or by ctl, done with now), staying under
-        // the caller's fd limit as userns mode would; the copies close on exec.
-        let targets: std::collections::HashSet<RawFd> = self.inherit.iter().map(|(n, _)| *n).collect();
-        let mut moved = Vec::new();
-        for (n, fd) in &self.inherit {
-            let mut from = 3;
-            let m = loop {
-                // SAFETY: plain syscalls on fds we hold.
-                let m = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, from) };
-                if m < 0 {
-                    return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
-                }
-                if !targets.contains(&m) {
-                    break m;
-                }
-                unsafe { libc::close(m) };
-                from = m + 1;
+            let mut now = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
             };
-            moved.push((*n, m));
+            libc::getrlimit(r as _, &mut now);
+            let lower = libc::rlimit {
+                rlim_cur: l.rlim_cur.min(now.rlim_max),
+                rlim_max: l.rlim_max.min(now.rlim_max),
+            };
+            if libc::setrlimit(r as _, &lower) != 0 {
+                return Err(format!(
+                    "applying your resource limits: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
-        for (n, m) in moved {
-            // SAFETY: as above.
-            if unsafe { libc::dup2(m, n) } < 0 {
+    }
+    Ok(())
+}
+
+/// A session keyring of our own. pam_keyinit (RHEL's /etc/pam.d/sudo) may
+/// have given the helper root's, with root's user keyring linked into it;
+/// session keyrings survive fork, setuid and exec.
+fn own_session_keyring() -> std::result::Result<(), String> {
+    const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+    // SAFETY: a NULL name asks for a new anonymous keyring.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<libc::c_char>(),
+        )
+    };
+    let e = std::io::Error::last_os_error();
+    // ENOSYS: a kernel without keyrings, no root's to reach either.
+    if r >= 0 || e.raw_os_error() == Some(libc::ENOSYS) {
+        return Ok(());
+    }
+    Err(format!("leaving root's session keyring: {e}"))
+}
+
+/// Write the report to the parent (see `read_report`) and close the pipe,
+/// so it reads on at once whatever happens to us next.
+fn tell(to_parent: OwnedFd, kind: u8, body: &[u8]) {
+    let mut msg = Vec::with_capacity(1 + body.len());
+    msg.push(kind);
+    msg.extend_from_slice(body);
+    let mut rest = &msg[..];
+    while !rest.is_empty() {
+        // SAFETY: plain write of our own buffer.
+        let n = unsafe { libc::write(to_parent.as_raw_fd(), rest.as_ptr().cast(), rest.len()) };
+        if n <= 0 {
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        rest = &rest[n as usize..];
+    }
+}
+
+/// In the forked child, still root: leave sudo's session if asked
+/// (`detach`), take the caller's limits, drop to the user (groups, gid, uid,
+/// keyring; no capability may survive) and set no_new_privs, so no setuid
+/// program can regain root in a network the user controls. Only then take
+/// the request and the fds from the client: closing an fd of theirs can
+/// block (SO_LINGER, a file on their FUSE mount), which must never happen to
+/// root. Report the request to the parent, take the user's umask, stdio,
+/// directory and environment, wait for the go-ahead, put the inherited fds
+/// back at their numbers and become the program. Returns only on failure,
+/// with the reason, or empty when the parent, still listening, got it.
+fn become_program(
+    who: &Identity,
+    limits: &[libc::rlimit],
+    detach: Option<OwnedFd>,
+    ctl: &OwnedFd,
+    to_parent: OwnedFd,
+) -> String {
+    let mut to_parent = Some(to_parent);
+    let mut fail = |why: String| -> String {
+        match to_parent.take() {
+            Some(p) => {
+                tell(p, b'E', why.as_bytes());
+                String::new()
+            }
+            None => why,
+        }
+    };
+    // SAFETY: plain syscalls; the helper is single-threaded, so the child
+    // may use the environment and the allocator.
+    unsafe {
+        if let Some(w) = detach {
+            if libc::setsid() < 0 {
+                return fail(format!("leaving sudo's session: {}", std::io::Error::last_os_error()));
+            }
+            libc::write(w.as_raw_fd(), b"s".as_ptr().cast(), 1);
+        }
+        if let Err(e) = adopt_limits(limits) {
+            return fail(e);
+        }
+        if libc::setgroups(who.groups.len(), who.groups.as_ptr()) != 0
+            || libc::setresgid(who.gid, who.gid, who.gid) != 0
+            || libc::setresuid(who.uid, who.uid, who.uid) != 0
+        {
+            return fail(format!(
+                "dropping to uid {}: {}",
+                who.uid,
+                std::io::Error::last_os_error()
+            ));
+        }
+        let (mut r, mut e, mut s) = (0, 0, 0);
+        libc::getresuid(&mut r, &mut e, &mut s);
+        if (r, e, s) != (who.uid, who.uid, who.uid) || libc::setuid(0) == 0 {
+            return fail("privileges were not dropped".into());
+        }
+        if let Err(e) = own_session_keyring() {
+            return fail(e);
+        }
+        if !capabilities_gone(std::fs::read_to_string("/proc/self/status").ok().as_deref()) {
+            return fail("capabilities survived the drop to the user, or cannot be checked".into());
+        }
+        // The network in here is the user's: a setuid program (sudo, su,
+        // anything PAM authenticates over the network) must not regain
+        // root in it.
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1
+        {
+            return fail(format!("setting no_new_privs: {}", std::io::Error::last_os_error()));
+        }
+    }
+    let mut buf = vec![0u8; REQUEST_MAX];
+    let (n, fds) = match netns::recv_with_fds(ctl, &mut buf) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("read the request: {e:#}")),
+    };
+    // Not closed on the way out, failing: at exit the kernel does it, and
+    // lingering does not apply there.
+    let fds: Vec<RawFd> = fds.into_iter().map(IntoRawFd::into_raw_fd).collect();
+    let Some(req) = Request::decode(&buf[..n]) else {
+        return fail("malformed request".into());
+    };
+    if fds.len() != 4 + req.inherit.len() {
+        return fail(format!("expected {} fds", 4 + req.inherit.len()));
+    }
+    let env: Vec<CString> = match req.env.iter().map(|e| CString::new(e.as_bytes())).collect() {
+        Ok(v) => v,
+        Err(_) => return fail("environment entry contains NUL".into()),
+    };
+    // The program shares this socket and waits on it for the go-ahead for as
+    // long as proxytun needs.
+    if let Err(e) = set_timeouts(ctl, Duration::ZERO) {
+        return fail(format!("{e:#}"));
+    }
+    if let Some(p) = to_parent.take() {
+        tell(p, b'R', &buf[..n]);
+    }
+    drop(buf);
+    let (stdio, cwd, inherit) = (&fds[..3], fds[3], &fds[4..]);
+    // SAFETY: plain syscalls on fds we hold.
+    unsafe {
+        libc::umask(req.umask);
+        for (i, &fd) in stdio.iter().enumerate() {
+            if libc::dup2(fd, i as libc::c_int) < 0 {
+                return format!("taking your stdio: {}", std::io::Error::last_os_error());
+            }
+        }
+        // As the user: a directory it cannot enter is its problem, not
+        // something root opens for it.
+        if libc::fchdir(cwd) != 0 {
+            return format!("entering the working directory: {}", std::io::Error::last_os_error());
+        }
+    }
+    // The user's environment; execvp then searches the user's PATH.
+    // SAFETY: single-threaded; the strings live in `env` until exec.
+    unsafe {
+        libc::clearenv();
+        for e in &env {
+            libc::putenv(e.as_ptr() as *mut _);
+        }
+    }
+    netns::wait_go(ctl);
+    // The inherited fds at the numbers they had in proxytun. Each is first
+    // copied to the lowest free number that is no one's target (a target
+    // may be held by one of them, or by ctl, done with now), staying under
+    // the caller's fd limit as userns mode would; the copies close on exec.
+    let targets: std::collections::HashSet<RawFd> = req.inherit.iter().copied().collect();
+    let mut moved = Vec::new();
+    for (&n, &fd) in req.inherit.iter().zip(inherit) {
+        let mut from = 3;
+        let m = loop {
+            // SAFETY: plain syscalls on fds we hold.
+            let m = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, from) };
+            if m < 0 {
                 return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
             }
-        }
-        let code = netns::exec(argv);
-        unsafe { libc::_exit(code) }
+            if !targets.contains(&m) {
+                break m;
+            }
+            unsafe { libc::close(m) };
+            from = m + 1;
+        };
+        moved.push((n, m));
     }
+    for (n, m) in moved {
+        // SAFETY: as above.
+        if unsafe { libc::dup2(m, n) } < 0 {
+            return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
+        }
+    }
+    let code = netns::exec(&req.argv);
+    unsafe { libc::_exit(code) }
 }
 
 #[cfg(test)]
@@ -915,6 +1099,46 @@ mod tests {
         assert!(
             validate(&with(0o022, &fds), 7).is_err(),
             "more than one message carries"
+        );
+    }
+
+    #[test]
+    fn no_capability_may_survive_and_unreadable_means_unknown() {
+        let st = "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n";
+        assert!(capabilities_gone(Some(st)));
+        assert!(!capabilities_gone(Some(
+            &st.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000000400")
+        )));
+        assert!(!capabilities_gone(Some(
+            &st.replace("CapPrm:\t0000000000000000", "CapPrm:\t0000003fffffffff")
+        )));
+        // A fd limit of 0 leaves /proc unreadable: that proves nothing.
+        assert!(!capabilities_gone(None));
+        assert!(!capabilities_gone(Some("")));
+    }
+
+    #[test]
+    fn the_program_runs_neither_traced_nor_filtered_beyond_the_caller() {
+        let caller = "TracerPid:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\n";
+        assert!(same_confinement(caller, caller).is_ok());
+        // A container's filter, the caller's too: fine. (No Seccomp_filters
+        // line before Linux 5.9.)
+        let docker = "TracerPid:\t0\nSeccomp:\t2\n";
+        assert!(same_confinement(docker, docker).is_ok());
+        let traced = caller.replace("TracerPid:\t0", "TracerPid:\t812");
+        assert!(same_confinement(&traced, caller)
+            .unwrap_err()
+            .to_string()
+            .contains("traced"));
+        let filtered = "TracerPid:\t0\nSeccomp:\t2\nSeccomp_filters:\t1\n";
+        assert!(same_confinement(filtered, caller)
+            .unwrap_err()
+            .to_string()
+            .contains("syscall filter"));
+        let one_more = "TracerPid:\t0\nSeccomp:\t2\nSeccomp_filters:\t2\n";
+        assert!(
+            same_confinement(one_more, filtered).is_err(),
+            "sudo's on top of the caller's"
         );
     }
 

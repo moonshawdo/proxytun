@@ -1807,22 +1807,33 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
 /// A stand-in for sudo. Installed setuid in a user namespace where we are
 /// root, it really makes its caller root there. Like sudo it resets the
 /// environment, closes inherited fds, records the caller in SUDO_UID, adds
-/// 022 to the umask and gives the command root's resource limits.
+/// 022 to the umask and gives the command root's resource limits. On
+/// request it also does what some sudo setups do to their command: a root
+/// session keyring (pam_keyinit), a syscall filter or a tracer (intercept,
+/// log_subcmds), lower limits (no core dumps).
 const C_FAKE_SUDO: &str = r#"
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <grp.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
     if (getenv("FAKE_SUDO_FAIL")) { fprintf(stderr, "fake sudo: authentication failure\n"); return 1; }
     int new_pgrp = getenv("FAKE_SUDO_NEW_PGRP") != NULL, new_session = getenv("FAKE_SUDO_SETSID") != NULL;
     int to_root = getenv("FAKE_SUDO_CHDIR") != NULL, use_pty = getenv("FAKE_SUDO_USE_PTY") != NULL;
+    int low_limits = getenv("FAKE_SUDO_LOW_LIMITS") != NULL, keyring = getenv("FAKE_SUDO_KEYRING") != NULL;
+    int filter = getenv("FAKE_SUDO_SECCOMP") != NULL, trace = getenv("FAKE_SUDO_TRACE") != NULL;
     char uid[32], gid[32];
     const char *forced = getenv("FAKE_SUDO_UID");
     if (forced) snprintf(uid, sizeof uid, "%s", forced); else snprintf(uid, sizeof uid, "%u", getuid());
@@ -1877,6 +1888,34 @@ int main(int argc, char **argv) {
         close(m);
     }
     if (setgroups(0, NULL) || setresgid(0, 0, 0) || setresuid(0, 0, 0)) { perror("fake sudo"); return 1; }
+    if (low_limits) {
+        struct rlimit core, nofile;
+        getrlimit(RLIMIT_CORE, &core);
+        getrlimit(RLIMIT_NOFILE, &nofile);
+        core.rlim_cur = 0;
+        nofile.rlim_cur = 300;
+        if (setrlimit(RLIMIT_CORE, &core) || setrlimit(RLIMIT_NOFILE, &nofile)) { perror("fake sudo: limits"); return 1; }
+    }
+    if (keyring && syscall(SYS_keyctl, 1 /* JOIN_SESSION_KEYRING */, "fake-sudo-root") < 0) {
+        perror("fake sudo: keyctl"); return 1;
+    }
+    if (filter) {
+        struct sock_filter allow[] = { BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW) };
+        struct sock_fprog prog = { 1, allow };
+        if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)) { perror("fake sudo: seccomp"); return 1; }
+    }
+    if (trace) {
+        pid_t cmd = fork();
+        if (cmd > 0) {
+            int st;
+            while (waitpid(cmd, &st, 0) == cmd && WIFSTOPPED(st)) {
+                int sig = WSTOPSIG(st) == SIGTRAP ? 0 : WSTOPSIG(st);
+                ptrace(PTRACE_CONT, cmd, 0, sig);
+            }
+            return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+        }
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0)) { perror("fake sudo: ptrace"); _exit(1); }
+    }
     execv(argv[2], argv + 2);
     perror("fake sudo: exec");
     return 127;
@@ -2215,6 +2254,28 @@ def listener():
     l.listen(1)
     return l
 
+if case in ("linger", "stranger"):
+    # Fds whose last close blocks for a minute: a socket with SO_LINGER and
+    # unsent data, and its peer, which never reads. They travel inside the
+    # receiving end of a socketpair, so all we hold is that end, closed right
+    # after sending: from then on whoever got it holds the last reference.
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    a = socket.create_connection(srv.getsockname())
+    b, _ = srv.accept()
+    a.setblocking(False)
+    try:
+        while True:
+            a.send(b"x" * 65536)
+    except BlockingIOError:
+        pass
+    a.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 60))
+    x, y = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    socket.send_fds(x, [b"in flight"], [a.fileno(), b.fileno()])
+    for s in (a, b, srv, x):
+        s.close()
+
 if case == "stranger":
     # The socket belongs to our child, not to the process that ran sudo.
     r, w = os.pipe()
@@ -2223,20 +2284,36 @@ if case == "stranger":
         l = listener()
         os.write(w, b"x")
         c, _ = l.accept()
+        # Queued, never read: the helper ends the connection unread.
+        socket.send_fds(c, [b"junk\0"], [y.fileno()])
+        y.close()
         uid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
         print("peer uid:", uid, flush=True)
-        print("got:", c.recv(4096).decode(errors="replace"), flush=True)
+        try:
+            got = c.recv(4096)
+        except ConnectionResetError:  # closed with our message unread
+            got = b""
+        print("got:", got.decode(errors="replace"), flush=True)
         os._exit(0)
+    y.close()
     os.read(r, 1)
+    start = time.monotonic()
     rc = subprocess.call(helper)
     os.waitpid(pid, 0)
-    print(f"rc={rc}", flush=True)
+    print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
     sys.exit()
 
 l = listener()
 p = subprocess.Popen(helper)
 c, _ = l.accept()
 start = time.monotonic()
+if case == "linger":
+    socket.send_fds(c, [b"junk\0"], [y.fileno()])
+    y.close()
+    print("got:", c.recv(4096)[:2].decode(errors="replace"), flush=True)
+    rc = p.wait(timeout=90)
+    print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
+    sys.exit()
 if case == "silent":
     rc = p.wait(timeout=30)
     print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
@@ -2270,7 +2347,7 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     require_centos7!("python3");
     let dir = shared_dir("helper-client");
     std::fs::write(dir.join("client.py"), PY_HELPER_CLIENT).unwrap();
-    let cases = ["stranger", "range", "pgrp", "fds", "silent", "late"];
+    let cases = ["stranger", "range", "pgrp", "fds", "linger", "silent", "late"];
     let user = format!(
         "for c in {}; do python3 \"$D/client.py\" \"$BIN\" \"$D\" $c > \"$D/out-$c\" 2>&1 & done; wait",
         cases.join(" ")
@@ -2289,7 +2366,7 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
         "{}",
         all()
     );
-    assert!(got("stranger").ends_with("rc=1\n"), "{}", all());
+
     // Requests proxytun would never send.
     assert!(
         got("range").contains("fake-ip range 10.0.0.0/30 out of bounds"),
@@ -2309,22 +2386,66 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     );
     assert!(got("fds").contains("expected 5 fds"), "{}", all());
     assert!(got("fds").ends_with("rc=1\n"), "{}", all());
+    // Whatever fds a client sends, root never holds them: closing them (the
+    // socket lingers for a minute) cannot keep it, and sudo, waiting.
+    assert!(got("linger").contains("malformed request"), "{}", all());
+    assert!(got("linger").contains("got: ER\n"), "{}", all());
+    let secs = |c: &str| -> u64 {
+        got(c)
+            .lines()
+            .last()
+            .and_then(|l| l.strip_prefix("rc=1 after "))
+            .and_then(|s| s.strip_suffix('s'))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("{}", all()))
+    };
+    assert!(secs("linger") < 5, "{}", all());
+    // Nor when they are only queued on the connection, and the helper ends
+    // it without reading (here: for the stranger).
+    assert!(secs("stranger") < 5, "{}", all());
     // A client that never talks does not keep root waiting.
-    let silent = got("silent");
-    let secs: u64 = silent
-        .lines()
-        .last()
-        .and_then(|l| l.strip_prefix("rc=1 after "))
-        .and_then(|s| s.strip_suffix('s'))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| panic!("{}", all()));
-    assert!((5..=15).contains(&secs), "{}", all());
+    assert!((5..=15).contains(&secs("silent")), "{}", all());
     // That limit is for talking to root only: the program, the helper gone,
     // waits for the go-ahead as long as proxytun takes.
     assert!(got("late").ends_with("got: OK\nrc=0\nran\n"), "{}", all());
     for c in ["range", "pgrp", "fds"] {
         assert!(!dir.join(format!("ran-{c}")).exists(), "{c}: nothing may run");
     }
+}
+
+#[test]
+fn the_helper_refuses_a_sudo_that_traces_or_filters_its_command() {
+    require_centos7!();
+    let dir = shared_dir("sudo-confined");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let marker = dir.join("ran");
+    let touch = format!("touch {}", marker.display());
+    // sudoers `intercept` / `log_subcmds`: the program would run with root
+    // watching (and able to stop) its every exec.
+    for (how, says) in [("FAKE_SUDO_SECCOMP", "syscall filter"), ("FAKE_SUDO_TRACE", "traced")] {
+        let out = run_like_centos7(&cfg, &[], &["sh", "-c", &touch], true, &[(how, "1")]);
+        assert_ne!(out.code, 0, "{how}\n{}", out.dump());
+        assert!(out.stderr.contains(says), "{how}\n{}", out.dump());
+        assert!(!marker.exists(), "{how}: the program must not run");
+    }
+}
+
+#[test]
+fn a_tmpdir_too_long_for_the_helper_socket_says_so() {
+    require_centos7!();
+    let dir = shared_dir("sudo-long-tmpdir");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let long = dir.join("t".repeat(100));
+    std::fs::create_dir(&long).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let out = run_like_centos7(&cfg, &[], &["true"], true, &[("TMPDIR", long.to_str().unwrap())]);
+    assert_ne!(out.code, 0, "{}", out.dump());
+    assert!(
+        out.stderr.contains("set TMPDIR to a shorter directory"),
+        "{}",
+        out.dump()
+    );
 }
 
 #[test]
@@ -2398,17 +2519,19 @@ fn under_sudo_the_program_keeps_the_users_limits_umask_and_fds() {
     for n in 20..=60 {
         std::fs::write(dir.join(format!("f{n}")), format!("{n},")).unwrap();
     }
-    // What the program sees of its process: sudo gives root other limits and
-    // umask and closes inherited fds; none of that may reach the program.
+    // What the program sees of its process: sudo gives root other limits
+    // (more, or fewer: no core dumps, fewer fds), another umask and session
+    // keyring, and closes inherited fds; none of that may reach the program.
     // Two inherited fds sit right under the fd limit, where they must stay;
     // a band of them (each its own file) covers the numbers that are free
     // while they are put in place, so none may end up on another's number.
     std::fs::write(
         dir.join("parity.sh"),
-        r#"ulimit -Sn 777; umask 002; exec 775<"$D/five" 776>&1
+        r#"ulimit -Sn 777; ulimit -Sc 1024; umask 002; exec 775<"$D/five" 776>&1
 for n in $(seq 20 60); do eval "exec $n<\"\$D/f$n\""; done
-exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; umask; cat <&775; echo to-776 >&776;
-  for n in $(seq 20 60); do cat <&$n; done; echo; ls /proc/self/fd | sort -n | tr "\n" " "'
+exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; ulimit -Sc; umask; cat <&775; echo to-776 >&776;
+  for n in $(seq 20 60); do cat <&$n; done; echo; grep -c fake-sudo-root /proc/keys;
+  ls /proc/self/fd | sort -n | tr "\n" " "'
 "#,
     )
     .unwrap();
@@ -2419,16 +2542,18 @@ exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; umask; cat <&775
     assert_eq!(plain.code, 0, "{}", plain.dump());
     assert!(!plain.stderr.contains("asking sudo"), "{}", plain.dump());
     let lines: Vec<&str> = plain.stdout.lines().collect();
-    assert_eq!(lines.len(), 7, "{}", plain.dump());
+    assert_eq!(lines.len(), 9, "{}", plain.dump());
     assert_eq!(lines[0], "777", "{}", plain.dump());
     let band: Vec<String> = (20..=60).map(|n| n.to_string()).collect();
     assert_eq!(
         lines[2..],
         [
-            "0002".to_string(),
+            "1024".to_string(),
+            "0002".into(),
             "inherited".into(),
             "to-776".into(),
             format!("{},", band.join(",")),
+            "0".into(),
             format!("0 1 2 3 {} 775 776 ", band.join(" ")),
         ],
         "{}",
@@ -2436,7 +2561,11 @@ exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; umask; cat <&775
     );
     // Through sudo, the same. (A copy of proxytun: the user cannot reach our
     // build directory.)
-    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", "PT=\"$D/pt\" bash \"$D/parity.sh\"");
+    let out = sh_like_centos7(
+        &dir,
+        "cp \"$BIN\" \"$D/pt\"",
+        "FAKE_SUDO_LOW_LIMITS=1 FAKE_SUDO_KEYRING=1 PT=\"$D/pt\" bash \"$D/parity.sh\"",
+    );
     assert_eq!(out.code, 0, "{}", out.dump());
     assert!(out.stderr.contains("asking sudo"), "{}", out.dump());
     assert_eq!(out.stdout, plain.stdout, "{}", out.dump());
@@ -2611,6 +2740,16 @@ fn doctor_reports_rootless_mode_and_each_proxy() {
         "{text}"
     );
     assert_eq!(out.status.code(), Some(1), "a dead proxy fails the doctor\n{text}");
+
+    // Credentials on the command line: the doctor says so too.
+    let out = Command::new(BIN)
+        .args(["--doctor", "--proxy", "socks5://u:secret@127.0.0.1:1"])
+        .arg("-c")
+        .arg(dir.join("none.toml"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--proxy carries credentials"), "{err}");
 }
 
 #[test]

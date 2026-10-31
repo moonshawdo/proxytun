@@ -427,13 +427,28 @@ pub fn setup_namespace(
     userns: bool,
     forwards: &[SocketAddr],
 ) -> std::result::Result<Namespace, SetupError> {
+    enter_namespace(userns)?;
+    configure_namespace(range, userns, forwards)
+}
+
+/// Move this process into new, still empty namespaces (see `setup_namespace`).
+pub fn enter_namespace(userns: bool) -> std::result::Result<(), SetupError> {
     if userns {
-        enter_user_namespace().map_err(|err| SetupError { userns: true, err })?;
+        enter_user_namespace().map_err(|err| SetupError { userns: true, err })
     } else {
         unshare(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS)
             .context("create network and mount namespaces")
-            .map_err(|err| SetupError { userns: false, err })?;
+            .map_err(|err| SetupError { userns: false, err })
     }
+}
+
+/// Fill the namespaces `enter_namespace` made: the TUN device, the listener
+/// and the host-port listeners.
+pub fn configure_namespace(
+    range: Ipv4Net,
+    userns: bool,
+    forwards: &[SocketAddr],
+) -> std::result::Result<Namespace, SetupError> {
     // A user namespace whose capabilities an LSM withholds (Ubuntu's AppArmor
     // restriction) fails here instead, with EPERM.
     let (tun, listener) = configure(range).map_err(|err| SetupError {

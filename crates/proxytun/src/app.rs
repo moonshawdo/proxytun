@@ -49,6 +49,23 @@ fn take_env_secret(name: &str) -> Option<String> {
     value
 }
 
+/// The `--proxy` / `$PROXYTUN_PROXY` override, kept from everyone else: our
+/// memory holds proxy credentials (config, $PROXYTUN_PROXY), which any
+/// process of the same user - the program we start included - could
+/// otherwise read from /proc/<our pid>/environ or /proc/<pid>/mem. Must run
+/// before other threads exist.
+pub fn take_proxy_override(cli: Option<&str>) -> Option<String> {
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    let env_proxy = take_env_secret("PROXYTUN_PROXY");
+    if cli.is_some_and(url_has_credentials) {
+        tracing::warn!(
+            "--proxy carries credentials, which any local user can read from `ps` / /proc/<pid>/cmdline; \
+             put them in the config file (mode 600) or in $PROXYTUN_PROXY instead"
+        );
+    }
+    cli.map(String::from).or(env_proxy)
+}
+
 /// Load the config and apply the `--proxy` / `PROXYTUN_PROXY` override.
 pub fn load_config(path: &Path, proxy_override: Option<&str>) -> Result<Config> {
     let mut cfg = match Config::load(path) {
@@ -79,18 +96,7 @@ pub fn run(args: Args) -> Result<i32> {
         program = %args.argv.first().map(|a| a.to_string_lossy()).unwrap_or_default(),
         "starting"
     );
-    // Our memory holds proxy credentials (config, $PROXYTUN_PROXY). Without
-    // this, any process of the same user - including the program we are about
-    // to run - could read them from /proc/<our pid>/environ or /proc/<pid>/mem.
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    let env_proxy = take_env_secret("PROXYTUN_PROXY");
-    if args.proxy.as_deref().is_some_and(url_has_credentials) {
-        tracing::warn!(
-            "--proxy carries credentials, which any local user can read from `ps` / /proc/<pid>/cmdline; \
-             put them in the config file (mode 600) or in $PROXYTUN_PROXY instead"
-        );
-    }
-    let proxy_override = args.proxy.clone().or(env_proxy);
+    let proxy_override = take_proxy_override(args.proxy.as_deref());
     // Before any thread exists (see `exit_signal_fd`).
     let ignored = ignored_signals(&[libc::SIGHUP, libc::SIGUSR1, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]);
     let exit_sigs: Vec<libc::c_int> = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]

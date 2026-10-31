@@ -190,7 +190,7 @@ fn main() -> Result<()> {
     }
 
     if cli.doctor {
-        let proxy = cli.proxy.clone().or_else(|| std::env::var("PROXYTUN_PROXY").ok());
+        let proxy = app::take_proxy_override(cli.proxy.as_deref());
         let (cfg, problem) = match app::load_config(&cli.config, proxy.as_deref()) {
             Ok(c) => (c, None),
             // Still check the host, with the default settings and no proxy.
