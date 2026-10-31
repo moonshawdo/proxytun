@@ -1,112 +1,72 @@
-# proxytun example config.
+# proxytun config. Only [[proxies]] is required; everything else is shown
+# commented out with its default. A proxyhook.toml works as is: keys proxytun
+# has no use for are reported at start-up and ignored.
 # Top-level keys must come before any [table] in TOML, so they are all here.
-# A proxyhook.toml works as is: keys proxytun has no use for are reported at
-# start-up and ignored.
 
 # --- fake-ip DNS ---------------------------------------------------------
-# Domains the program resolves get an address from this pool, which is how the
-# real hostname survives until the proxy. The last /24 of the range is kept
-# for proxytun's own addresses inside the namespace (the TUN device, the DNS
-# server), so the prefix must be between /8 and /22.
-fake_ip_range = "198.18.0.0/15"
+# Domains the program resolves get an address from this range, which is how
+# the real hostname survives until the proxy. Its last /24 holds proxytun's
+# own addresses (TUN device, DNS server), so the prefix must be /8 to /22.
+# fake_ip_range = "198.18.0.0/15"
 
-# Used to answer non-A queries (MX/TXT/...) and nothing else. Must be ip:port.
-# Reached directly from the host, not through the proxy.
-upstream_dns = "1.1.1.1:53"
+# Where MX/TXT/PTR/... queries (everything but A records) are forwarded, from
+# the host. Default: the first nameserver of the host's /etc/resolv.conf.
+# upstream_dns = "1.1.1.1:53"
 
-# --- behaviour switches --------------------------------------------------
-# Destinations reached directly from the host instead of through the proxy
-# (like proxychains' "localnet"). The proxy endpoints named in the program's
-# own http_proxy / https_proxy / all_proxy variables are added automatically.
-# Add your LAN here if it should bypass the proxy, e.g.
-#   localnet = ["10.0.0.0/8", "192.168.0.0/16"]
-# (127.0.0.0/8 inside the namespace is the namespace's own loopback; it never
-# reaches proxytun.)
-localnet = ["127.0.0.0/8"]
+# --- direct instead of proxied -------------------------------------------
+# Literal-IP destinations reached straight from the host, no rules, no proxy
+# (like proxychains' localnet). The proxies named in the program's own
+# http_proxy / https_proxy / all_proxy are added automatically. Default empty.
+# localnet = ["10.0.0.0/8", "192.168.0.0/16"]
 
-# Recover the hostname of connections to a bare IP by peeking at the first
-# bytes the program sends (TLS SNI / HTTP Host). This catches programs that
-# bypass our DNS, e.g. Chrome with "Secure DNS" (DoH) or hard-coded addresses.
-# Ports not listed in sniff_ports are never delayed.
-sniff = true
-sniff_ports = [80, 443, 8443]
-# Names that are NOT the real destination: the "public name" shown by a real
-# ECH (Encrypted Client Hello) connection. Chrome adds an ECH extension to every
-# hello as GREASE, so ECH cannot be used as a signal; matching names (and their
-# subdomains) keep the plain IP instead.
-sniff_skip_domains = ["cloudflare-ech.com"]
-# How long to wait for the program's first bytes before keeping the plain IP.
-sniff_timeout_ms = 300
+# --- hostname sniffing ----------------------------------------------------
+# For connections to a bare IP (DoH, hard-coded addresses, names resolved
+# through nscd / systemd-resolved), read the hostname from the TLS SNI or HTTP
+# Host of the first bytes. Fine-tuning (sniff_ports, sniff_skip_domains,
+# sniff_timeout_ms, sniff_override_destination): see the README.
+# sniff = true
 
-# The namespace's 127.0.0.1 is its own and starts empty. The host's loopback
-# TCP listeners found at start-up (a local database, a dev server, a proxy on
-# 127.0.0.1:7890) are forwarded into it, same address and port: 127.x.x.x:P
-# as is, 0.0.0.0:P as 127.0.0.1:P, [::]:P as 127.0.0.1:P and [::1]:P. Port 53
-# is never forwarded (DNS stays ours); listeners opened later are not seen.
-# Exclude a port the program wants to listen on itself. --no-host-ports turns
-# the whole thing off.
-host_ports_forward = true
-host_ports_exclude = []
+# --- the host's own loopback services -------------------------------------
+# The namespace's 127.0.0.1 is its own. The host's loopback TCP listeners found
+# at start-up are forwarded into it; exclude ports the program listens on itself.
+# host_ports_forward = true
+# host_ports_exclude = []
 
-# When a proxy handshake fails, try up to this many other members of the group
-# before giving up (and closing the connection - it never falls back to direct).
-retries = 2
+# --- several proxies (see [[groups]] below) --------------------------------
+# Other group members to try when a proxy handshake fails.
+# retries = 2
 
-# Active health checks of the upstream proxies.
-[health]
-interval_secs = 10   # probe every proxy this often
-fail_threshold = 3   # consecutive failures before a proxy is marked DOWN
-timeout_ms = 3000
-
-# --- upstream proxies ----------------------------------------------------
-# Several can be listed and balanced; see [[groups]].
+# --- upstream proxy -------------------------------------------------------
 # The address can be overridden at run time with --proxy URL or $PROXYTUN_PROXY.
-# proxytun dials the proxy from the host, so 127.0.0.1 here means the host.
+# proxytun dials it from the host, so 127.0.0.1 here means the host.
 [[proxies]]
 name = "clash"
 type = "socks5"                  # "socks5" (domain sent as ATYP=3) or "http" (CONNECT host:port)
 addr = "172.25.32.1:7897"
 # username = "user"
 # password = "pass"
-# weight = 1                     # used by weighted-round-robin
 
-# A second proxy, to try load balancing:
-# [[proxies]]
-# name = "backup"
-# type = "http"
-# addr = "10.0.0.5:8080"
-# weight = 2
+# --- several proxies --------------------------------------------------------
+# Without [[groups]], all proxies form the group "default". To balance them:
+# strategy = round-robin | random | least-conn | least-latency |
+#            weighted-round-robin (weight = n on each proxy) | hash (same domain -> same proxy)
+# [[groups]]
+# name = "default"
+# strategy = "round-robin"
+# members = ["clash", "backup"]
+#
+# Health checks, used to skip proxies that are down:
+# [health]
+# interval_secs = 10
+# fail_threshold = 3
+# timeout_ms = 3000
 
-# --- proxy groups (load balancing) ---------------------------------------
-# strategy: round-robin | random | least-conn | least-latency |
-#           weighted-round-robin | hash (same domain -> same proxy)
-# A group named "default" is required; rules without `group` use it.
-[[groups]]
-name = "default"
-strategy = "round-robin"
-members = ["clash"]
-
-# --- routing rules, first match wins ------------------------------------
+# --- rules, first match wins ------------------------------------------------
+# proxytun's own routing; with Clash deciding for you, usually none are needed.
+# Without a matching rule, connections go through the group "default".
 # match:  domain-suffix | domain-keyword | domain | ip-cidr | final
 # action: proxy | direct | block      (proxy accepts group = "<name>")
-# Domain rules fire when the program resolved the name through our DNS;
-# ip-cidr rules fire when it dialed a literal IP. With no `final` rule,
-# unmatched connections go through the default group (never direct).
-[[rules]]
-match  = "ip-cidr"
-value  = "192.168.0.0/16"
-action = "direct"
-
-[[rules]]
-match  = "domain-suffix"
-value  = "cn"
-action = "direct"
-
-[[rules]]
-match  = "domain-keyword"
-value  = "baidu"
-action = "direct"
-
-[[rules]]
-match  = "final"
-action = "proxy"
+# [[rules]]
+# match  = "domain-suffix"
+# value  = "cn"
+# action = "direct"

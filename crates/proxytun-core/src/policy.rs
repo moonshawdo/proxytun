@@ -299,8 +299,18 @@ mod tests {
     }
 
     #[test]
-    fn localnet_passthrough_default_is_loopback_only() {
+    fn nothing_is_passed_through_by_default() {
+        // In proxytun the namespace's own loopback never reaches us, so the
+        // old 127.0.0.0/8 default would only have been noise.
         let p = policy("", &[]);
+        for ip in [[127, 0, 0, 1], [10, 0, 0, 1], [192, 168, 1, 1]] {
+            assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::from(ip), 80)), "{ip:?}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_localnet_covers_ipv6_and_mapped_loopback_too() {
+        let p = policy_top("localnet = [\"127.0.0.0/8\"]", "", &[]);
         assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(127, 0, 0, 1), 80)));
         assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(127, 200, 3, 4), 80)));
         assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::new(10, 0, 0, 1), 80)));

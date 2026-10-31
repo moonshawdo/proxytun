@@ -1,11 +1,10 @@
 //! TCP relay. The capture side accepts the program's connection and works out
 //! where it was going (`Pending`); `route` does the rest: sniff a hostname if
-//! the target is a bare IP, run the rule engine, then splice bytes to a proxy
+//! the target is a bare IP, run the rule engine, then copy bytes to a proxy
 //! group / straight out / nowhere.
 
 use crate::balancer::Registry;
 use crate::config::{env_proxies, Config};
-use crate::net::splice::splice_bidirectional;
 use crate::policy::Policy;
 use crate::proxy;
 use crate::sniff::{self, Sniffed};
@@ -53,7 +52,6 @@ pub struct Live {
     pub registry: Registry,
     pub retries: u32,
     pub fail_threshold: u32,
-    pub splice: bool,
     pub sniff: SniffCfg,
 }
 
@@ -66,7 +64,6 @@ pub fn build_live(cfg: &Config) -> Result<Live> {
         registry: Registry::build(cfg)?,
         retries: cfg.retries,
         fail_threshold: cfg.health.fail_threshold,
-        splice: cfg.splice,
         sniff: SniffCfg {
             enabled: cfg.sniff,
             ports: cfg.sniff_ports.clone(),
@@ -119,7 +116,7 @@ pub async fn route(live: &Live, mut inbound: TcpStream, pending: Pending) -> Res
         Decision::Direct => {
             let mut out = dial_direct(&target).await?;
             out.set_nodelay(true).ok();
-            pump(&mut inbound, &mut out, live.splice).await
+            pump(&mut inbound, &mut out).await
         }
         Decision::Proxy { group } => {
             let g = live
@@ -128,7 +125,7 @@ pub async fn route(live: &Live, mut inbound: TcpStream, pending: Pending) -> Res
                 .ok_or_else(|| anyhow!("rule names unknown group '{group}'"))?;
             let (mut out, _conn, node) = proxy::dial_group(g, &target, live.retries, live.fail_threshold).await?;
             tracing::debug!(%node, "proxied");
-            pump(&mut inbound, &mut out, live.splice).await
+            pump(&mut inbound, &mut out).await
         }
     }
 }
@@ -187,19 +184,12 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Copy both ways until both sides are done: splice(2) when asked for and
-/// possible, else a userspace copy.
-pub async fn pump(a: &mut TcpStream, b: &mut TcpStream, use_splice: bool) -> Result<()> {
+/// Copy both ways until both sides are done. A plain copy, not splice(2):
+/// for connections that came in through the TUN device it measured 20-30%
+/// faster (the TUN thread is the bottleneck either way, and splice only adds
+/// to it). See docs/DESIGN.md.
+pub async fn pump(a: &mut TcpStream, b: &mut TcpStream) -> Result<()> {
     a.set_nodelay(true).ok();
-    if use_splice {
-        match splice_bidirectional(a, b).await {
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                tracing::debug!("splice unsupported for this connection, copying instead");
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
     // 64 KiB buffers: the 8 KiB default costs throughput on fast links.
     copy_bidirectional_with_sizes(a, b, 64 * 1024, 64 * 1024).await?;
     Ok(())
@@ -289,7 +279,6 @@ mod tests {
             registry: Registry::build(&cfg).unwrap(),
             retries: 2,
             fail_threshold: 3,
-            splice: true,
             sniff,
         })
     }
@@ -382,9 +371,13 @@ mod tests {
             let (mut s, _) = origin.accept().await.unwrap();
             s.write_all(b"hello from the lan").await.unwrap();
         });
-        // The default localnet is 127.0.0.0/8; the rules would proxy everything,
-        // and a TLS-looking first packet would otherwise be sniffed.
-        let live = mk_live(proxy, "[[rules]]\nmatch=\"final\"\naction=\"proxy\"");
+        // localnet covers the origin; the rules would proxy everything.
+        let cfg = Config::parse(&format!(
+            "localnet = [\"127.0.0.0/8\"]\n[proxy]\ntype=\"socks5\"\naddr=\"{proxy}\"\n\
+             [[rules]]\nmatch=\"final\"\naction=\"proxy\""
+        ))
+        .unwrap();
+        let live = Arc::new(build_live(&cfg).unwrap());
         let mut c = relay_pending(&live, pending(Target::V4(Ipv4Addr::LOCALHOST, origin_port))).await;
         let mut got = Vec::new();
         // The echoing proxy would never close: bound the wait so a regression
@@ -437,7 +430,6 @@ mod tests {
             registry: Registry::build(&cfg).unwrap(),
             retries: 2,
             fail_threshold: 3,
-            splice: true,
             sniff: SniffCfg::default(),
         });
         for _ in 0..4 {
@@ -725,5 +717,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wait_seen(&seen, 1).await, ["ip:5.5.5.6:443"]);
+    }
+
+    // ------------------------------------------------------------ pump --
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (s, _) = l.accept().await.unwrap();
+        (c, s)
+    }
+
+    /// client <-> [a  pump  b] <-> server
+    async fn pumped() -> (TcpStream, TcpStream, tokio::task::JoinHandle<Result<()>>) {
+        let (client, mut a) = tcp_pair().await;
+        let (mut b, server) = tcp_pair().await;
+        let h = tokio::spawn(async move { pump(&mut a, &mut b).await });
+        (client, server, h)
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn pump_moves_a_large_payload_intact_in_both_directions() {
+        let (mut client, mut server, h) = pumped().await;
+        let up = pattern(16 << 20);
+        let down = pattern(9 << 20);
+        let (up2, down2) = (up.clone(), down.clone());
+        let srv = tokio::spawn(async move {
+            let mut got = vec![0u8; up2.len()];
+            server.read_exact(&mut got).await.unwrap();
+            assert!(got == up2, "client->server bytes differ");
+            server.write_all(&down2).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+        client.write_all(&up).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert!(got == down, "server->client bytes differ");
+        srv.await.unwrap();
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pump_keeps_the_other_direction_open_after_a_half_close() {
+        let (mut client, mut server, h) = pumped().await;
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap(); // client is done sending
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap(); // sees EOF after the data
+        assert_eq!(got, b"request");
+        server.write_all(b"late reply").await.unwrap(); // reverse path still works
+        server.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"late reply");
+        h.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reset_peer_ends_the_pump_instead_of_hanging() {
+        use std::os::fd::AsRawFd;
+        let (client, mut server, h) = pumped().await;
+        // Abortive close of the client: RST instead of FIN.
+        let abortive = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &abortive as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as u32,
+            );
+        }
+        drop(client);
+        let mut buf = [0u8; 8];
+        let _ = server.read(&mut buf).await;
+        let r = tokio::time::timeout(Duration::from_secs(5), h).await;
+        assert!(r.is_ok(), "the pump must end after a reset");
     }
 }

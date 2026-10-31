@@ -127,7 +127,7 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 sh.stats.active.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("routing to the host's own port");
                 let r = match TcpStream::connect(addr).await {
-                    Ok(mut out) => relay::pump(&mut inbound, &mut out, sh.live().splice).await,
+                    Ok(mut out) => relay::pump(&mut inbound, &mut out).await,
                     Err(e) => Err(e.into()),
                 };
                 sh.stats.active.fetch_sub(1, Ordering::Relaxed);

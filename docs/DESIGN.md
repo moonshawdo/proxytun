@@ -56,8 +56,21 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 ## 4. 网络细节
 
 - **TCP 接管**:TUN + 用户态地址改写(Clash/sing-box 的 "system stack" 思路)。读到程序的 SYN 后改写源/目的地址与端口,导向命名空间内的监听 socket,
-  由内核完成 TCP;回程包反向改写。accept 后按改写表查回原目标,交给 `proxytun_core::net::relay::route`(选路、splice 零拷贝、SNI/Host 嗅探)。
+  由内核完成 TCP;回程包反向改写。accept 后按改写表查回原目标,交给 `proxytun_core::net::relay::route`(选路、SNI/Host 嗅探、双向拷贝)。
   不依赖 netfilter(3.10 内核没有 nftables),不引入用户态 TCP 栈。
+- **不用零拷贝(splice)**(2026-10-31 实测后删除):proxyhook 的中继两端都是普通 socket,splice 有明显收益;
+  proxytun 的连接先经过 TUN,命名空间里的 TCP 处理落在写 TUN 的线程上,它本来就是瓶颈,splice 只会加重它。
+  本机(WSL2、8 核、本地 SOCKS5 代理与源站,2 GiB 下载)实测:
+
+  | 路径 | splice | 普通拷贝(64 KiB 缓冲) | 不经 proxytun |
+  |---|---|---|---|
+  | 经 TUN 捕获的连接 | 约 800 MB/s | 约 1070 MB/s | 约 2100 MB/s |
+  | 主机端口转发 | 约 2700 MB/s | 约 1350 MB/s | 约 4100 MB/s |
+
+  主路径普通拷贝快 20–30%;主机端口转发慢一半,但 1.35 GB/s 对本地服务足够,为它单留 splice 不值得。
+  主路径的上限约 1 GB/s(单个 TUN 收发循环),远高于真实代理的吞吐,不再做多队列 TUN、校验和卸载等优化。
+  每条连接的额外开销约 0.2–0.3 ms(含假 DNS)。将来 proxyhook 改为依赖 core 时,splice 可以从 proxyhook 仓库(或本仓库 `59d8f75`)
+  拷回 `net/splice.rs`,再给 `relay::pump` 加一个选择参数,proxyhook 传 splice、proxytun 传拷贝。
 - **DNS**:
   - 私有挂载命名空间里把 `resolv.conf` bind-mount 成指向假 DNS 地址的文件(保留原文件的 `search`/`domain`/`options` 行),主机文件不动;
   - 发往任意 IP 53 端口的 UDP 和 TCP 一律由 fake-ip DNS 应答(拦住硬编码 `8.8.8.8` 的程序);
@@ -69,6 +82,10 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   其余作 fake IP,因此 `fake_ip_range` 至少 /22。198.18.0.0/15 是 RFC 2544 测试保留段,不会与真实目标冲突。
 - **MTU**:65520。包只在本机内核与 proxytun 之间流转,包越大用户态处理的包数越少。
 - **localnet / 程序环境里的代理**:沿用 proxyhook 的 `Policy::is_passthrough`,命中的目标由 proxytun 直连,不走规则与代理(避免代理套代理)。
+  `localnet` 默认为空(proxyhook 默认 `127.0.0.0/8`,在 proxytun 里不起作用:命名空间的回环到不了 proxytun)。
+- **非 A 记录的上游 DNS**:`upstream_dns` 不写时用主机 `/etc/resolv.conf` 的第一个 nameserver(没有则 `127.0.0.1:53`,同 glibc),
+  从主机发出,所以主机上的 `127.0.0.53` 之类本地解析器也能用。proxyhook 默认 `1.1.1.1:53`,在内网或 CentOS 服务器上常被挡,
+  MX/TXT/PTR 查询会卡满 3 秒超时。
 - **主机本地服务(回环)**:命名空间的 `127.0.0.1` 与主机隔离。启动时扫描**一次**主机的 TCP 监听(`/proc/net/tcp`、`tcp6`),转发进命名空间:
 
   | 主机上的监听 | 命名空间里开 | 转发到主机 |
@@ -114,8 +131,8 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 
 - 命令行与 proxyhook 一致:`proxytun [选项] 程序 参数...`(`--` 可选),`-c`(默认 `proxytun.toml`)、`--proxy`、`-q`、`-v`/`-vv`、
   `--log-level`、`--log-file`、`--doctor`;新增 `--no-sudo`、`--no-host-ports`。环境变量 `PROXYTUN_PROXY`、`PROXYTUN_LOG`。
-- 配置文件格式与 `proxyhook.toml` 相同,可直接拿来用;proxytun 用不到的键(`verify_peer_uid`、`block_quic`、`dns_udp_unconnected`)
-  和拼错的键,启动时 warn 并忽略。
+- 配置文件格式与 `proxyhook.toml` 相同,可直接拿来用;proxytun 用不到的键(`verify_peer_uid`、`block_quic`、`dns_udp_unconnected`、`splice`)
+  和拼错的键,启动时 warn 并忽略。示例 `proxytun.toml` 只有必填的 `[[proxies]]`,其余以注释给出默认值。
 - `--doctor`:报告将使用哪种模式(userns / sudo / root)。不靠猜 sysctl,而是按真实运行的路径建一次命名空间、以 `true` 为程序跑完;
   userns 不可用时说明原因并列出相关 sysctl(`max_user_namespaces`、`unprivileged_userns_clone`、AppArmor 限制),
   检查 PATH 里有没有 `sudo` 但不调用;另查 `/dev/net/tun`、Yama(`gdb -p` 的范围)、将转发的主机端口、每个代理(SOCKS5/HTTP 探测)。
@@ -124,7 +141,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 ## 8. 代码组织
 
 - workspace 根在 `~/aicode/proxytun`:`crates/proxytun-core`(共享库)+ `crates/proxytun`(程序)。
-- core 从 proxyhook `e0be192` 复制:`config`、`types`、`policy`、`balancer`、`health`、`proxy`、`sniff`、`net::{fakeip, splice, dns, relay}`;
+- core 从 proxyhook `e0be192` 复制:`config`、`types`、`policy`、`balancer`、`health`、`proxy`、`sniff`、`net::{fakeip, dns, relay}`(`splice` 已删,见第 4 节);
   去掉了 ptrace、ticket、uid 校验(`peer`)、`doctor`、`app`。DNS 只保留应答/转发逻辑和 `serve_tcp`(无监听服务器),
   中继只保留与 ticket 解耦的 `route()` 与 `build_live()`。复制后按 proxytun 需要自由修改。
 - proxyhook 仓库不改动;以后要么改为依赖 core,要么退役。

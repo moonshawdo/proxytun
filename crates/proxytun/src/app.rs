@@ -118,7 +118,14 @@ pub fn run(args: Args) -> Result<i32> {
     let fake_net: Ipv4Net = cfg.fake_ip_range.parse().context("parse fake_ip_range")?;
     let addrs = Addrs::new(fake_net);
     let pool = FakePool::with_reserved_tail(fake_net, 256);
-    let upstream_dns = cfg.upstream_dns_addr()?;
+    let host_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let upstream_dns = cfg.upstream_dns_addr(&host_resolv)?;
+    let from = if cfg.upstream_dns.is_some() {
+        "upstream_dns"
+    } else {
+        "the host's /etc/resolv.conf"
+    };
+    tracing::info!(%upstream_dns, "non-A DNS queries go to {from}");
     let live = Arc::new(build_live(&cfg)?);
 
     // Orphans of the program's tree are re-parented to us, so we can wait for

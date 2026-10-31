@@ -44,7 +44,6 @@ proxytun(主机网络,普通用户)
 - **规则与负载均衡**(来自 proxyhook):`domain-suffix` / `domain-keyword` / `domain` / `ip-cidr` / `final`,6 种均衡策略,健康检查,故障转移,全部不可用时断开(**不会静默直连**)。
 - **本机服务可达**:启动时把主机上监听回环地址的 TCP 端口转发进命名空间,程序照常连 `127.0.0.1:5432`。
 - **不留痕迹**:TUN 不持久、命名空间匿名,退出(包括崩溃、`kill -9`)后内核自动回收;主机的网卡、路由、`resolv.conf` 都不动。
-- **零拷贝转发**:`splice(2)`。
 - **运维**:`--doctor` 自检;`SIGHUP` 热加载;`SIGUSR1` 打印统计;日志分级与日志文件(同 proxyhook)。
 
 ## 运行模式
@@ -98,13 +97,15 @@ proxytun 的退出码就是程序的退出码(信号终止为 `128+信号`)。�
 
 ### 配置文件
 
-格式与 proxyhook 相同,`proxyhook.toml` 可以直接用(proxytun 用不到的键会给出警告并忽略,拼错的键也一样)。
-完整的带注释示例见 [proxytun.toml](proxytun.toml),其余各键的含义与 proxyhook 仓库的 `docs/CONFIG.md` 一致。proxytun 特有或含义不同的键:
+格式与 proxyhook 相同,`proxyhook.toml` 可以直接用:proxytun 用不到的键(`verify_peer_uid`、`block_quic`、`dns_udp_unconnected`、`splice`)
+和拼错的键会给出警告并忽略。示例 [proxytun.toml](proxytun.toml) 只有必填的 `[[proxies]]`,其余以注释给出默认值;
+各键的含义与 proxyhook 仓库的 `docs/CONFIG.md` 一致。proxytun 特有或含义不同的键:
 
 | 键 | 说明 |
 |---|---|
 | `fake_ip_range` | 末尾的 /24 留给命名空间内部(TUN `.1`、假 DNS `.53`),所以至少要 /22 |
-| `localnet` | 命中的目标由 proxytun 从主机直连,不走规则与代理。命名空间里的 `127.0.0.0/8` 是命名空间自己的回环,到不了 proxytun |
+| `upstream_dns` | MX/TXT/PTR 等非 A 查询从主机转发到这里。**默认用主机 `/etc/resolv.conf` 的第一个 nameserver**(proxyhook 默认 `1.1.1.1:53`) |
+| `localnet` | 命中的目标由 proxytun 从主机直连,不走规则与代理。**默认为空**:命名空间里的 `127.0.0.0/8` 是命名空间自己的回环,到不了 proxytun |
 | `host_ports_forward` | 是否把主机的回环监听转发进命名空间,默认 `true` |
 | `host_ports_exclude` | 不转发的端口(程序要自己在这个端口上监听时用) |
 

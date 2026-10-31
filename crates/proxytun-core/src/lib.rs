@@ -2,7 +2,7 @@
 //! captured. Copied from proxyhook (commit e0be192) and trimmed of everything
 //! tied to ptrace: `config`/`policy` (rules), `balancer`/`health` (upstream
 //! selection), `proxy` (SOCKS5/HTTP dialers), `net` (fake-ip pool and DNS
-//! answers, relay routing, splice), `sniff` (TLS SNI / HTTP Host).
+//! answers, relay routing), `sniff` (TLS SNI / HTTP Host).
 
 pub mod balancer;
 pub mod config;

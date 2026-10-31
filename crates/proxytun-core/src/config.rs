@@ -31,16 +31,17 @@ pub struct Config {
     #[serde(default = "default_fakeip")]
     pub fake_ip_range: String,
 
-    /// Upstream DNS for the queries we do not fake (MX/TXT/PTR/...), e.g.
-    /// "1.1.1.1:53". Contacted directly, not through the proxy. (Domains routed
-    /// `direct` are resolved by the system resolver, not by this server.)
-    #[serde(default = "default_upstream_dns")]
-    pub upstream_dns: String,
+    /// Upstream DNS for the queries we do not fake (MX/TXT/PTR/...), as
+    /// "ip:port". Contacted directly, not through the proxy. Unset: the host's
+    /// own resolver (see `upstream_dns_addr`). (Domains routed `direct` are
+    /// resolved by the system resolver, not by this server.)
+    #[serde(default)]
+    pub upstream_dns: Option<String>,
 
     /// Destinations reached directly, never through rules or the proxy. Like
-    /// proxychains' localnet. (In the namespace 127.0.0.0/8 is the namespace's
-    /// own loopback and never reaches proxytun at all.)
-    #[serde(default = "default_localnet")]
+    /// proxychains' localnet. Default empty: in the namespace 127.0.0.0/8 is
+    /// the namespace's own loopback and never reaches proxytun at all.
+    #[serde(default)]
     pub localnet: Vec<String>,
 
     /// How many other group members to try when a proxy handshake fails.
@@ -74,11 +75,6 @@ pub struct Config {
     #[serde(default = "default_sniff_timeout")]
     pub sniff_timeout_ms: u64,
 
-    /// Move relayed bytes with splice(2) (zero-copy through the kernel). Turn
-    /// off only to rule it out when debugging. Default true.
-    #[serde(default = "yes")]
-    pub splice: bool,
-
     /// Forward the host's loopback TCP listeners, as found at start-up, into
     /// the namespace's own loopback (which is otherwise empty). Default true.
     #[serde(default = "yes")]
@@ -99,6 +95,17 @@ pub struct Config {
     /// error: the caller warns about them.
     #[serde(skip)]
     pub ignored_keys: Vec<String>,
+}
+
+/// The first nameserver of a resolv.conf that we can dial (IPv6 link-local
+/// ones with a `%zone` are skipped).
+pub fn first_nameserver(resolv: &str) -> Option<SocketAddr> {
+    resolv.lines().find_map(|l| {
+        let mut f = l.split_whitespace();
+        (f.next()? == "nameserver").then_some(())?;
+        let ip: std::net::IpAddr = f.next()?.parse().ok()?;
+        Some(SocketAddr::new(ip, 53))
+    })
 }
 
 /// `proxies.0.usrname`: the key as written in the file. serde_ignored's own
@@ -123,12 +130,6 @@ fn join(parent: String, key: &str) -> String {
 
 fn default_fakeip() -> String {
     "198.18.0.0/15".into()
-}
-fn default_upstream_dns() -> String {
-    "1.1.1.1:53".into()
-}
-fn default_localnet() -> Vec<String> {
-    vec!["127.0.0.0/8".into()]
 }
 fn default_sniff_ports() -> Vec<u16> {
     vec![80, 443, 8443]
@@ -415,7 +416,7 @@ impl Config {
                 net.prefix_len()
             );
         }
-        self.upstream_dns_addr()?;
+        self.upstream_dns_addr("")?;
         for c in &self.localnet {
             c.parse::<IpNet>()
                 .with_context(|| format!("bad localnet entry {c:?}"))?;
@@ -447,10 +448,15 @@ impl Config {
         Ok(())
     }
 
-    pub fn upstream_dns_addr(&self) -> Result<SocketAddr> {
-        self.upstream_dns
-            .parse()
-            .with_context(|| format!("bad upstream_dns {}", self.upstream_dns))
+    /// Where non-A queries go: `upstream_dns` if set, else the first usable
+    /// nameserver of the host's resolv.conf (`host_resolv`, its text), else
+    /// 127.0.0.1:53 as glibc does without one. We forward from the host, so a
+    /// host-local stub resolver (127.0.0.53) is reachable.
+    pub fn upstream_dns_addr(&self, host_resolv: &str) -> Result<SocketAddr> {
+        match &self.upstream_dns {
+            Some(s) => s.parse().with_context(|| format!("bad upstream_dns {s}")),
+            None => Ok(first_nameserver(host_resolv).unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 53)))),
+        }
     }
 
     /// Replace all proxies with a single one given as a URL
@@ -637,9 +643,9 @@ mod tests {
         assert_eq!(c.groups[0].name, "default");
         assert_eq!(c.groups[0].members, vec!["default"]);
         assert_eq!(c.fake_ip_range, "198.18.0.0/15");
-        assert_eq!(c.localnet, vec!["127.0.0.0/8"]);
+        assert!(c.localnet.is_empty(), "127.0.0.0/8 never reaches proxytun");
         assert_eq!(c.retries, 2);
-        assert!(c.splice);
+        assert_eq!(c.upstream_dns, None, "the host's resolver unless set");
         assert!(c.host_ports_forward);
         assert!(c.host_ports_exclude.is_empty());
         assert!(c.sniff);
@@ -709,7 +715,7 @@ mod tests {
         // A proxyhook.toml must load as is; its ptrace-only switches and any
         // typo are named so the user learns they have no effect.
         let text = format!(
-            "verify_peer_uid = true\nblock_quic = false\ndns_udp_unconnected = true\nsnif = false\n{MINIMAL}usrname = \"u\"\n"
+            "verify_peer_uid = true\nblock_quic = false\ndns_udp_unconnected = true\nsplice = true\nsnif = false\n{MINIMAL}usrname = \"u\"\n"
         );
         let c = Config::parse(&text).unwrap();
         assert_eq!(
@@ -718,6 +724,7 @@ mod tests {
                 "verify_peer_uid",
                 "block_quic",
                 "dns_udp_unconnected",
+                "splice",
                 "snif",
                 "proxy.usrname"
             ]
@@ -963,5 +970,28 @@ mod tests {
             ("all_proxy", "host:notaport"),
         ]);
         assert_eq!(e, EnvProxies::default());
+    }
+
+    #[test]
+    fn upstream_dns_follows_the_host_unless_set() {
+        let host = "# WSL\nsearch lan\nnameserver fe80::1%eth0\nnameserver 172.25.32.1\nnameserver 8.8.8.8\n";
+        let c = Config::parse(MINIMAL).unwrap();
+        assert_eq!(c.upstream_dns_addr(host).unwrap(), "172.25.32.1:53".parse().unwrap());
+        assert_eq!(
+            c.upstream_dns_addr("nameserver 127.0.0.53\n").unwrap(),
+            "127.0.0.53:53".parse().unwrap(),
+            "a host stub resolver is fine: we forward from the host"
+        );
+        assert_eq!(
+            c.upstream_dns_addr("nameserver 2001:db8::53\n").unwrap(),
+            "[2001:db8::53]:53".parse().unwrap()
+        );
+        assert_eq!(
+            c.upstream_dns_addr("# none\n").unwrap(),
+            "127.0.0.1:53".parse().unwrap(),
+            "glibc's default"
+        );
+        let set = Config::parse(&format!("upstream_dns = \"9.9.9.9:5353\"\n{MINIMAL}")).unwrap();
+        assert_eq!(set.upstream_dns_addr(host).unwrap(), "9.9.9.9:5353".parse().unwrap());
     }
 }
