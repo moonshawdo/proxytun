@@ -63,10 +63,29 @@ addr = "172.25.32.1:7897"
 
 # --- rules, first match wins ------------------------------------------------
 # proxytun's own routing; with Clash deciding for you, usually none are needed.
-# Without a matching rule, connections go through the group "default".
+# Domain rules fire when the program resolved the name through our DNS (or the
+# name was sniffed); ip-cidr rules fire when it dialed a literal IP. Without a
+# matching rule, connections go through the group "default" (never direct).
 # match:  domain-suffix | domain-keyword | domain | ip-cidr | final
 # action: proxy | direct | block      (proxy accepts group = "<name>")
+#
+# Example: uncomment to send the LAN, .cn domains and baidu straight out and
+# everything else through the proxy.
+# [[rules]]
+# match  = "ip-cidr"
+# value  = "192.168.0.0/16"
+# action = "direct"
+#
 # [[rules]]
 # match  = "domain-suffix"
 # value  = "cn"
 # action = "direct"
+#
+# [[rules]]
+# match  = "domain-keyword"
+# value  = "baidu"
+# action = "direct"
+#
+# [[rules]]
+# match  = "final"
+# action = "proxy"

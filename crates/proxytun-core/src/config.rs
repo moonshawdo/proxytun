@@ -811,6 +811,37 @@ mod tests {
     }
 
     #[test]
+    fn the_example_rules_work_once_uncommented() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proxytun.toml")).unwrap();
+        // Uncomment exactly what a user would: the [[rules]] lines and their keys.
+        let rule_line = |l: &str| {
+            let t = l.trim_start_matches("# ");
+            t == "[[rules]]"
+                || ["match ", "value ", "action "]
+                    .iter()
+                    .any(|k| t.starts_with(k) && t.contains('='))
+        };
+        let text: String = text
+            .lines()
+            .map(|l| if rule_line(l) { &l[2..] } else { l })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let c = Config::parse(&text).unwrap();
+        assert!(c.ignored_keys.is_empty(), "{:?}", c.ignored_keys);
+        let kinds: Vec<RuleKind> = c.rules.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RuleKind::IpCidr,
+                RuleKind::DomainSuffix,
+                RuleKind::DomainKeyword,
+                RuleKind::Final
+            ]
+        );
+        assert_eq!(c.rules.last().unwrap().action, Action::Proxy);
+    }
+
+    #[test]
     fn shipped_example_config_is_valid() {
         let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proxytun.toml")).unwrap();
         let c = Config::parse(&text).unwrap();
