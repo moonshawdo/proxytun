@@ -36,7 +36,8 @@ pub struct Addrs {
     /// The TUN device's address: the program's source address, and where the
     /// TCP listener sits.
     pub tun: Ipv4Addr,
-    /// Source address of rewritten connections towards the listener.
+    /// The first of the `nat::NAT_ADDRS` source addresses (.2 to .17) of
+    /// rewritten connections towards the listener.
     pub nat: Ipv4Addr,
     /// Where resolv.conf points (any address on port 53 works too).
     pub dns: Ipv4Addr,

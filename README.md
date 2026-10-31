@@ -216,7 +216,8 @@ conn{id=1 target=Domain("example.com", 443)}: closed ms=812 dial_ms=35 via=clash
 - **sudo 的 `use_pty`**(Ubuntu 22.04+、Debian 12、sudo ≥ 1.9.14 默认开,CentOS 7 默认没开):sudo 把命令放进自己的伪终端会话,
   这个会话在助手退出时就结束了。程序会先离开它、在自己的会话里运行,没有控制终端:proxytun 把终端的 Ctrl+C、Ctrl+\ 转给它,
   但 Ctrl+Z 作业控制、窗口大小变化到不了它,要打开 `/dev/tty` 的程序(如密码提示)会失败。proxytun 会警告。
-- **地址改写表**:同时存在的 TCP 连接(含关闭后保留 75 秒的)最多约 6.4 万条。
+- **地址改写表**:同时存在的 TCP 连接(含关闭后保留 75 秒的)最多约 100 万条,即持续每秒约 1.37 万条新连接;
+  表满时新连接立即收到 RST(程序得到"连接被拒绝"),不会卡住重试。
 - **CentOS 7 真机**(3.10 内核、真实 sudo 1.8.23、SELinux)尚未验证,只在开发机上模拟过;验证步骤见 [docs/CENTOS7.md](docs/CENTOS7.md)。
 
 ## 开发

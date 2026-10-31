@@ -184,9 +184,8 @@ pub fn run(args: Args) -> Result<i32> {
     };
 
     let sh = Arc::new(Shared {
-        addrs,
         listen,
-        nat: Mutex::new(Nat::default()),
+        nat: Mutex::new(Nat::new(addrs.nat, crate::nat::NAT_ADDRS)),
         pool,
         upstream_dns,
         live: RwLock::new(live.clone()),
