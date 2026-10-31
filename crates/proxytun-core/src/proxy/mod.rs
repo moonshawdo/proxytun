@@ -81,11 +81,6 @@ pub fn socks5_connect_request(t: &Target) -> Result<Vec<u8>> {
             req.extend_from_slice(&ip.octets());
             req.extend_from_slice(&p.to_be_bytes());
         }
-        Target::V6(ip, p) => {
-            req.push(0x04);
-            req.extend_from_slice(&ip.octets());
-            req.extend_from_slice(&p.to_be_bytes());
-        }
     }
     Ok(req)
 }
@@ -104,6 +99,7 @@ fn socks5_rep_name(rep: u8) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub async fn socks5_handshake<S>(s: &mut S, t: &Target, user: Option<&str>, pass: Option<&str>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -224,7 +220,6 @@ pub fn http_connect_request(t: &Target, user: Option<&str>, pass: Option<&str>) 
     let hostport = match t {
         Target::Domain(d, p) => format!("{d}:{p}"),
         Target::V4(ip, p) => format!("{ip}:{p}"),
-        Target::V6(ip, p) => format!("[{ip}]:{p}"),
     };
     let mut req = format!("CONNECT {hostport} HTTP/1.1\r\nHost: {hostport}\r\n");
     if let Some(u) = user {
@@ -468,7 +463,7 @@ mod tests {
         assert!(!is_local_shortage(&io(libc::ECONNREFUSED)));
         assert!(!is_local_shortage(&io(libc::ETIMEDOUT)));
     }
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
     use tokio::io::duplex;
 
     fn dom(d: &str, p: u16) -> Target {
@@ -488,9 +483,6 @@ mod tests {
     fn socks5_ip_requests() {
         let r = socks5_connect_request(&Target::V4(Ipv4Addr::new(1, 2, 3, 4), 80)).unwrap();
         assert_eq!(r, vec![5, 1, 0, 1, 1, 2, 3, 4, 0, 80]);
-        let r = socks5_connect_request(&Target::V6(Ipv6Addr::LOCALHOST, 80)).unwrap();
-        assert_eq!(r.len(), 4 + 16 + 2);
-        assert_eq!(r[3], 0x04);
     }
 
     #[test]
@@ -656,9 +648,6 @@ mod tests {
         assert!(r.starts_with("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"));
         assert!(r.ends_with("\r\n\r\n"));
         assert!(!r.contains("Proxy-Authorization"));
-
-        let r = http_connect_request(&Target::V6(Ipv6Addr::LOCALHOST, 80), None, None);
-        assert!(r.starts_with("CONNECT [::1]:80 "));
 
         let r = http_connect_request(&dom("a.b", 1), Some("Aladdin"), Some("open sesame"));
         assert!(

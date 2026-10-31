@@ -1,4 +1,4 @@
-//! Runtime routing policy built from a `Config` plus the traced program's own
+//! Runtime routing policy built from a `Config` plus the program's own
 //! environment. Pure logic: no I/O, so every branch is unit-tested.
 //!
 //! Two layers decide what happens to a connect():
@@ -8,10 +8,10 @@
 //!   2. `decide`: the rule list, first match wins.
 
 use crate::config::{Action, Config, EnvProxies, RuleKind, DEFAULT_GROUP};
-use crate::types::{Decision, Dest, Target};
+use crate::types::{Decision, Target};
 use anyhow::Result;
 use ipnet::IpNet;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 
 struct Rule {
     kind: RuleKind,
@@ -70,21 +70,12 @@ impl Policy {
     }
 
     /// Should this destination bypass sniffing, the rules and the proxy?
-    pub fn is_passthrough(&self, dest: &Dest) -> bool {
-        let (ip, port) = match dest {
-            Dest::V4(ip, p) => (IpAddr::V4(*ip), *p),
-            Dest::V6(ip, p) => (IpAddr::V6(*ip), *p),
-        };
-        let ip = unmap(ip);
+    pub fn is_passthrough(&self, ip: Ipv4Addr, port: u16) -> bool {
+        let ip = IpAddr::V4(ip);
         if self.env.ips.iter().any(|(i, p)| unmap(*i) == ip && *p == port) {
             return true;
         }
-        if self.localnet.iter().any(|n| n.contains(&ip)) {
-            return true;
-        }
-        // ::1 is loopback just like 127.0.0.1; if localnet covers v4 loopback
-        // the user clearly wants loopback left alone.
-        ip == IpAddr::V6(Ipv6Addr::LOCALHOST) && self.localnet.iter().any(|n| n.contains(&IpAddr::from([127, 0, 0, 1])))
+        self.localnet.iter().any(|n| n.contains(&ip))
     }
 
     /// Does an ip-cidr rule cover this literal-IP target? Then the user has said
@@ -93,7 +84,6 @@ impl Policy {
     pub fn has_ip_rule_for(&self, t: &Target) -> bool {
         let ip = match t {
             Target::V4(ip, _) => IpAddr::V4(*ip),
-            Target::V6(ip, _) => unmap(IpAddr::V6(*ip)),
             Target::Domain(..) => return false,
         };
         self.rules
@@ -122,7 +112,6 @@ impl Policy {
                 (RuleKind::DomainKeyword, Target::Domain(..)) => domain.contains(&r.value),
                 (RuleKind::Domain, Target::Domain(..)) => domain == r.value,
                 (RuleKind::IpCidr, Target::V4(ip, _)) => r.net.is_some_and(|n| n.contains(&IpAddr::V4(*ip))),
-                (RuleKind::IpCidr, Target::V6(ip, _)) => r.net.is_some_and(|n| n.contains(&unmap(IpAddr::V6(*ip)))),
                 (RuleKind::Final, _) => true,
                 _ => false,
             };
@@ -137,29 +126,22 @@ impl Policy {
 }
 
 /// An address that only means something inside one network (RFC 1918
-/// private, loopback, link-local, carrier-grade NAT, IPv6 ULA...). A
-/// connection to such an address was aimed there on purpose (/etc/hosts, a LAN
-/// service), so its sniffed hostname must not send it somewhere else.
-pub fn is_local_scope(ip: IpAddr) -> bool {
-    match unmap(ip) {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10
-        }
-        IpAddr::V6(v6) => {
-            let s0 = v6.segments()[0];
-            v6.is_loopback() || v6.is_unspecified() || (s0 & 0xfe00) == 0xfc00 || (s0 & 0xffc0) == 0xfe80
-        }
-    }
+/// private, loopback, link-local, carrier-grade NAT...). A connection to such
+/// an address was aimed there on purpose (/etc/hosts, a LAN service), so its
+/// sniffed hostname must not send it somewhere else.
+pub fn is_local_scope(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10
 }
 
-/// `::ffff:a.b.c.d` -> `a.b.c.d`, everything else unchanged.
-pub fn unmap(ip: IpAddr) -> IpAddr {
+/// `::ffff:a.b.c.d` -> `a.b.c.d`, everything else unchanged: a proxy in the
+/// program's environment may be written either way.
+fn unmap(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
@@ -188,7 +170,7 @@ mod tests {
         assert!(!is_subdomain("com", "example.com"));
     }
     use crate::config::{env_proxies, EnvProxies};
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
 
     fn policy(extra: &str, env: &[(&str, &str)]) -> Policy {
         policy_top("", extra, env)
@@ -290,10 +272,6 @@ mod tests {
                 group: "default".into()
             }
         );
-        assert_eq!(
-            p.decide(&Target::V6("2001:db8::1".parse().unwrap(), 80)),
-            Decision::Block
-        );
         // A domain never matches an ip-cidr rule.
         assert_eq!(
             p.decide(&dom("10.0.0.1")),
@@ -301,16 +279,6 @@ mod tests {
                 group: "default".into()
             }
         );
-    }
-
-    #[test]
-    fn v4_mapped_v6_literal_uses_v4_rules() {
-        let p = policy(
-            "[[rules]]\nmatch=\"ip-cidr\"\nvalue=\"10.0.0.0/8\"\naction=\"direct\"",
-            &[],
-        );
-        let mapped: Ipv6Addr = "::ffff:10.1.1.1".parse().unwrap();
-        assert_eq!(p.decide(&Target::V6(mapped, 80)), Decision::Direct);
     }
 
     #[test]
@@ -330,61 +298,55 @@ mod tests {
         // old 127.0.0.0/8 default would only have been noise.
         let p = policy("", &[]);
         for ip in [[127, 0, 0, 1], [10, 0, 0, 1], [192, 168, 1, 1]] {
-            assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::from(ip), 80)), "{ip:?}");
+            assert!(!p.is_passthrough(Ipv4Addr::from(ip), 80), "{ip:?}");
         }
     }
 
     #[test]
     fn a_loopback_localnet_covers_ipv6_and_mapped_loopback_too() {
         let p = policy_top("localnet = [\"127.0.0.0/8\"]", "", &[]);
-        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(127, 0, 0, 1), 80)));
-        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(127, 200, 3, 4), 80)));
-        assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::new(10, 0, 0, 1), 80)));
-        assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::new(172, 25, 32, 1), 7897)));
-        assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::new(192, 168, 1, 1), 80)));
-        // ::1 and v4-mapped loopback count as loopback too.
-        assert!(p.is_passthrough(&Dest::V6(Ipv6Addr::LOCALHOST, 80)));
-        assert!(p.is_passthrough(&Dest::V6("::ffff:127.0.0.1".parse().unwrap(), 80)));
-        assert!(!p.is_passthrough(&Dest::V6("2001:db8::1".parse().unwrap(), 80)));
+        assert!(p.is_passthrough(Ipv4Addr::new(127, 0, 0, 1), 80));
+        assert!(p.is_passthrough(Ipv4Addr::new(127, 200, 3, 4), 80));
+        assert!(!p.is_passthrough(Ipv4Addr::new(10, 0, 0, 1), 80));
+        assert!(!p.is_passthrough(Ipv4Addr::new(172, 25, 32, 1), 7897));
+        assert!(!p.is_passthrough(Ipv4Addr::new(192, 168, 1, 1), 80));
     }
 
     #[test]
     fn custom_localnet_is_honoured() {
         let p = policy_top("localnet = [\"10.0.0.0/8\"]", "", &[]);
-        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(10, 9, 9, 9), 1)));
-        assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::new(127, 0, 0, 1), 1)));
+        assert!(p.is_passthrough(Ipv4Addr::new(10, 9, 9, 9), 1));
+        assert!(!p.is_passthrough(Ipv4Addr::new(127, 0, 0, 1), 1));
     }
 
     #[test]
     fn our_own_proxies_are_reached_directly_by_ip_and_port_only() {
         // The helper's proxy is 127.0.0.1:1080.
         let p = policy("", &[]);
-        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1080)));
-        assert!(p.is_passthrough(&Dest::V6("::ffff:127.0.0.1".parse().unwrap(), 1080)));
+        assert!(p.is_passthrough(Ipv4Addr::LOCALHOST, 1080));
         assert!(
-            !p.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1081)),
+            !p.is_passthrough(Ipv4Addr::LOCALHOST, 1081),
             "other ports of the proxy's host follow the rules"
         );
         let off = policy_top("direct_to_proxies = false", "", &[]);
-        assert!(!off.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1080)));
+        assert!(!off.is_passthrough(Ipv4Addr::LOCALHOST, 1080));
 
         // --proxy / $PROXYTUN_PROXY: the proxy in effect is the one let through.
         let mut cfg = Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1080\"\n").unwrap();
         cfg.override_proxy("socks5://10.1.2.3:7897").unwrap();
         let p = Policy::new(&cfg, EnvProxies::default()).unwrap();
-        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(10, 1, 2, 3), 7897)));
-        assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1080)));
+        assert!(p.is_passthrough(Ipv4Addr::new(10, 1, 2, 3), 7897));
+        assert!(!p.is_passthrough(Ipv4Addr::LOCALHOST, 1080));
     }
 
     #[test]
     fn env_proxy_endpoint_is_passthrough_by_ip_and_port() {
         let p = policy("", &[("http_proxy", "http://172.25.32.1:7897")]);
-        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(172, 25, 32, 1), 7897)));
+        assert!(p.is_passthrough(Ipv4Addr::new(172, 25, 32, 1), 7897));
         assert!(
-            !p.is_passthrough(&Dest::V4(Ipv4Addr::new(172, 25, 32, 1), 443)),
+            !p.is_passthrough(Ipv4Addr::new(172, 25, 32, 1), 443),
             "other ports on the same host are still proxied"
         );
-        assert!(p.is_passthrough(&Dest::V6("::ffff:172.25.32.1".parse().unwrap(), 7897)));
     }
 
     #[test]
@@ -423,7 +385,6 @@ mod tests {
             !p.has_ip_rule_for(&Target::V4(Ipv4Addr::new(8, 8, 8, 8), 443)),
             "final is not an ip rule"
         );
-        assert!(p.has_ip_rule_for(&Target::V6("::ffff:9.9.9.1".parse().unwrap(), 443)));
         assert!(!p.has_ip_rule_for(&dom("9.9.9.9")));
     }
 
@@ -438,22 +399,10 @@ mod tests {
             "100.64.0.1",
             "100.127.255.1",
             "0.0.0.0",
-            "::1",
-            "fd00::1",
-            "fe80::1",
-            "::ffff:192.168.1.1",
         ] {
             assert!(is_local_scope(ip.parse().unwrap()), "{ip}");
         }
-        for ip in [
-            "8.8.8.8",
-            "172.32.0.1",
-            "100.128.0.1",
-            "93.184.216.34",
-            "203.0.113.9",
-            "2001:4860::8888",
-            "::ffff:8.8.8.8",
-        ] {
+        for ip in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "93.184.216.34", "203.0.113.9"] {
             assert!(!is_local_scope(ip.parse().unwrap()), "{ip}");
         }
     }

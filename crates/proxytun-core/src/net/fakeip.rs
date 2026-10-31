@@ -63,12 +63,6 @@ pub struct FakeGuard {
     off: u32,
 }
 
-impl std::fmt::Debug for FakeGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FakeGuard(+{})", self.off)
-    }
-}
-
 impl Drop for FakeGuard {
     fn drop(&mut self) {
         let mut g = self.pool.lock();
@@ -108,6 +102,7 @@ impl Inner {
 }
 
 impl FakePool {
+    #[cfg(test)]
     pub fn new(net: Ipv4Net) -> Self {
         Self::with_reserved_tail(net, 0)
     }
@@ -181,6 +176,7 @@ impl FakePool {
     }
 
     /// Reverse: is this IP one of ours, and if so which domain? Refreshes recency.
+    #[cfg(test)]
     pub fn lookup(&self, ip: Ipv4Addr) -> Option<String> {
         let mut g = self.lock();
         let off = g.off_of(ip)?;
@@ -208,6 +204,7 @@ impl FakePool {
     }
 
     /// Does this IP fall inside the fake-ip range at all?
+    #[cfg(test)]
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         let g = self.lock();
         let v: u32 = ip.into();

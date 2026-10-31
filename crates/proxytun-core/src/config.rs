@@ -482,7 +482,7 @@ impl Config {
     }
 
     /// Replace all proxies with a single one given as a URL
-    /// (`--proxy` / `PROXYHOOK_PROXY`).
+    /// (`--proxy` / `PROXYTUN_PROXY`).
     pub fn override_proxy(&mut self, url: &str) -> Result<()> {
         let p = parse_proxy_url(url)?;
         self.proxies = vec![ProxyCfg {
@@ -964,8 +964,16 @@ mod tests {
     #[test]
     fn world_readable_config_with_a_password_is_flagged() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("proxyhook-perm-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("proxytun-perm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Gone afterwards, whether the test passes or not.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
         let f = dir.join("c.toml");
         std::fs::write(
             &f,

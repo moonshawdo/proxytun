@@ -563,7 +563,7 @@ pub(crate) mod tests {
         Shared {
             listen,
             nat: Mutex::new(Nat::new(NAT, 1)),
-            pool: FakePool::new("198.18.0.0/15".parse().unwrap()),
+            pool: FakePool::with_reserved_tail("198.18.0.0/15".parse().unwrap(), 0),
             upstream_dns: "127.0.0.1:9".parse().unwrap(),
             live: RwLock::new(Arc::new(relay::build_live(&cfg).unwrap())),
             stats: Stats::default(),

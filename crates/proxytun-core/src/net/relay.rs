@@ -8,7 +8,7 @@ use crate::config::{env_proxies, Config};
 use crate::policy::Policy;
 use crate::proxy;
 use crate::sniff::{self, Sniffed};
-use crate::types::{Decision, Dest, Pending, Target};
+use crate::types::{Decision, Pending, Target};
 use anyhow::{anyhow, Result};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -33,6 +33,7 @@ pub struct SniffCfg {
     pub override_destination: bool,
 }
 
+#[cfg(test)]
 impl Default for SniffCfg {
     fn default() -> Self {
         SniffCfg {
@@ -122,8 +123,7 @@ pub async fn route(live: &Live, traffic: &Traffic, mut inbound: TcpStream, pendi
     let Pending { target, guard } = pending;
     // localnet and the program's own proxies: straight out, untouched.
     let passthrough = match target {
-        Target::V4(ip, port) => live.policy.is_passthrough(&Dest::V4(ip, port)),
-        Target::V6(ip, port) => live.policy.is_passthrough(&Dest::V6(ip, port)),
+        Target::V4(ip, port) => live.policy.is_passthrough(ip, port),
         Target::Domain(..) => false,
     };
     // `target` is what we connect to, `rule_target` what the rules look at.
@@ -222,8 +222,7 @@ fn keepalive(s: &TcpStream) {
 async fn maybe_sniff(inbound: &TcpStream, target: &Target, cfg: &SniffCfg, policy: &Policy) -> Option<String> {
     let ip = match target {
         Target::Domain(..) => return None,
-        Target::V4(ip, _) => std::net::IpAddr::V4(*ip),
-        Target::V6(ip, _) => std::net::IpAddr::V6(*ip),
+        Target::V4(ip, _) => *ip,
     };
     if !cfg.enabled || !cfg.ports.contains(&target.port()) {
         return None;
@@ -371,7 +370,6 @@ async fn dial_direct(t: &Target) -> Result<TcpStream> {
         match t {
             Target::Domain(d, p) => TcpStream::connect(&lookup(&LOOKUPS, d, *p).await?[..]).await,
             Target::V4(ip, p) => TcpStream::connect((*ip, *p)).await,
-            Target::V6(ip, p) => TcpStream::connect((*ip, *p)).await,
         }
     };
     Ok(tokio::time::timeout(proxy::CONNECT_TIMEOUT, fut)

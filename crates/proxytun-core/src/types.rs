@@ -2,26 +2,7 @@
 //! relay/DNS side.
 
 use crate::net::fakeip::FakeGuard;
-use std::net::{Ipv4Addr, Ipv6Addr};
-
-/// A destination as the program addressed it: still an IP at this point;
-/// mapping a fake IP back to a domain happens before the relay sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dest {
-    V4(Ipv4Addr, u16),
-    V6(Ipv6Addr, u16),
-}
-
-impl Dest {
-    pub fn port(&self) -> u16 {
-        match self {
-            Dest::V4(_, p) | Dest::V6(_, p) => *p,
-        }
-    }
-    pub fn is_dns(&self) -> bool {
-        self.port() == 53
-    }
-}
+use std::net::Ipv4Addr;
 
 /// The *real* target the relay should connect to, after fake-ip reverse lookup.
 /// A `Domain` means "we recovered the original hostname, send it to the proxy
@@ -30,13 +11,12 @@ impl Dest {
 pub enum Target {
     Domain(String, u16),
     V4(Ipv4Addr, u16),
-    V6(Ipv6Addr, u16),
 }
 
 impl Target {
     pub fn port(&self) -> u16 {
         match self {
-            Target::Domain(_, p) | Target::V4(_, p) | Target::V6(_, p) => *p,
+            Target::Domain(_, p) | Target::V4(_, p) => *p,
         }
     }
 
@@ -46,7 +26,6 @@ impl Target {
         match self {
             Target::Domain(d, _) => d.clone(),
             Target::V4(ip, _) => ip.to_string(),
-            Target::V6(ip, _) => ip.to_string(),
         }
     }
 }
@@ -63,7 +42,6 @@ pub enum Decision {
 }
 
 /// One captured connection handed to the relay: where the program meant to go.
-#[derive(Debug)]
 pub struct Pending {
     pub target: Target,
     /// Keeps the fake-ip mapping pinned (un-evictable) while the connection lives.
