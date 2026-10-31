@@ -62,6 +62,8 @@ sudo 模式的安全边界:
 - 请求的每个字段都重新校验(假 IP 段 /8–/22、进程组必须是调用者自己的、只转发回环地址且不超过 250 个),10 秒内收不到请求就退出。
 - 不读配置、不以 root 打开你给的任何路径。程序先完全降权并设置 `no_new_privs`(命名空间里的网络由你控制,不能让 `sudo`、`su`
   这类 setuid 程序在里面重新拿到 root),再进入你的工作目录、按你的 `PATH` 找程序;助手把 fd 交回后立即退出。
+- 程序在 sudo 模式下看到的进程属性与非 root 模式一致:你的 umask、你继承给 proxytun 的 fd(如 make 的 jobserver、`3<file`,按原编号),
+  资源限制降到你的值(PAM 给 root 的更高限制不会带进来)。sudoers 给命令设了 SELinux `ROLE`/`TYPE`(程序会带着那个上下文)时拒绝运行。
 
 proxytun 拒绝经 sudo、doas、pkexec 或 setuid 以 root 身份运行(只有特权助手例外),内部的命名空间准备入口也一样:
 即使 sudoers 只放行了 proxytun,也拿不到一个 root 程序。需要 root 模式,请以 root 登录(或 `su -`)后运行。`--no-sudo` 禁止回退到 sudo。
@@ -208,7 +210,9 @@ conn{id=1 target=Domain("example.com", 443)}: closed ms=812 dial_ms=35 via=clash
 - **抽象 unix socket** 按网络命名空间隔离(X11 会回落到 `/tmp/.X11-unix` 路径,通常不受影响);文件路径型 unix socket 不受影响。
 - **setuid 程序**:`sudo`、`su`、`ping` 等在里面都不能提权。非 root 模式(user namespace)下,root 拥有的文件还会显示为 `nobody`;
   sudo 模式下程序带着 `no_new_privs`(见"运行模式")。
-- **sudo 的 `use_pty`**:如果 sudoers 开了它,程序会落在 sudo 的伪终端会话里,终端的 Ctrl+C 到不了程序(proxytun 会警告)。CentOS 7 默认没开。
+- **sudo 的 `use_pty`**(Ubuntu 22.04+、Debian 12、sudo ≥ 1.9.14 默认开,CentOS 7 默认没开):sudo 把命令放进自己的伪终端会话,
+  这个会话在助手退出时就结束了。程序会先离开它、在自己的会话里运行,没有控制终端:proxytun 把终端的 Ctrl+C、Ctrl+\ 转给它,
+  但 Ctrl+Z 作业控制、窗口大小变化到不了它,要打开 `/dev/tty` 的程序(如密码提示)会失败。proxytun 会警告。
 - **地址改写表**:同时存在的 TCP 连接(含关闭后保留 75 秒的)最多约 6.4 万条。
 - **CentOS 7 真机**(3.10 内核、真实 sudo 1.8.23、SELinux)尚未验证,只在开发机上模拟过;验证步骤见 [docs/CENTOS7.md](docs/CENTOS7.md)。
 

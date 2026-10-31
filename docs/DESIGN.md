@@ -38,7 +38,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 
 - 能用 user namespace 就用;不能用时自动走 sudo,先打印一行说明原因;`--no-sudo` 禁止调用 sudo(直接报错)。
   只有 user namespace 本身的问题(建不了,或其中的能力被 LSM 收走,表现为 EPERM/EACCES)才回退;主机明确拒绝的步骤
-  (打开 `/dev/net/tun` 失败、写不了临时的 `resolv.conf`)直接报错:那是管理员的设置,不能让 root 替用户绕过。
+  (打开 `/dev/net/tun` 失败、建不了放 `resolv.conf` 的临时目录)直接报错:那是管理员的设置,不能让 root 替用户绕过。
 - **准备进程是重新 exec 的 proxytun**(M1 实现时确定):proxytun 启动即设为 non-dumpable(保护代理凭据),fork 出的子进程会继承,
   其 `/proc/self/uid_map` 等文件因此归 root、写不进去;而让子进程恢复 dumpable 又会暴露从父进程复制来的内存(含凭据)。
   所以子进程 fork 后立即 `execv("/proc/self/exe", ["proxytun", "__proxytun_setup", ...])`:新映像里没有凭据,也恢复为 dumpable。
@@ -66,7 +66,15 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   - root 模式下先把挂载传播设为 private,否则 bind-mount 的 `resolv.conf` 会传播回主机。
   - 安装要求:sudo 以 root 执行的是 proxytun 自己的文件,必须放在只有 root 能写的位置;免密码的 sudoers 规则只放行
     `/usr/local/bin/proxytun __proxytun_root_setup *`(多余参数会被助手拒绝)。
-  - sudoers 开了 `use_pty` 时程序会落入 sudo 的伪终端会话,交互工具的终端控制会出问题:检测到时 warn。
+  - sudoers 开了 `use_pty` 时,sudo 的监控进程在新会话里以新伪终端为控制终端运行助手;助手退出后监控进程(会话首进程)随之退出,
+    内核向该终端的前台进程组发 SIGHUP。所以助手发现自己与调用者不在同一会话时,让程序 fork 后先 `setsid()` 离开,经管道告知后才回报。
+    此时程序不在 proxytun 的进程组,终端的 Ctrl+C 只到 proxytun:`SI_KERNEL` 的信号也按"程序是否还在本进程组"决定是否转发(见第 5 节)。
+    程序没有控制终端,Ctrl+Z 与窗口大小变化到不了它:检测到时 warn。
+  - 程序的进程属性与 userns 模式一致:umask 随请求传过去;非 close-on-exec 的 fd(≥3,最多 249 个,SCM_RIGHTS 一次 253 个减去固定的 4 个)
+    随请求传过去,放行后先挪到最大编号之上再 `dup2` 回原编号;资源限制在降权前逐项降到调用者的值(`prlimit` 读调用者的 16 项,
+    只降不升:CentOS 7 的 `20-nproc.conf` 给 root 不限进程数,管理员给用户设的 nproc/memlock 必须仍然有效)。
+  - sudoers 的 `ROLE`/`TYPE`(或 AppArmor profile)会让 sudo 在另一个安全上下文里运行助手,程序会带着它:比较
+    `/proc/self/attr/current` 与调用者的,不同就拒绝。默认配置下 sudo 不改上下文。
 - 1024 以下端口:绑定检查的是"拥有该网络命名空间的 user namespace 里是否有 `CAP_NET_BIND_SERVICE`",
   建命名空间的那一步本来就有,所以转发低端口不需要额外的 root;建好的监听 socket 交给普通用户进程后 accept 不需要权限。
   程序自己在命名空间里监听低端口仍会失败,与它在主机上直接运行时一致。
@@ -135,7 +143,8 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   proxytun 收到 `SI_USER` 信号后等 50 ms,读 `/proc/<见证>/status` 的待处理信号:见证也收到且程序仍在本进程组 → 程序已有一份,不转发;
   否则转发。每次判断后清空见证的待处理信号。见证 double-fork(不是 proxytun 的子进程,不影响"等整棵树退出"),管道断开即退出。
   比 proxyhook 多覆盖一种情况:用 `sigwait`/`signalfd` 收信号的程序被整组 kill 时也不会收到两次。
-  程序自己离开了 proxytun 的进程组(`setsid`、shell 作业控制)时,整组信号到不了它,照常转发。
+  程序自己离开了 proxytun 的进程组(`setsid`、shell 作业控制,或 sudo `use_pty` 下的 sudo 模式)时,整组信号到不了它,照常转发;
+  终端发的 `SI_KERNEL` 信号同理:程序还在本进程组就不转发(它已有一份),不在就转发。
 - proxytun 异常退出(`kill -9`、崩溃):**不杀程序**。TUN 随 fd 关闭消失,程序只剩回环,等于断网,不会绕过代理直连;日志与文档写明。
 - 热加载范围同 proxyhook;主机端口转发、地址规划、`fake_ip_range`、`upstream_dns` 需要重启。
 - 凭据保护同 proxyhook:程序环境里去掉 `PROXYTUN_PROXY`(原值就地清零),proxytun 设为 non-dumpable;`--proxy` 带密码时 warn。

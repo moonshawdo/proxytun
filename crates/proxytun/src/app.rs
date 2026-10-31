@@ -151,7 +151,9 @@ pub fn run(args: Args) -> Result<i32> {
             if !joined {
                 tracing::warn!(
                     "sudo started the program in a terminal session of its own (sudoers `use_pty`?): \
-                     Ctrl+C on this terminal will not reach it"
+                     it now runs in a session of its own without a controlling terminal; proxytun \
+                     passes Ctrl+C and Ctrl+\\ on to it, but job control (Ctrl+Z) and window size \
+                     changes do not reach it"
                 );
             }
             (child, ns)
@@ -308,9 +310,10 @@ enum ExitSignal {
     /// Exit now with this code. The program's tree keeps running, cut off
     /// from the network (the TUN device goes with us).
     Exit(i32),
-    /// The program got it too; nothing to do.
-    Leave,
-    /// Pass it on to the program unless it got it too (see `already_delivered`).
+    /// From the terminal, to our whole foreground group: pass it on only if
+    /// the program is not in that group (see `already_delivered`).
+    Terminal,
+    /// From a process: pass it on unless it got it too.
     Forward,
 }
 
@@ -324,20 +327,20 @@ fn on_exit_signal(sig: libc::c_int, code: i32, program_running: bool, terms: u32
         return ExitSignal::Exit(128 + sig);
     }
     // Sent by the kernel: the terminal's Ctrl+C / Ctrl+\ signals the whole
-    // foreground group, the program included.
+    // foreground group, the program included if it is still in it.
     if code == libc::SI_KERNEL {
-        return ExitSignal::Leave;
+        return ExitSignal::Terminal;
     }
     // From a process: `kill <proxytun>`, or `kill -- -<group>` / `kill %1` /
     // systemd, which look the same from here.
     ExitSignal::Forward
 }
 
-/// Did a signal from a process reach the program as well as us? It did if
-/// it was sent to our whole group (the witness has it) and the program is
-/// still in that group.
-fn already_delivered(witness_saw: bool, program_pgrp: Option<libc::pid_t>, our_pgrp: libc::pid_t) -> bool {
-    witness_saw && program_pgrp == Some(our_pgrp)
+/// Did a signal reach the program as well as us? It did if it was sent to
+/// our whole group (by the terminal, or the witness has it) and the program
+/// is still in that group.
+fn already_delivered(to_group: bool, program_pgrp: Option<libc::pid_t>, our_pgrp: libc::pid_t) -> bool {
+    to_group && program_pgrp == Some(our_pgrp)
 }
 
 /// How long to wait before asking the witness: a group-wide signal is
@@ -376,10 +379,10 @@ fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option
             let witness = witness.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(WITNESS_DELAY).await;
-                let saw = witness.as_ref().is_some_and(|w| w.saw(sig));
+                let group = action == ExitSignal::Terminal || witness.as_ref().is_some_and(|w| w.saw(sig));
                 // SAFETY: plain syscall.
                 let ours = unsafe { libc::getpgrp() };
-                if action == ExitSignal::Forward && !already_delivered(saw, witness::pgrp_of(pid), ours) {
+                if !already_delivered(group, witness::pgrp_of(pid), ours) {
                     tracing::debug!(sig, pid, "forwarding the signal to the program");
                     unsafe { libc::kill(pid, sig) };
                 }
@@ -436,7 +439,7 @@ mod tests {
     fn exit_signals_are_left_to_the_running_program() {
         for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
             // Ctrl+C / Ctrl+\ on the terminal: the program got it too.
-            assert_eq!(on_exit_signal(sig, libc::SI_KERNEL, true, 1), ExitSignal::Leave);
+            assert_eq!(on_exit_signal(sig, libc::SI_KERNEL, true, 1), ExitSignal::Terminal);
             // kill(2) from some process: maybe only we got it.
             assert_eq!(on_exit_signal(sig, SI_USER, true, 1), ExitSignal::Forward);
             // Main program gone (a background child keeps us waiting): exit,

@@ -1217,7 +1217,7 @@ argv = sys.argv[1:]
 master, slave = pty.openpty()
 def own_tty():
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-p = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=subprocess.DEVNULL,
+p = subprocess.Popen(argv, stdin=slave, stdout=slave,
                      start_new_session=True, preexec_fn=own_tty)
 os.close(slave)
 out = b""
@@ -1678,18 +1678,23 @@ fn gdb_attaches_from_outside_to_a_running_program() {
 
 /// A stand-in for sudo. Installed setuid in a user namespace where we are
 /// root, it really makes its caller root there. Like sudo it resets the
-/// environment, closes inherited fds and records the caller in SUDO_UID.
+/// environment, closes inherited fds, records the caller in SUDO_UID, adds
+/// 022 to the umask and gives the command root's resource limits.
 const C_FAKE_SUDO: &str = r#"
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <grp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
     if (getenv("FAKE_SUDO_FAIL")) { fprintf(stderr, "fake sudo: authentication failure\n"); return 1; }
     int new_pgrp = getenv("FAKE_SUDO_NEW_PGRP") != NULL, new_session = getenv("FAKE_SUDO_SETSID") != NULL;
-    int to_root = getenv("FAKE_SUDO_CHDIR") != NULL;
+    int to_root = getenv("FAKE_SUDO_CHDIR") != NULL, use_pty = getenv("FAKE_SUDO_USE_PTY") != NULL;
     char uid[32], gid[32];
     const char *forced = getenv("FAKE_SUDO_UID");
     if (forced) snprintf(uid, sizeof uid, "%s", forced); else snprintf(uid, sizeof uid, "%u", getuid());
@@ -1707,6 +1712,42 @@ int main(int argc, char **argv) {
     if (new_session) setsid();
     /* Like sudo with `runcwd` in sudoers, or -D. */
     if (to_root && chdir("/") != 0) return 1;
+    /* Like sudo's default `umask 0022`, and pam_limits giving root its own
+       limits (here: more open files, within the hard limit). */
+    umask(umask(0) | 022);
+    struct rlimit files;
+    getrlimit(RLIMIT_NOFILE, &files);
+    files.rlim_cur = files.rlim_max < 4096 ? files.rlim_max : 4096;
+    if (setrlimit(RLIMIT_NOFILE, &files)) { perror("fake sudo: setrlimit"); return 1; }
+    /* Like sudo's use_pty: a monitor in a session of its own, with a new pty
+       as controlling terminal, runs the command in the pty's foreground group.
+       When the command exits, so does the monitor, the session leader: the
+       pty hangs up whatever is still in that group. */
+    if (use_pty) {
+        int m = posix_openpt(O_RDWR | O_NOCTTY);
+        if (m < 0 || grantpt(m) || unlockpt(m)) { perror("fake sudo: pty"); return 1; }
+        pid_t monitor = fork();
+        if (monitor > 0) {
+            int st;
+            waitpid(monitor, &st, 0);
+            return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+        }
+        setsid();
+        int s = open(ptsname(m), O_RDWR);
+        if (s < 0) { perror("fake sudo: open pty"); _exit(1); }
+        pid_t cmd = fork();
+        if (cmd > 0) {
+            int st;
+            setpgid(cmd, cmd);
+            tcsetpgrp(s, cmd);
+            waitpid(cmd, &st, 0);
+            _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 1);
+        }
+        setpgid(0, 0);
+        while (tcgetpgrp(s) != getpid()) usleep(1000);
+        close(s);
+        close(m);
+    }
     if (setgroups(0, NULL) || setresgid(0, 0, 0) || setresuid(0, 0, 0)) { perror("fake sudo"); return 1; }
     execv(argv[2], argv + 2);
     perror("fake sudo: exec");
@@ -2070,13 +2111,15 @@ if case == "silent":
     rc = p.wait(timeout=30)
     print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
     sys.exit()
-rng, pgrp = {
-    "range": ("10.0.0.0/30", os.getpgrp()),
-    "pgrp": ("198.18.0.0/15", 1),
-    "late": ("198.18.0.0/15", os.getpgrp()),
+rng, pgrp, inherit = {
+    "range": ("10.0.0.0/30", os.getpgrp(), "-"),
+    "pgrp": ("198.18.0.0/15", 1, "-"),
+    # Claims an inherited fd 9 but sends none.
+    "fds": ("198.18.0.0/15", os.getpgrp(), "9"),
+    "late": ("198.18.0.0/15", os.getpgrp(), "-"),
 }[case]
 marker = os.path.join(d, "ran-" + case)
-fields = ["1", rng, str(pgrp), "-", "2", "touch", marker, "PATH=/usr/bin:/bin"]
+fields = ["2", rng, str(pgrp), "-", "22", inherit, "2", "touch", marker, "PATH=/usr/bin:/bin"]
 cwd = os.open(d, os.O_PATH)
 socket.send_fds(c, [b"".join(f.encode() + b"\0" for f in fields)], [0, 1, 2, cwd])
 print("got:", c.recv(4096)[:2].decode(errors="replace"), flush=True)
@@ -2097,7 +2140,7 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     require_centos7!("python3");
     let dir = shared_dir("helper-client");
     std::fs::write(dir.join("client.py"), PY_HELPER_CLIENT).unwrap();
-    let cases = ["stranger", "range", "pgrp", "silent", "late"];
+    let cases = ["stranger", "range", "pgrp", "fds", "silent", "late"];
     let user = format!(
         "for c in {}; do python3 \"$D/client.py\" \"$BIN\" \"$D\" $c > \"$D/out-$c\" 2>&1 & done; wait",
         cases.join(" ")
@@ -2131,6 +2174,8 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
         "{}",
         all()
     );
+    assert!(got("fds").contains("expected 5 fds"), "{}", all());
+    assert!(got("fds").ends_with("rc=1\n"), "{}", all());
     // A client that never talks does not keep root waiting.
     let silent = got("silent");
     let secs: u64 = silent
@@ -2144,7 +2189,7 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     // That limit is for talking to root only: the program, the helper gone,
     // waits for the go-ahead as long as proxytun takes.
     assert!(got("late").ends_with("got: OK\nrc=0\nran\n"), "{}", all());
-    for c in ["range", "pgrp"] {
+    for c in ["range", "pgrp", "fds"] {
         assert!(!dir.join(format!("ran-{c}")).exists(), "{c}: nothing may run");
     }
 }
@@ -2207,6 +2252,60 @@ fn the_log_file_is_never_someone_elses_nor_a_link() {
         "nothing logged to them"
     );
     assert!(!dir.join("own").exists(), "nothing created through the link");
+}
+
+#[test]
+fn under_sudo_the_program_keeps_the_users_limits_umask_and_fds() {
+    require_centos7!();
+    let dir = shared_dir("sudo-parity");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    std::fs::write(dir.join("five"), "inherited\n").unwrap();
+    // What the program sees of its process: sudo gives root other limits and
+    // umask and closes inherited fds; none of that may reach the program.
+    let probe = "ulimit -Sn; ulimit -Hn; umask; cat <&5; echo to-seven >&7; ls /proc/self/fd | tr '\\n' ' '";
+    let script = |pt: &str| {
+        format!("ulimit -Sn 777; umask 002; exec 5<\"$D/five\" 7>&1; {pt} -c \"$D/cfg.toml\" -- sh -c \"{probe}\"")
+    };
+    // Without sudo (user namespaces), as the reference.
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script("\"$BIN\""));
+    let plain = run_cmd(cmd, &[("BIN", BIN), ("D", dir.to_str().unwrap())]);
+    assert_eq!(plain.code, 0, "{}", plain.dump());
+    assert!(!plain.stderr.contains("asking sudo"), "{}", plain.dump());
+    let lines: Vec<&str> = plain.stdout.lines().collect();
+    assert_eq!(lines.len(), 6, "{}", plain.dump());
+    assert_eq!(lines[0], "777", "{}", plain.dump());
+    assert_eq!(
+        lines[2..],
+        ["0002", "inherited", "to-seven", "0 1 2 3 5 7 "],
+        "{}",
+        plain.dump()
+    );
+    // Through sudo, the same. (A copy of proxytun: the user cannot reach our
+    // build directory.)
+    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", &script("\"$D/pt\""));
+    assert_eq!(out.code, 0, "{}", out.dump());
+    assert!(out.stderr.contains("asking sudo"), "{}", out.dump());
+    assert_eq!(out.stdout, plain.stdout, "{}", out.dump());
+}
+
+#[test]
+fn under_sudo_use_pty_the_program_survives_sudo_and_still_gets_ctrl_c() {
+    require_centos7!("python3");
+    let dir = shared_dir("sudo-use-pty");
+    std::fs::write(dir.join("sig.py"), PY_SIGNAL).unwrap();
+    std::fs::write(dir.join("press_ctrl_c.py"), PY_PTY_CTRL_C).unwrap();
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // sudo's pty session ends right after the helper: the program must have
+    // left it, and is then out of our foreground group, so the terminal's
+    // Ctrl+C reaches it only through us.
+    let user = "FAKE_SUDO_USE_PTY=1 python3 \"$D/press_ctrl_c.py\" \"$D/pt\" -c \"$D/cfg.toml\" -- \
+                python3 \"$D/sig.py\" SIGINT handler";
+    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", user);
+    // (The fake sudo really made a pty session of its own.)
+    assert!(out.stderr.contains("session of its own"), "{}", out.dump());
+    assert!(out.stdout.contains("handled 1"), "{}", out.dump());
+    assert!(out.stdout.starts_with("exit 3"), "{}", out.dump());
 }
 
 #[test]

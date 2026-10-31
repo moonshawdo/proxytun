@@ -11,16 +11,23 @@
 //!     ancestors (alive, so its pid cannot have been reused) and belong to
 //!     SUDO_UID; the program's gid and groups are read from that process in
 //!     /proc (kernel-provided), never from the request;
+//!   * refuses when sudo would run it in another security context than the
+//!     caller's (sudoers ROLE/TYPE): the program would carry it;
 //!   * reads no config and opens no path the user chose: the request carries
-//!     only the fake-ip range, the argv, the environment and four fds (stdin,
-//!     stdout, stderr, working directory), and is checked again here, since
-//!     anyone may write their own client;
+//!     only the fake-ip range, the argv, the environment, the umask, and the
+//!     fds (stdin, stdout, stderr, working directory, and those the program
+//!     inherits), and is checked again here, since anyone may write their own
+//!     client;
 //!   * gives up after `HELPER_TIMEOUT` on a client that does not talk;
-//!   * forks the program, puts it in proxytun's process group, and has it drop
-//!     to the user (groups, gid, uid; no capability may survive) and set
-//!     no_new_privs, so no setuid program can regain root in a network the
-//!     user controls; then take the user's stdio, directory and environment,
-//!     and wait for the go-ahead;
+//!   * forks the program, puts it in proxytun's process group (or, when sudo
+//!     gave it a terminal session of its own, `use_pty`, out of that session
+//!     before it ends and hangs the program up), and has it lower its
+//!     resource limits to the caller's (PAM may give root more), drop to the
+//!     user (groups, gid,
+//!     uid; no capability may survive) and set no_new_privs, so no setuid
+//!     program can regain root in a network the user controls; then take the
+//!     user's umask, stdio, directory and environment, wait for the go-ahead,
+//!     and put the inherited fds back at their numbers;
 //!   * hands the TUN device and listener back and exits: from then on no
 //!     process of ours runs as root.
 
@@ -34,7 +41,7 @@ use nix::sys::socket::{
 use std::ffi::{CString, OsString};
 use std::io::IoSlice;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::Duration;
 
@@ -49,22 +56,38 @@ struct Request {
     pgrp: libc::pid_t,
     /// Host ports to bind inside.
     forwards: Vec<SocketAddr>,
+    /// proxytun's umask, for the program.
+    umask: libc::mode_t,
+    /// The fds the program inherits, by their numbers in proxytun. They
+    /// follow the four fixed ones in the message, in this order.
+    inherit: Vec<RawFd>,
     argv: Vec<String>,
     env: Vec<OsString>,
 }
 
 impl Request {
-    /// NUL-separated: version, range, pgrp, forwards, argc, argv..., env...
+    /// NUL-separated: version, range, pgrp, forwards, umask (octal), inherited
+    /// fds ("-" for none), argc, argv..., env...
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut field = |b: &[u8]| {
             out.extend_from_slice(b);
             out.push(0);
         };
-        field(b"1");
+        field(b"2");
         field(self.fake_range.to_string().as_bytes());
         field(self.pgrp.to_string().as_bytes());
         field(netns::join_addrs(&self.forwards).as_bytes());
+        field(format!("{:o}", self.umask).as_bytes());
+        let inherit: Vec<String> = self.inherit.iter().map(|n| n.to_string()).collect();
+        field(
+            if inherit.is_empty() {
+                "-".into()
+            } else {
+                inherit.join(",")
+            }
+            .as_bytes(),
+        );
         field(self.argv.len().to_string().as_bytes());
         for a in &self.argv {
             field(a.as_bytes());
@@ -78,12 +101,17 @@ impl Request {
     fn decode(b: &[u8]) -> Option<Request> {
         let mut fields = b.strip_suffix(&[0])?.split(|&c| c == 0);
         let mut text = || std::str::from_utf8(fields.next()?).ok().map(str::to_owned);
-        if text()? != "1" {
+        if text()? != "2" {
             return None;
         }
         let fake_range = text()?.parse().ok()?;
         let pgrp = text()?.parse().ok()?;
         let forwards = netns::split_addrs(&text()?)?;
+        let umask = libc::mode_t::from_str_radix(&text()?, 8).ok()?;
+        let inherit = match text()?.as_str() {
+            "-" => Vec::new(),
+            list => list.split(',').map(|n| n.parse().ok()).collect::<Option<_>>()?,
+        };
         let argc: usize = text()?.parse().ok()?;
         let argv = (0..argc).map(|_| text()).collect::<Option<Vec<_>>>()?;
         if argv.is_empty() {
@@ -94,6 +122,8 @@ impl Request {
             fake_range,
             pgrp,
             forwards,
+            umask,
+            inherit,
             argv,
             env,
         })
@@ -168,6 +198,10 @@ pub fn root_refusal_here() -> Option<String> {
     root_refusal(unsafe { libc::getuid() }, unsafe { libc::geteuid() }, elevated)
 }
 
+/// SCM_RIGHTS passes at most 253 fds at once; four are stdio and the
+/// working directory.
+const MAX_INHERIT: usize = 249;
+
 /// How long the helper waits for its client.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -192,7 +226,52 @@ fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
         "process group {} is not the caller's",
         req.pgrp
     );
+    ensure!(req.umask <= 0o777, "umask {:o} out of bounds", req.umask);
+    ensure!(
+        req.inherit.len() <= MAX_INHERIT,
+        "too many inherited fds ({})",
+        req.inherit.len()
+    );
+    let mut seen = std::collections::HashSet::new();
+    for &n in &req.inherit {
+        ensure!(n >= 3 && seen.insert(n), "inherited fd {n} not allowed");
+    }
     Ok(())
+}
+
+/// The resource limits of `pid`: all 16 Linux has had since 2.6.25.
+fn limits_of(pid: libc::pid_t) -> Result<Vec<libc::rlimit>> {
+    (0..16)
+        .map(|r| {
+            let mut l = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: reads into a local struct; as root we may read anyone's.
+            if unsafe { libc::prlimit(pid, r as _, std::ptr::null(), &mut l) } != 0 {
+                bail!("read the resource limits of {pid}: {}", std::io::Error::last_os_error());
+            }
+            Ok(l)
+        })
+        .collect()
+}
+
+/// The fds a program started by us inherits: 3 and up, open without
+/// close-on-exec. In userns mode they pass through exec by themselves.
+fn inheritable_fds() -> Result<Vec<RawFd>> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir("/proc/self/fd").context("list our fds")? {
+        let Ok(n) = e?.file_name().to_string_lossy().parse::<RawFd>() else {
+            continue;
+        };
+        // SAFETY: F_GETFD only reads flags. The listing's own fd is
+        // close-on-exec, and gone by now anyway (-1).
+        if n >= 3 && unsafe { libc::fcntl(n, libc::F_GETFD) } == 0 {
+            v.push(n);
+        }
+    }
+    v.sort_unstable();
+    Ok(v)
 }
 
 /// Is `target` among the first `hops` ancestors, starting from `parent`?
@@ -312,11 +391,25 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
         cred.uid()
     );
 
+    let inherit = inheritable_fds()?;
+    ensure!(
+        inherit.len() <= MAX_INHERIT,
+        "{} inherited fds: through sudo at most {MAX_INHERIT} can be passed on",
+        inherit.len()
+    );
     let req = Request {
         fake_range: s.fake_range,
         // SAFETY: plain syscall.
         pgrp: unsafe { libc::getpgrp() },
         forwards: s.forwards.clone(),
+        // SAFETY: plain syscalls, putting it back at once; no other thread
+        // runs yet (the runtime comes later).
+        umask: unsafe {
+            let m = libc::umask(0);
+            libc::umask(m);
+            m
+        },
+        inherit,
         argv: s.argv.clone(),
         env: std::env::vars_os()
             .map(|(k, v)| {
@@ -333,7 +426,10 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
         bail!("open the working directory: {}", std::io::Error::last_os_error());
     }
     let cwd = unsafe { OwnedFd::from_raw_fd(cwd) };
-    let fds = [0, 1, 2, cwd.as_raw_fd()];
+    let fds: Vec<RawFd> = [0, 1, 2, cwd.as_raw_fd()]
+        .into_iter()
+        .chain(req.inherit.iter().copied())
+        .collect();
     sendmsg::<()>(
         ctl.as_raw_fd(),
         &[IoSlice::new(&req.encode())],
@@ -417,7 +513,17 @@ fn helper(args: &[String]) -> Result<()> {
         Ok(w) => w,
         Err(e) => return refuse(&ctl, e),
     };
-    let caller_pgrp = crate::witness::pgrp_of(cred.pid()).unwrap_or(-1);
+    // sudoers may run its command in another security context (ROLE/TYPE, an
+    // AppArmor profile): the program would carry it. Only the caller's will do.
+    let label = |p: String| std::fs::read(format!("/proc/{p}/attr/current")).ok();
+    if label("self".into()) != label(cred.pid().to_string()) {
+        return refuse(
+            &ctl,
+            anyhow!("sudo runs its command in another security context than yours (sudoers ROLE/TYPE?)"),
+        );
+    }
+    let caller = crate::witness::proc_stat(cred.pid());
+    let caller_pgrp = caller.map_or(-1, |s| s.pgrp);
 
     let mut buf = vec![0u8; 1 << 20];
     let (n, fds) = netns::recv_with_fds(&ctl, &mut buf).context("read the request")?;
@@ -427,8 +533,16 @@ fn helper(args: &[String]) -> Result<()> {
     if let Err(e) = validate(&req, caller_pgrp) {
         return refuse(&ctl, e);
     }
-    let Ok([stdin, stdout, stderr, cwd]) = <[OwnedFd; 4]>::try_from(fds) else {
-        return refuse(&ctl, anyhow!("expected 4 fds"));
+    if fds.len() != 4 + req.inherit.len() {
+        return refuse(&ctl, anyhow!("expected {} fds", 4 + req.inherit.len()));
+    }
+    let mut fds = fds.into_iter();
+    let mut next = || fds.next().expect("counted");
+    let (stdin, stdout, stderr, cwd) = (next(), next(), next(), next());
+    let inherit: Vec<(RawFd, OwnedFd)> = req.inherit.iter().map(|&n| (n, next())).collect();
+    let limits = match limits_of(cred.pid()) {
+        Ok(l) => l,
+        Err(e) => return refuse(&ctl, e),
     };
     // The program shares this socket and waits on it for the go-ahead for as
     // long as proxytun needs.
@@ -441,7 +555,25 @@ fn helper(args: &[String]) -> Result<()> {
             return Err(e.err);
         }
     };
-    let prepared = Prepared::new(&req)?;
+    // sudo gave us a terminal session of its own (`use_pty`): when its
+    // leader, sudo's monitor, exits after us, the terminal hangs up whatever
+    // is still in it. The program leaves first and tells us on this pipe.
+    // SAFETY: plain syscall.
+    let detach = if caller.map(|s| s.session) != Some(unsafe { libc::getsid(0) }) {
+        let mut p = [0; 2];
+        // SAFETY: pipe2 fills both fds, owned right away.
+        if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            bail!("pipe: {}", std::io::Error::last_os_error());
+        }
+        Some(unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) })
+    } else {
+        None
+    };
+    let (left, detach) = match detach {
+        Some((r, w)) => (Some(r), Some(w)),
+        None => (None, None),
+    };
+    let prepared = Prepared::new(&req, limits, inherit, detach)?;
     // SAFETY: we are single-threaded; the child only uses prepared data.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -454,6 +586,12 @@ fn helper(args: &[String]) -> Result<()> {
         eprintln!("proxytun (sudo helper): {why}");
         unsafe { libc::_exit(126) };
     }
+    if let Some(left) = left {
+        drop(prepared); // our copy of the write end: EOF should the child die
+        let mut b = [0u8; 1];
+        // SAFETY: plain read into a local buffer.
+        unsafe { libc::read(left.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
+    }
     // Join proxytun's group. Safe from the parent alone: the child cannot exec
     // (and so make setpgid fail) before the go-ahead, which follows our report.
     // SAFETY: plain syscall.
@@ -463,19 +601,38 @@ fn helper(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The user's environment, built before fork.
+/// What the program takes from the user, built before fork.
 struct Prepared {
     env: Vec<CString>,
+    /// The caller's resource limits, by resource number: the program's are
+    /// lowered to them.
+    limits: Vec<libc::rlimit>,
+    umask: libc::mode_t,
+    /// (number in proxytun, fd here).
+    inherit: Vec<(RawFd, OwnedFd)>,
+    /// Write end of the pipe the program reports leaving sudo's session on.
+    detach: Option<OwnedFd>,
 }
 
 impl Prepared {
-    fn new(req: &Request) -> Result<Self> {
+    fn new(
+        req: &Request,
+        limits: Vec<libc::rlimit>,
+        inherit: Vec<(RawFd, OwnedFd)>,
+        detach: Option<OwnedFd>,
+    ) -> Result<Self> {
         let env = req
             .env
             .iter()
             .map(|e| CString::new(e.as_bytes()).context("environment entry contains NUL"))
             .collect::<Result<_>>()?;
-        Ok(Prepared { env })
+        Ok(Prepared {
+            env,
+            limits,
+            umask: req.umask,
+            inherit,
+            detach,
+        })
     }
 
     /// In the forked child: become the user, wait for the go-ahead on `ctl`,
@@ -491,6 +648,28 @@ impl Prepared {
         // SAFETY: plain syscalls; the helper is single-threaded, so the
         // child may use the environment and the allocator.
         unsafe {
+            if let Some(w) = &self.detach {
+                if libc::setsid() < 0 {
+                    return format!("leaving sudo's session: {}", std::io::Error::last_os_error());
+                }
+                libc::write(w.as_raw_fd(), b"s".as_ptr().cast(), 1);
+            }
+            // The caller's limits wherever PAM gave root more (nproc, memlock:
+            // what the admin set for the user holds); only ever lowering.
+            for (r, l) in self.limits.iter().enumerate() {
+                let mut now = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::getrlimit(r as _, &mut now);
+                let lower = libc::rlimit {
+                    rlim_cur: now.rlim_cur.min(l.rlim_cur),
+                    rlim_max: now.rlim_max.min(l.rlim_max),
+                };
+                if libc::setrlimit(r as _, &lower) != 0 {
+                    return format!("applying your resource limits: {}", std::io::Error::last_os_error());
+                }
+            }
             if libc::setgroups(who.groups.len(), who.groups.as_ptr()) != 0
                 || libc::setresgid(who.gid, who.gid, who.gid) != 0
                 || libc::setresuid(who.uid, who.uid, who.uid) != 0
@@ -518,6 +697,7 @@ impl Prepared {
             {
                 return format!("setting no_new_privs: {}", std::io::Error::last_os_error());
             }
+            libc::umask(self.umask);
             for (i, fd) in stdio.iter().enumerate() {
                 libc::dup2(fd.as_raw_fd(), i as libc::c_int);
             }
@@ -536,6 +716,26 @@ impl Prepared {
             }
         }
         netns::wait_go(ctl);
+        // The inherited fds at the numbers they had in proxytun, moved out of
+        // the way first: a number to fill may be held by one of them (or by
+        // ctl, done with now). The moved copies close on exec.
+        if let Some(top) = self.inherit.iter().map(|(n, _)| *n).max() {
+            let mut moved = Vec::new();
+            for (n, fd) in &self.inherit {
+                // SAFETY: plain syscalls on fds we hold.
+                let m = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, top + 1) };
+                if m < 0 {
+                    return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
+                }
+                moved.push((*n, m));
+            }
+            for (n, m) in moved {
+                // SAFETY: as above.
+                if unsafe { libc::dup2(m, n) } < 0 {
+                    return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
+                }
+            }
+        }
         let code = netns::exec(argv);
         unsafe { libc::_exit(code) }
     }
@@ -551,6 +751,8 @@ mod tests {
             fake_range: "198.18.0.0/15".parse().unwrap(),
             pgrp: 4242,
             forwards: vec!["127.0.0.1:5432".parse().unwrap(), "[::1]:80".parse().unwrap()],
+            umask: 0o027,
+            inherit: vec![3, 7, 250],
             argv: vec!["curl".into(), "".into(), "a b=c".into()],
             env: vec![
                 OsString::from("HOME=/home/u"),
@@ -562,16 +764,29 @@ mod tests {
             fake_range: "10.0.0.0/8".parse().unwrap(),
             pgrp: 1,
             forwards: vec![],
+            umask: 0,
+            inherit: vec![],
             argv: vec!["true".into()],
             env: vec![],
         };
+        let mut other_version = no_env.encode();
         assert_eq!(Request::decode(&no_env.encode()), Some(no_env));
-        assert_eq!(Request::decode(b"2\0x\0"), None, "unknown version");
-        assert_eq!(Request::decode(b"1\x0010.0.0.0/8\x001\0-\x000\0"), None, "no program");
+        other_version[0] = b'1';
+        assert_eq!(Request::decode(&other_version), None, "another version");
         assert_eq!(
-            Request::decode(b"1\x0010.0.0.0/8\x001\0-\x005\0a\0"),
+            Request::decode(b"2\x0010.0.0.0/8\x001\0-\x0022\0-\x000\0"),
+            None,
+            "no program"
+        );
+        assert_eq!(
+            Request::decode(b"2\x0010.0.0.0/8\x001\0-\x0022\0-\x005\0a\0"),
             None,
             "argv cut short"
+        );
+        assert_eq!(
+            Request::decode(b"2\x0010.0.0.0/8\x001\0-\x009\0-\x001\0true\0"),
+            None,
+            "umask not octal"
         );
     }
 
@@ -618,6 +833,8 @@ mod tests {
             fake_range: range.parse().unwrap(),
             pgrp,
             forwards: forwards.iter().map(|a| a.parse().unwrap()).collect(),
+            umask: 0o022,
+            inherit: vec![],
             argv: vec!["true".into()],
             env: vec![],
         }
@@ -642,6 +859,29 @@ mod tests {
             .collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         assert!(validate(&req("198.18.0.0/15", 7, &many), 7).is_err(), "too many");
+
+        let with = |umask, inherit: &[RawFd]| Request {
+            umask,
+            inherit: inherit.to_vec(),
+            ..req("198.18.0.0/15", 7, &[])
+        };
+        assert!(validate(&with(0o777, &[3, 9, 1000]), 7).is_ok());
+        assert!(
+            validate(&with(0o1777, &[]), 7).is_err(),
+            "umask with more than permission bits"
+        );
+        assert!(
+            validate(&with(0o022, &[2]), 7).is_err(),
+            "stdio is not inherited this way"
+        );
+        assert!(validate(&with(0o022, &[5, 5]), 7).is_err(), "duplicate fd");
+        let fds: Vec<RawFd> = (3..3 + MAX_INHERIT as RawFd).collect();
+        assert!(validate(&with(0o022, &fds), 7).is_ok(), "as many as fit");
+        let fds: Vec<RawFd> = (3..4 + MAX_INHERIT as RawFd).collect();
+        assert!(
+            validate(&with(0o022, &fds), 7).is_err(),
+            "more than one message carries"
+        );
     }
 
     #[test]
