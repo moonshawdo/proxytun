@@ -160,11 +160,14 @@ where
     if let Err(e) = s.read_exact(&mut head).await {
         use std::io::ErrorKind::{ConnectionAborted, ConnectionReset, UnexpectedEof};
         // Hung up instead of replying: what `ssh -D` does when it cannot
-        // reach the destination. Like no reply at all, about the destination.
+        // reach the destination, which another member (another server) may
+        // well reach. Not the proxy's failure (it greeted us properly), nor a
+        // success it reported: health untouched, and the next member tried
+        // at once.
         if matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted) {
             return Err(TargetRefused {
                 msg: format!("socks5: the proxy hung up instead of replying to the connect request ({e})"),
-                about_target: true,
+                about_target: false,
                 answered: false,
             }
             .into());
@@ -876,12 +879,9 @@ mod tests {
         // squid, ssh -D, dante answer the connect request only once the
         // destination has: a black hole leaves the request unanswered. That is
         // no reason to doubt the proxy, nor to make every member wait it out.
-        // ssh -D hangs up instead: the same, not a broken proxy (three
-        // unreachable destinations in a row used to take it down).
         let cases = [
             (Reply::SocksUnanswered, ProxyKind::Socks5),
             (Reply::HttpUnanswered, ProxyKind::Http),
-            (Reply::SocksHangsUp, ProxyKind::Socks5),
         ]
         .map(|(reply, kind)| async move {
             let (a, hits_a) = scripted_proxy(reply).await;
@@ -918,8 +918,36 @@ mod tests {
             assert!(dial_group(&g, &dom("x.example", 443), 0, 1).await.is_err());
             assert!(!g.nodes[0].is_healthy(), "a silent proxy is marked down");
         };
-        let [socks, http, hangs_up] = cases;
-        tokio::join!(socks, http, hangs_up, mute);
+        let [socks, http] = cases;
+        tokio::join!(socks, http, mute);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_hangs_up_on_a_request_is_neither_blamed_nor_the_last_word() {
+        // ssh -D hangs up on a destination it cannot reach: three in a row
+        // used to take it down (V2 fixed that), and another member, another
+        // server, may reach it. Neither health is touched by the hang-up.
+        let (a, a_hits) = scripted_proxy(Reply::SocksHangsUp).await;
+        let (b, b_hits) = scripted_proxy(Reply::Socks(0)).await;
+        let g = Group::new(
+            "g",
+            Strategy::RoundRobin,
+            vec![node_at("a", a, ProxyKind::Socks5), node_at("b", b, ProxyKind::Socks5)],
+        );
+        for _ in 0..6 {
+            dial_group(&g, &dom("x.example", 443), 2, 1).await.unwrap();
+        }
+        assert!(g.nodes[0].is_healthy(), "hanging up is not a broken proxy");
+        assert_eq!(g.nodes[0].stats().ok_total, 0, "nor a success it reported");
+        assert!(a_hits.load(Ordering::SeqCst) > 0, "a was asked");
+        assert_eq!(b_hits.load(Ordering::SeqCst), 6, "and b got every one");
+        // All members hang up: it fails, still blaming none.
+        let (c, _) = scripted_proxy(Reply::SocksHangsUp).await;
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("c", c, ProxyKind::Socks5)]);
+        for _ in 0..3 {
+            assert!(dial_group(&g, &dom("x.example", 443), 2, 1).await.is_err());
+        }
+        assert!(g.nodes[0].is_healthy());
     }
 
     #[tokio::test]

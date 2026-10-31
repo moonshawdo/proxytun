@@ -167,7 +167,7 @@ pub fn run(args: Args) -> Result<Exit> {
         }
         r => r?,
     };
-    let relays = relay_capacity(raise_fd_limit());
+    let relays = relay_capacity(raise_fd_limit(), ns.forwards.len());
     // A caller that ignores SIGCHLD (that survives exec) would have the kernel
     // reap our children unasked, the program's exit status with them. The
     // program, forked already and waiting for the go-ahead, keeps the
@@ -408,13 +408,15 @@ fn raise_fd_limit() -> u64 {
 }
 
 /// How many connections may be relayed at once with `soft` open files: two
-/// fds each, once the rest is set aside (the TUN device and listeners, the
-/// runtime, health probes, up to 256 DNS forwards and 32 lookups, host-port
-/// listeners: 512, or a quarter of a small limit); `MAX_RELAYS` at most.
-/// Beyond it a connection is reset at once (`relays_refused`), instead of
-/// waiting in the accept queue for an fd, or failing its dial.
-fn relay_capacity(soft: u64) -> usize {
-    let reserve = (soft / 4).min(512);
+/// fds each, once the rest is set aside: some 64 fixed ones (the TUN device,
+/// the listener, the runtime, health probes), the `host_ports` listeners,
+/// and as many DNS forwards and host name lookups as may run at once; but
+/// at most half a small limit. `MAX_RELAYS` at most. Beyond it a connection
+/// is reset at once (`relays_refused`), instead of waiting in the accept
+/// queue for an fd, or failing its dial.
+fn relay_capacity(soft: u64, host_ports: usize) -> usize {
+    let rest = 64 + host_ports + proxytun_core::net::dns::MAX_FORWARDS + proxytun_core::net::relay::MAX_LOOKUPS;
+    let reserve = (rest as u64).min(soft / 2);
     let n = (soft.saturating_sub(reserve) / 2).clamp(1, capture::MAX_RELAYS as u64) as usize;
     if n < capture::MAX_RELAYS {
         tracing::warn!(
@@ -628,13 +630,18 @@ mod tests {
 
     #[test]
     fn the_relay_cap_follows_the_open_file_limit() {
-        // CentOS 7's default hard limit: room for the rest, two per relay.
-        assert_eq!(relay_capacity(4096), (4096 - 512) / 2);
-        assert_eq!(relay_capacity(1024), (1024 - 256) / 2);
-        assert_eq!(relay_capacity(1 << 20), crate::capture::MAX_RELAYS);
-        assert_eq!(relay_capacity(16384 + 512), crate::capture::MAX_RELAYS);
-        assert_eq!(relay_capacity(64), 24);
-        assert_eq!(relay_capacity(0), 1);
+        // Room for everything else at its worst: 64 fixed, the host ports,
+        // 256 DNS forwards, 32 lookups. Then two per relay.
+        let rest = 64 + 256 + 32;
+        // CentOS 7's default hard limit.
+        assert_eq!(relay_capacity(4096, 0), (4096 - rest) / 2);
+        // 1024, with a hundred host ports: forwards and lookups at their
+        // most still find fds.
+        assert_eq!(relay_capacity(1024, 100), (1024 - rest - 100) / 2);
+        assert_eq!(relay_capacity(1 << 20, 250), crate::capture::MAX_RELAYS);
+        // A small limit: half for the rest at most.
+        assert_eq!(relay_capacity(64, 4), 16);
+        assert_eq!(relay_capacity(0, 0), 1);
     }
 
     #[test]

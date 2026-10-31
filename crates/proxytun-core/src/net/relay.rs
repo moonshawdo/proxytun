@@ -189,9 +189,11 @@ pub async fn route(live: &Live, traffic: &Traffic, mut inbound: TcpStream, pendi
 
 /// Notice a dead path to the proxy or target, which nothing else would: the
 /// program's own keepalives are answered by our listener, right next to it.
-/// Idle, the first probe goes after 60 s, then every 15 s; unanswered (or
-/// data unacknowledged) for 120 s, the connection fails, and the relay with
-/// it, resetting the program.
+/// Idle, the first probe goes after 60 s, then every 15 s; four unanswered,
+/// the connection fails, and the relay with it, resetting the program. No
+/// TCP_USER_TIMEOUT: it would also end a transfer whose receiver merely
+/// stops reading for a while (a zero window); data that cannot get through
+/// a dead path ends the connection after the kernel's own retries.
 fn keepalive(s: &TcpStream) {
     let fd = s.as_raw_fd();
     for (level, opt, v) in [
@@ -199,7 +201,6 @@ fn keepalive(s: &TcpStream) {
         (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60),
         (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15),
         (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 4),
-        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 120_000),
     ] {
         let v: libc::c_int = v;
         // SAFETY: an int option on a socket we own.
@@ -630,6 +631,24 @@ mod tests {
         drop(c);
         let seen = tokio::time::timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
         assert_eq!(seen, Err(std::io::ErrorKind::ConnectionReset));
+    }
+
+    #[tokio::test]
+    async fn keepalive_probes_idle_paths_and_never_times_out_a_slow_reader() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        keepalive(&s);
+        let get = |level, opt| {
+            let mut v: libc::c_int = -1;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            unsafe { libc::getsockopt(s.as_raw_fd(), level, opt, &mut v as *mut _ as *mut _, &mut len) };
+            v
+        };
+        assert_eq!(get(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 60);
+        // A receiver that stops reading for minutes (a zero window) is not
+        // a dead path: no user timeout may end the transfer.
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT), 0);
     }
 
     #[tokio::test]

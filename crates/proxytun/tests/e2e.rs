@@ -2019,7 +2019,7 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
     );
     assert!(out.stderr.contains("open-file limit"), "and says so\n{}", out.dump());
 
-    // With no room to raise it, the relay cap follows the limit: 24 at once
+    // With no room to raise it, the relay cap follows the limit: 16 at once
     // for 64 fds; more are reset at once, not left to run proxytun out of
     // fds. No host ports: each would hold an fd, and how many listeners the
     // host has varies.
@@ -2042,7 +2042,7 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
     };
     let out = pressure(&cfg, "50", "0");
     assert!(
-        out.stderr.contains("allows 24 connections relayed at once"),
+        out.stderr.contains("allows 16 connections relayed at once"),
         "{}",
         out.dump()
     );

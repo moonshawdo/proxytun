@@ -616,50 +616,55 @@ where
         if !KEYS.contains(&k.to_ascii_lowercase().as_str()) || v.is_empty() {
             continue;
         }
-        let Some((host, port)) = proxy_endpoint(&v) else {
+        let Some((host, ports)) = proxy_endpoint(&v) else {
             continue;
         };
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if !out.ips.contains(&(ip, port)) {
-                out.ips.push((ip, port));
-            }
-        } else {
-            let host = host.to_ascii_lowercase();
-            if !out.domains.contains(&(host.clone(), port)) {
-                out.domains.push((host, port));
+        for port in ports {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                if !out.ips.contains(&(ip, port)) {
+                    out.ips.push((ip, port));
+                }
+            } else {
+                let host = host.to_ascii_lowercase();
+                if !out.domains.contains(&(host.clone(), port)) {
+                    out.domains.push((host, port));
+                }
             }
         }
     }
     out
 }
 
-/// Extract (host, port) from values like `http://u:p@10.0.0.1:8080/`,
-/// `socks5h://[::1]:1080`, or a bare `host:port`.
-fn proxy_endpoint(v: &str) -> Option<(String, u16)> {
+/// Extract the host and the ports it may be reached on from values like
+/// `http://u:p@10.0.0.1:8080/`, `socks5h://[::1]:1080`, or a bare
+/// `host:port`.
+fn proxy_endpoint(v: &str) -> Option<(String, Vec<u16>)> {
     let (scheme, rest) = match v.split_once("://") {
         Some((s, r)) => (Some(s.to_ascii_lowercase()), r),
         None => (None, v),
     };
     let rest = rest.split('/').next()?;
     let hostport = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
-    // Without a port, curl and git go to 1080 (443 for an https:// proxy),
-    // whatever the scheme: so do we, to recognise where they go.
-    let default_port = match scheme.as_deref() {
-        Some("https") => 443,
-        _ => 1080,
+    // Without a port, clients disagree: curl and git go to 1080 for any
+    // scheme, Python, Go, wget, npm and apt to 80 for http:// (443 for
+    // https://). Either is the program's own proxy.
+    let default_ports = match scheme.as_deref() {
+        Some("https") => vec![443],
+        Some("socks5" | "socks5h" | "socks4" | "socks4a" | "socks") => vec![1080],
+        _ => vec![80, 1080],
     };
     if let Some(stripped) = hostport.strip_prefix('[') {
         let (h, tail) = stripped.split_once(']')?;
-        let port = match tail.strip_prefix(':') {
-            Some(p) => p.parse().ok()?,
-            None => default_port,
+        let ports = match tail.strip_prefix(':') {
+            Some(p) => vec![p.parse().ok()?],
+            None => default_ports,
         };
-        return Some((h.to_string(), port));
+        return Some((h.to_string(), ports));
     }
     match hostport.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() => Some((h.to_string(), p.parse().ok()?)),
+        Some((h, p)) if !h.is_empty() => Some((h.to_string(), vec![p.parse().ok()?])),
         Some(_) => None,
-        None if !hostport.is_empty() => Some((hostport.to_string(), default_port)),
+        None if !hostport.is_empty() => Some((hostport.to_string(), default_ports)),
         None => None,
     }
 }
@@ -1046,11 +1051,14 @@ mod tests {
             ("https_proxy", "https://secure.example"),
             ("all_proxy", "socks5://s.example"),
         ]);
-        // Where curl and git connect: 1080 even for http:// (not 80).
+        // Where curl and git connect (1080), and where pip, Go, wget, npm
+        // and apt do (80): both.
         assert_eq!(
             e.domains,
             vec![
+                ("proxy.corp.example".to_string(), 80),
                 ("proxy.corp.example".to_string(), 1080),
+                ("plain.example".to_string(), 80),
                 ("plain.example".to_string(), 1080),
                 ("secure.example".to_string(), 443),
                 ("s.example".to_string(), 1080)

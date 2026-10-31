@@ -133,7 +133,7 @@ proxytun 的退出码就是程序的退出码;程序被信号杀死时,proxytun 
 | `fake_ip_range` | 末尾的 /24 留给命名空间内部(TUN `.1`、假 DNS `.53`),所以至少要 /22 |
 | `upstream_dns` | MX/TXT/PTR 等非 A 查询从主机转发到这里。**默认用主机 `/etc/resolv.conf` 的第一个 nameserver**(proxyhook 默认 `1.1.1.1:53`) |
 | `localnet` | 命中的目标由 proxytun 从主机直连,不走规则与代理。**默认为空**:命名空间里的 `127.0.0.0/8` 是命名空间自己的回环,到不了 proxytun |
-| `direct_to_proxies` | 程序自己连 `[[proxies]]` 里的某个代理时(它自己的代理设置、`curl -x`),按 IP+端口直连,不再经代理绕一次;同一主机的其他端口照常走规则。默认 `true`(proxyhook 只放行程序环境变量里的代理;那些照样放行,`http_proxy` 等不写端口时按 curl、git 的约定当作 1080,`https://` 为 443) |
+| `direct_to_proxies` | 程序自己连 `[[proxies]]` 里的某个代理时(它自己的代理设置、`curl -x`),按 IP+端口直连,不再经代理绕一次;同一主机的其他端口照常走规则。默认 `true`(proxyhook 只放行程序环境变量里的代理;那些照样放行,`http_proxy` 等不写端口时 80 和 1080 都算:curl、git 连 1080,pip、Go、wget、npm、apt 连 80;`https://` 为 443) |
 | `host_ports_forward` | 是否把主机的回环监听转发进命名空间,默认 `true` |
 | `host_ports_exclude` | 不转发的端口(程序要自己在这个端口上监听时用) |
 
@@ -209,7 +209,7 @@ proxytun 和程序照常运行。要完整的日志请用 `--log-file`。
 | 慢 | `closed` 行:`dial_ms` 大是连代理慢;`dial_ms` 小而 `ms` 大、字节数不多,是代理或目标传得慢 |
 | 吞吐上不去 | SIGUSR1 的速率行;`top -H -p <pid>` 里名为 `tun` 的线程接近 100% 时,是到了 proxytun 本身的上限(本机约 1 GB/s),否则瓶颈在代理 |
 | 域名解析不了 / 很慢 | `-v` 的 `dns:` 行;统计里的 `dns_forward_failed`(上游第一次不应答时会 warn) |
-| 连接卡住 | 统计里的丢包计数:`dropped_no_flow`(找不到连接的 TCP 包)、`dropped_table_full`(地址改写表满,error 日志每 10 秒最多一条)、`relays_refused`(同时中继的连接已达上限,新连接被立即重置;上限 8192 条,打开文件数上限较低时更少,启动时 warn 写明,如 CentOS 7 默认的 4096 只够约 1800 条)、`dropped_dns_busy`(同时处理的 DNS 查询已达 1024 个,多出的丢弃,解析器会重试)、`dropped_unparsed`(IPv6、分片)、`dropped_other_proto`(ICMP 等) |
+| 连接卡住 | 统计里的丢包计数:`dropped_no_flow`(找不到连接的 TCP 包)、`dropped_table_full`(地址改写表满,error 日志每 10 秒最多一条)、`relays_refused`(同时中继的连接已达上限,新连接被立即重置;上限 8192 条,打开文件数上限较低时更少,启动时 warn 写明,如 CentOS 7 默认的 4096 约 1870 条)、`dropped_dns_busy`(同时处理的 DNS 查询已达 1024 个,多出的丢弃,解析器会重试)、`dropped_unparsed`(IPv6、分片)、`dropped_other_proto`(ICMP 等) |
 
 ## 限制
 

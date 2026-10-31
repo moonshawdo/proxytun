@@ -60,12 +60,14 @@ pub struct Stats {
 /// 500 MB within 15 s).
 pub const MAX_DNS_IN_FLIGHT: u64 = 1024;
 
-/// Counts one DNS query out of `Stats::dns_in_flight` when dropped.
-struct Answered<'a>(&'a AtomicU64);
+/// One DNS query counted in `Stats::dns_in_flight`, until dropped: made
+/// where it is counted, so it is counted out however its task ends (or
+/// never runs).
+struct Answering(Arc<Shared>);
 
-impl Drop for Answered<'_> {
+impl Drop for Answering {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.stats.dns_in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -329,8 +331,9 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
 }
 
 fn on_dns(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &[u8], p: &Packet) {
-    if sh.stats.dns_in_flight.fetch_add(1, Ordering::Relaxed) >= MAX_DNS_IN_FLIGHT {
-        sh.stats.dns_in_flight.fetch_sub(1, Ordering::Relaxed);
+    let counted = sh.stats.dns_in_flight.fetch_add(1, Ordering::Relaxed);
+    let answering = Answering(sh.clone());
+    if counted >= MAX_DNS_IN_FLIGHT {
         count(&sh.stats.drop_dns_busy, 1);
         return;
     }
@@ -339,7 +342,7 @@ fn on_dns(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &[u8], p: &Pac
     let (tun, sh) = (tun.clone(), sh.clone());
     // Forwarded queries can take seconds; never hold up the packet loop.
     rt.spawn(async move {
-        let _answered = Answered(&sh.stats.dns_in_flight);
+        let _answering = answering;
         let Some(resp) = dns::respond(&query, &sh.pool, sh.upstream_dns, Transport::Udp, &sh.dns).await else {
             return;
         };
