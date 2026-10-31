@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// At most this many mappings (about 150 MB), however large the range: past
+/// At most this many mappings (about 280 MB with common names), however large the range: past
 /// it, the oldest are recycled as when the range is used up. A /8 would
 /// otherwise let random subdomains grow the table to gigabytes.
 pub const MAX_ENTRIES: u32 = 1 << 20;

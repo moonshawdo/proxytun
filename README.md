@@ -113,8 +113,8 @@ proxytun 的退出码就是程序的退出码;程序被信号杀死时,proxytun 
 
 | 参数 | 说明 |
 |---|---|
-| `-c, --config <FILE>` | 配置文件,默认 `proxytun.toml`。给了 `--proxy` 时可以不存在 |
-| `--proxy <URL>` | 覆盖配置里的全部代理:`socks5://host:port` 或 `http://[user:pass@]host:port`。也可用环境变量 `PROXYTUN_PROXY`。带密码时请用环境变量或配置文件(命令行参数任何本机用户都能用 `ps` 看到) |
+| `-c, --config <FILE>` | 配置文件,默认 `proxytun.toml`。给了 `--proxy` 时可以不存在,也可以只写规则不写代理 |
+| `--proxy <URL>` | 覆盖配置里的全部代理:`socks5://host:port` 或 `http://[user:pass@]host:port`。也可用环境变量 `PROXYTUN_PROXY`。指定了其他分组(`group = "hk"`)的规则也走它(启动时 warn 一次)。带密码时请用环境变量或配置文件(命令行参数任何本机用户都能用 `ps` 看到) |
 | `--no-sudo` | user namespace 不可用时直接报错,不调用 sudo |
 | `--no-host-ports` | 不把主机的回环监听端口转发进命名空间 |
 | `--doctor` | 自检后退出;有 FAIL 时退出码为 1 |
@@ -208,7 +208,7 @@ proxytun 和程序照常运行。要完整的日志请用 `--log-file`。
 | 慢 | `closed` 行:`dial_ms` 大是连代理慢;`dial_ms` 小而 `ms` 大、字节数不多,是代理或目标传得慢 |
 | 吞吐上不去 | SIGUSR1 的速率行;`top -H -p <pid>` 里名为 `tun` 的线程接近 100% 时,是到了 proxytun 本身的上限(本机约 1 GB/s),否则瓶颈在代理 |
 | 域名解析不了 / 很慢 | `-v` 的 `dns:` 行;统计里的 `dns_forward_failed`(上游第一次不应答时会 warn) |
-| 连接卡住 | 统计里的丢包计数:`dropped_no_flow`(找不到连接的 TCP 包)、`dropped_table_full`(地址改写表满,error 日志每 10 秒最多一条)、`relays_refused`(同时中继的连接已达 8192 条,新连接被立即重置)、`dropped_unparsed`(IPv6、分片)、`dropped_other_proto`(ICMP 等) |
+| 连接卡住 | 统计里的丢包计数:`dropped_no_flow`(找不到连接的 TCP 包)、`dropped_table_full`(地址改写表满,error 日志每 10 秒最多一条)、`relays_refused`(同时中继的连接已达上限,新连接被立即重置;上限 8192 条,打开文件数上限较低时更少,启动时 warn 写明,如 CentOS 7 默认的 4096 只够约 1800 条)、`dropped_dns_busy`(同时处理的 DNS 查询已达 1024 个,多出的丢弃,解析器会重试)、`dropped_unparsed`(IPv6、分片)、`dropped_other_proto`(ICMP 等) |
 
 ## 限制
 
@@ -223,7 +223,10 @@ proxytun 和程序照常运行。要完整的日志请用 `--log-file`。
   这个会话在助手退出时就结束了。程序会先离开它、在自己的会话里运行,没有控制终端:proxytun 把终端的 Ctrl+C、Ctrl+\ 转给它,
   但 Ctrl+Z 作业控制、窗口大小变化到不了它,要打开 `/dev/tty` 的程序(如密码提示)会失败。proxytun 会警告。
 - **地址改写表**:同时存在的 TCP 连接(含关闭后保留 75 秒的)最多约 100 万条,即持续每秒约 1.37 万条新连接;
-  表满时新连接立即收到 RST(程序得到"连接被拒绝"),不会卡住重试。
+  表满时新连接立即收到 RST(程序得到"连接被拒绝"),不会卡住重试。表满时约占 200–280 MB 内存;假 IP 映射最多 100 万条,约 280 MB
+  (超长、含转义字符的域名最坏约 2.3 GB)。
+- **`resolv.conf` 的 `ndots`**:程序看到的 `resolv.conf` 去掉了 `options ndots:N`(其余照留)。假 DNS 对任何名字都给地址,
+  ndots ≥ 2(如 Kubernetes 的 5)时解析器先试"名字 + 搜索域",就会锁定在错误的名字上。
 - **CentOS 7 真机**(3.10 内核、真实 sudo 1.8.23、SELinux)尚未验证,只在开发机上模拟过;验证步骤见 [docs/CENTOS7.md](docs/CENTOS7.md)。
 
 ## 开发

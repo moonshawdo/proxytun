@@ -42,7 +42,7 @@ pub const QUEUED: Duration = Duration::from_secs(30);
 /// Ports handed out on each NAT address.
 pub const PORTS: std::ops::RangeInclusive<u16> = 1024..=65535;
 /// NAT addresses, from `Addrs::nat` on: about a million entries in all (some
-/// 100 MB at most).
+/// 200-280 MB when full).
 pub const NAT_ADDRS: u8 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,20 +236,29 @@ impl Nat {
         }
     }
 
+    /// `sweep_some` with no limit.
+    #[cfg(test)]
+    pub fn sweep(&mut self, now: Instant) -> usize {
+        self.sweep_some(now, usize::MAX).0
+    }
+
     /// Drop entries past their time: unanswered ones after `EMBRYONIC`,
     /// closed ones after `LINGER`. Unaccepted ones are closed after `QUEUED`,
     /// owing the program a reset (see `take_resets`) if it still uses the
-    /// flow. Returns how many went.
-    pub fn sweep(&mut self, now: Instant) -> usize {
+    /// flow. Looks at `budget` due items at most: the TUN thread waits for
+    /// the table meanwhile, and a million expiring at once would stall it
+    /// for a quarter of a second. Returns how many entries went, and whether
+    /// everything due by `now` was looked at.
+    pub fn sweep_some(&mut self, now: Instant, budget: usize) -> (usize, bool) {
         let up = |since: Instant, limit: Duration| now.saturating_duration_since(since) >= limit;
-        let mut gone = 0;
-        for key in due(&mut self.embryonic, now) {
+        let (mut gone, mut left) = (0, budget);
+        for key in due(&mut self.embryonic, now, &mut left) {
             if matches!(self.state(key), Some(State::Embryonic(t)) if up(t, EMBRYONIC)) {
                 self.remove(key);
                 gone += 1;
             }
         }
-        for key in due(&mut self.queued, now) {
+        for key in due(&mut self.queued, now, &mut left) {
             if let Some(State::Queued { since, server_next }) = self.state(key) {
                 if up(since, QUEUED) {
                     let e = self.by_key.get_mut(&key).expect("state found it");
@@ -266,13 +275,14 @@ impl Nat {
             }
         }
         // Closed again later (a second close): its own, later item ends it.
-        for key in due(&mut self.closed, now) {
+        for key in due(&mut self.closed, now, &mut left) {
             if matches!(self.state(key), Some(State::Closed(t)) if up(t, LINGER)) {
                 self.remove(key);
                 gone += 1;
             }
         }
-        gone
+        let rest = [&self.embryonic, &self.queued, &self.closed];
+        (gone, rest.iter().all(|q| q.front().is_none_or(|&(t, _)| t > now)))
     }
 
     /// A key never used yet, else the one given back longest ago. Never-used
@@ -306,17 +316,18 @@ impl Nat {
     }
 }
 
-/// The keys of `queue` due by `now`, taken off it. An item only ends an entry
-/// still in the state it was queued for with its time up: one replaced or
-/// moved on since is left alone.
-fn due(queue: &mut VecDeque<(Instant, Key)>, now: Instant) -> Vec<Key> {
+/// The keys of `queue` due by `now`, `left` at most (counted down), taken
+/// off it. An item only ends an entry still in the state it was queued for
+/// with its time up: one replaced or moved on since is left alone.
+fn due(queue: &mut VecDeque<(Instant, Key)>, now: Instant, left: &mut usize) -> Vec<Key> {
     let mut keys = Vec::new();
     while let Some(&(t, key)) = queue.front() {
-        if t > now {
+        if t > now || *left == 0 {
             break;
         }
         queue.pop_front();
         keys.push(key);
+        *left -= 1;
     }
     keys
 }
@@ -620,6 +631,22 @@ mod tests {
             "took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn a_sweep_takes_what_is_due_a_batch_at_a_time() {
+        let mut n = one();
+        let t = Instant::now();
+        let dst = sa("1.1.1.1:80");
+        for i in 0..10 {
+            n.outbound(program(i), dst, Some(1), t).unwrap();
+        }
+        // Ten unanswered SYNs expire together: four at a time.
+        assert_eq!(n.sweep_some(t + EMBRYONIC, 4), (4, false));
+        assert_eq!(n.sweep_some(t + EMBRYONIC, 4), (4, false));
+        assert_eq!(n.sweep_some(t + EMBRYONIC, 4), (2, true));
+        assert_eq!(n.len(), 0);
+        assert_eq!(n.sweep_some(t + EMBRYONIC, 4), (0, true), "nothing left");
     }
 
     #[test]

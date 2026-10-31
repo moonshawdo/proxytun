@@ -312,19 +312,33 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
+        let cfg = Self::load_unchecked(path)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// `load` without `validate`: for a config about to get its proxies from
+    /// `override_proxy`, which validates.
+    pub fn load_unchecked(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading config {}", path.display()))?;
-        Self::parse(&text)
+        Self::parse_unchecked(&text)
     }
 
     /// Parse, normalise legacy forms and validate.
     pub fn parse(text: &str) -> Result<Self> {
+        let cfg = Self::parse_unchecked(text)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// `parse` without `validate` (see `load_unchecked`).
+    pub fn parse_unchecked(text: &str) -> Result<Self> {
         let mut ignored = Vec::new();
         let de = toml::Deserializer::new(text);
         let mut cfg: Config =
             serde_ignored::deserialize(de, |path| ignored.push(key_path(&path))).context("parsing config toml")?;
         cfg.ignored_keys = ignored;
         cfg.normalise();
-        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -481,6 +495,22 @@ impl Config {
             members: vec![DEFAULT_GROUP.into()],
         }];
         self.proxy = None;
+        // Every proxy is the given one now, the groups' included: so are
+        // the rules that named a group.
+        let mut renamed: Vec<String> = Vec::new();
+        for r in &mut self.rules {
+            if let Some(g) = r.group.take() {
+                if g != DEFAULT_GROUP && !renamed.contains(&g) {
+                    renamed.push(g);
+                }
+            }
+        }
+        if !renamed.is_empty() {
+            tracing::warn!(
+                "--proxy / $PROXYTUN_PROXY replaces every proxy: rules for group(s) {} use it too",
+                renamed.join(", ")
+            );
+        }
         self.validate()
     }
 }
@@ -956,6 +986,25 @@ mod tests {
         assert!(!url_has_credentials("socks5://127.0.0.1:1080"));
         assert!(!url_has_credentials("http://host:8080/"));
         assert!(!url_has_credentials(""));
+    }
+
+    #[test]
+    fn an_override_needs_no_proxy_in_the_file_and_serves_every_group() {
+        // Rules only, the proxy from --proxy: fine.
+        let rules = "[[rules]]\nmatch=\"domain-suffix\"\nvalue=\"corp.example\"\naction=\"direct\"\n";
+        assert!(Config::parse(rules).is_err(), "no proxy at all");
+        let mut c = Config::parse_unchecked(rules).unwrap();
+        c.override_proxy("socks5://127.0.0.1:1080").unwrap();
+        // Rules sending traffic to other groups: the override serves them.
+        let groups = format!(
+            "{MINIMAL}[[proxies]]\nname=\"hk1\"\ntype=\"socks5\"\naddr=\"10.0.0.9:1080\"\n\
+             [[groups]]\nname=\"hk\"\nmembers=[\"hk1\"]\n\
+             [[rules]]\nmatch=\"domain-suffix\"\nvalue=\"hk.example\"\naction=\"proxy\"\ngroup=\"hk\"\n"
+        );
+        let mut c = Config::parse_unchecked(&groups).unwrap();
+        c.override_proxy("http://10.1.1.1:3128").unwrap();
+        assert_eq!(c.rules[0].group, None, "the default group, the only one");
+        assert_eq!(c.proxies.len(), 1);
     }
 
     #[test]

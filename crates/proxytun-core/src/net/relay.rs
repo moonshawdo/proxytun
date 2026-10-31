@@ -562,13 +562,26 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_down_fails_closed() {
-        // Nothing listens on this proxy address.
+        // Nothing listens on this proxy address. The target is one a direct
+        // dial would reach, and say so: it must not be dialed.
         let dead = crate::testutil::refused();
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = origin.accept().await {
+                let _ = s.write_all(b"reached directly").await;
+            }
+        });
         let live = mk_live(dead.addr, "");
-        let pend = pending(Target::Domain("example.com".into(), 443));
+        let pend = pending(Target::Domain("localhost".into(), port));
         let mut c = relay_pending(&live, pend).await;
-        let mut b = [0u8; 1];
-        assert_eq!(c.read(&mut b).await.unwrap_or(0), 0, "closed, never silently direct");
+        let mut got = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut got)).await;
+        assert!(
+            got.is_empty(),
+            "never silently direct: {:?}",
+            String::from_utf8_lossy(&got)
+        );
     }
 
     #[tokio::test]

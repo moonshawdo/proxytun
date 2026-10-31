@@ -58,16 +58,27 @@ impl Addrs {
 }
 
 /// The resolv.conf the program sees: only our DNS server, keeping the host's
-/// search domains and options.
+/// search domains and options, but for `ndots`. Our DNS answers every name
+/// with an address, so the first name a resolver tries is the one it keeps:
+/// with ndots 2 or more (Kubernetes has 5) that is `github.com` with a
+/// search domain appended, never `github.com` itself. At the default of 1,
+/// only names without a dot get a search domain first.
 pub fn resolv_conf(host: &str, dns: Ipv4Addr) -> String {
     let mut out = format!("# proxytun: names resolve through its fake-ip DNS\nnameserver {dns}\n");
     for line in host.lines() {
-        if matches!(
-            line.split_whitespace().next(),
-            Some("search" | "domain" | "options" | "sortlist")
-        ) {
-            out.push_str(line);
-            out.push('\n');
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("search" | "domain" | "sortlist") => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            Some("options") => {
+                let kept: Vec<&str> = words.filter(|w| !w.starts_with("ndots:")).collect();
+                if !kept.is_empty() {
+                    out.push_str(&format!("options {}\n", kept.join(" ")));
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -516,7 +527,8 @@ fn raise_somaxconn() {
 /// Point /etc/resolv.conf at `dns` in our own mount namespace. The file is
 /// written here, by whoever sets up the namespace (root, for sudo), never
 /// taken from a path someone else chose. Mount events must not propagate
-/// back to the host, hence MS_PRIVATE first.
+/// back to the host, hence MS_SLAVE first: the host's still reach us (an
+/// automounted share, a USB disk), ours never reach the host.
 fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
     use nix::mount::{mount, MsFlags};
     use std::io::Write;
@@ -547,10 +559,10 @@ fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
         None::<&str>,
         "/",
         None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        MsFlags::MS_REC | MsFlags::MS_SLAVE,
         None::<&str>,
     )
-    .context("make mounts private")?;
+    .context("make mounts one-way (slave)")?;
     // The target may be a symlink (systemd-resolved, WSL): mount follows it.
     // The mount keeps the file alive after `dir` is removed.
     mount(
@@ -681,6 +693,21 @@ mod tests {
                 "search corp.example lan",
                 "options edns0 trust-ad",
                 "domain corp.example"
+            ]
+        );
+        // A Kubernetes pod's: with ndots 5, github.com would be tried as
+        // github.com.default.svc.cluster.local first, and our DNS answers
+        // that too. The other options stay.
+        let pod = "nameserver 10.96.0.10\nsearch default.svc.cluster.local svc.cluster.local cluster.local\n\
+                   options ndots:5 timeout:2\noptions ndots:3\n";
+        let ours = resolv_conf(pod, Ipv4Addr::new(198, 19, 255, 53));
+        let lines: Vec<&str> = ours.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            lines,
+            [
+                "nameserver 198.19.255.53",
+                "search default.svc.cluster.local svc.cluster.local cluster.local",
+                "options timeout:2"
             ]
         );
     }

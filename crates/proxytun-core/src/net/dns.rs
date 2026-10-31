@@ -74,16 +74,18 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
         return Some(Answer::Forward);
     }
     let name = q.name().clone();
-    // ASCII (punycode, "xn--...") form: that is what proxies, rules and the
-    // TLS SNI use. to_utf8() would decode IDNs and send UTF-8 bytes onward.
-    let domain = name.to_ascii();
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
 
     match q.query_type() {
         // The root has no address; a fake one would name nothing a proxy can
         // be asked for.
-        RecordType::A if domain.is_empty() => reply(base_response(&req, ResponseCode::NoError)),
+        RecordType::A if name.is_root() => reply(base_response(&req, ResponseCode::NoError)),
         RecordType::A => {
+            // ASCII (punycode, "xn--...") form: that is what proxies, rules and
+            // the TLS SNI use. to_utf8() would decode IDNs and send UTF-8 bytes
+            // onward. Built for A queries only: escaping a long binary name
+            // costs, and a flood of other queries needs none of it.
+            let domain = name.to_ascii();
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
             let ip = if domain == "localhost" || domain.ends_with(".localhost") {
                 Ipv4Addr::LOCALHOST
             } else {
@@ -117,11 +119,11 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
         // that would let a browser skip the fake IP, and forwarding them
         // upstream would leak the lookup outside the proxy.
         RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB => {
-            tracing::debug!(%domain, qtype = %q.query_type(), "dns: answered empty");
+            tracing::debug!(domain = %name, qtype = %q.query_type(), "dns: answered empty");
             reply(base_response(&req, ResponseCode::NoError))
         }
         _ => {
-            tracing::debug!(%domain, qtype = %q.query_type(), "dns: forwarding upstream");
+            tracing::debug!(domain = %name, qtype = %q.query_type(), "dns: forwarding upstream");
             Some(Answer::Forward)
         }
     }

@@ -67,14 +67,13 @@ pub fn take_proxy_override(cli: Option<&str>) -> Option<String> {
 }
 
 /// Load the config and apply the `--proxy` / `PROXYTUN_PROXY` override.
+/// With one, the file need not exist nor name any proxy, and is checked
+/// only once the override is in.
 pub fn load_config(path: &Path, proxy_override: Option<&str>) -> Result<Config> {
-    let mut cfg = match Config::load(path) {
-        Ok(c) => c,
-        // With an explicit proxy a config file is optional.
-        Err(_) if proxy_override.is_some() && !path.exists() => {
-            Config::parse("[proxy]\ntype = \"socks5\"\naddr = \"127.0.0.1:1\"\n")?
-        }
-        Err(e) => return Err(e),
+    let mut cfg = match proxy_override {
+        None => Config::load(path)?,
+        Some(_) if !path.exists() => Config::parse_unchecked("")?,
+        Some(_) => Config::load_unchecked(path)?,
     };
     if let Some(w) = cfg.permission_warning(path) {
         tracing::warn!("{w}");
@@ -168,7 +167,7 @@ pub fn run(args: Args) -> Result<Exit> {
         }
         r => r?,
     };
-    raise_fd_limit();
+    let relays = relay_capacity(raise_fd_limit());
     // A caller that ignores SIGCHLD (that survives exec) would have the kernel
     // reap our children unasked, the program's exit status with them. The
     // program, forked already and waiting for the go-ahead, keeps the
@@ -204,7 +203,7 @@ pub fn run(args: Args) -> Result<Exit> {
         last_stats: Mutex::new(Snapshot::zero()),
         last_id: AtomicU64::new(0),
         table_full_logged: Mutex::new(None),
-        relay_slots: Arc::new(tokio::sync::Semaphore::new(capture::MAX_RELAYS)),
+        relay_slots: Arc::new(tokio::sync::Semaphore::new(relays)),
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -374,7 +373,8 @@ fn exit_signal_fd(sigs: &[libc::c_int]) -> Option<OwnedFd> {
 /// Every relayed connection holds two fds, and the usual soft limit is 1024.
 /// Raised to the hard limit only now: the program already has the original
 /// (inherited, or in sudo mode read from us by the helper).
-fn raise_fd_limit() {
+/// Raise our open-file limit as far as it goes; returns the soft limit.
+fn raise_fd_limit() -> u64 {
     let mut l = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -385,7 +385,7 @@ fn raise_fd_limit() {
     // SAFETY: plain syscalls on a local struct.
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) != 0 {
-            return;
+            return 1024;
         }
         if let Some(to) = fd_target(l, nr_open) {
             if libc::setrlimit(libc::RLIMIT_NOFILE, &to) != 0 {
@@ -404,6 +404,27 @@ fn raise_fd_limit() {
         hard = l.rlim_max,
         "open-file limit: two per relayed connection"
     );
+    l.rlim_cur
+}
+
+/// How many connections may be relayed at once with `soft` open files: two
+/// fds each, once the rest is set aside (the TUN device and listeners, the
+/// runtime, health probes, up to 256 DNS forwards and 32 lookups, host-port
+/// listeners: 512, or a quarter of a small limit); `MAX_RELAYS` at most.
+/// Beyond it a connection is reset at once (`relays_refused`), instead of
+/// waiting in the accept queue for an fd, or failing its dial.
+fn relay_capacity(soft: u64) -> usize {
+    let reserve = (soft / 4).min(512);
+    let n = (soft.saturating_sub(reserve) / 2).clamp(1, capture::MAX_RELAYS as u64) as usize;
+    if n < capture::MAX_RELAYS {
+        tracing::warn!(
+            soft,
+            "the open-file limit allows {n} connections relayed at once, not {}: raise the hard limit \
+             (`ulimit -Hn`, limits.conf) for more",
+            capture::MAX_RELAYS
+        );
+    }
+    n
 }
 
 /// The limits to set, if any: the soft one up to the hard one, both no
@@ -603,6 +624,17 @@ mod tests {
         assert_eq!(forward_to(true, 50, None, 7), Some(50));
         // Sent to proxytun alone, the program leading its own group: only it.
         assert_eq!(forward_to(false, 50, Some(50), 7), Some(50));
+    }
+
+    #[test]
+    fn the_relay_cap_follows_the_open_file_limit() {
+        // CentOS 7's default hard limit: room for the rest, two per relay.
+        assert_eq!(relay_capacity(4096), (4096 - 512) / 2);
+        assert_eq!(relay_capacity(1024), (1024 - 256) / 2);
+        assert_eq!(relay_capacity(1 << 20), crate::capture::MAX_RELAYS);
+        assert_eq!(relay_capacity(16384 + 512), crate::capture::MAX_RELAYS);
+        assert_eq!(relay_capacity(64), 24);
+        assert_eq!(relay_capacity(0), 1);
     }
 
     #[test]

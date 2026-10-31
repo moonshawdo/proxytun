@@ -47,6 +47,26 @@ pub struct Stats {
     pub drop_table_full: AtomicU64,
     /// Connections reset because `MAX_RELAYS` were being relayed already.
     pub relays_refused: AtomicU64,
+    /// DNS queries being answered now, and those dropped because
+    /// `MAX_DNS_IN_FLIGHT` were.
+    pub dns_in_flight: AtomicU64,
+    pub drop_dns_busy: AtomicU64,
+}
+
+/// At most this many DNS queries are answered at once; more are dropped,
+/// and the resolver asks again. Each is a task holding a copy of the query:
+/// a flood faster than the runtime answers (a resolver retrying in a loop,
+/// a DNS tunnel) would otherwise pile them up without bound (on two cores,
+/// 500 MB within 15 s).
+pub const MAX_DNS_IN_FLIGHT: u64 = 1024;
+
+/// Counts one DNS query out of `Stats::dns_in_flight` when dropped.
+struct Answered<'a>(&'a AtomicU64);
+
+impl Drop for Answered<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// At most this many connections are relayed at once (captured and host-port
@@ -120,7 +140,8 @@ pub struct Shared {
     pub last_id: AtomicU64,
     /// When the full address-rewriting table was last reported.
     pub table_full_logged: Mutex<Option<Instant>>,
-    /// One per connection being relayed, `MAX_RELAYS` in all.
+    /// One per connection being relayed, `MAX_RELAYS` at most (fewer when the
+    /// open-file limit is low: `app::relay_capacity`).
     pub relay_slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -170,8 +191,8 @@ fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream, warned: &mut Option<I
     count(&sh.stats.relays_refused, 1);
     if throttle::due(warned, Instant::now(), throttle::EVERY) {
         tracing::warn!(
-            "{MAX_RELAYS} connections are being relayed: refusing new ones (relays_refused; repeats \
-             within {}s not logged)",
+            "as many connections as may be relayed at once are being relayed (see the open-file limit \
+             at startup): refusing new ones (relays_refused; repeats within {}s not logged)",
             throttle::EVERY.as_secs()
         );
     }
@@ -308,11 +329,17 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
 }
 
 fn on_dns(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &[u8], p: &Packet) {
+    if sh.stats.dns_in_flight.fetch_add(1, Ordering::Relaxed) >= MAX_DNS_IN_FLIGHT {
+        sh.stats.dns_in_flight.fetch_sub(1, Ordering::Relaxed);
+        count(&sh.stats.drop_dns_busy, 1);
+        return;
+    }
     let query = packet::udp_payload(pkt, p).to_vec();
     let (client, server) = (p.src, p.dst);
     let (tun, sh) = (tun.clone(), sh.clone());
     // Forwarded queries can take seconds; never hold up the packet loop.
     rt.spawn(async move {
+        let _answered = Answered(&sh.stats.dns_in_flight);
         let Some(resp) = dns::respond(&query, &sh.pool, sh.upstream_dns, Transport::Udp, &sh.dns).await else {
             return;
         };
@@ -418,28 +445,41 @@ fn to_target(dst: SocketAddrV4, pool: &FakePool) -> (Target, Option<FakeGuard>) 
     }
 }
 
-/// Drop table entries whose connection is long gone.
+/// Drop table entries whose connection is long gone. Every second: what
+/// expires comes in small bites (see `sweep`).
 pub async fn run_sweeper(tun: Arc<OwnedFd>, sh: Arc<Shared>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
-        sweep(&tun, &sh, Instant::now());
+        sweep(&tun, &sh, Instant::now()).await;
     }
 }
 
+/// Due address-rewriting entries looked at per hold of the table, which the
+/// TUN thread needs for every TCP packet: about a millisecond's work.
+const SWEEP_BATCH: usize = 4096;
+
 /// Expire address-rewriting entries, and reset the programs left holding a
-/// connection that was never accepted.
-fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
-    let (n, resets) = {
-        let mut nat = sh.nat();
-        (nat.sweep(now), nat.take_resets())
-    };
-    if n > 0 {
-        tracing::debug!(expired = n, reset = resets.len(), "swept address-rewriting entries");
-    }
-    for r in resets {
-        tracing::debug!(program = %r.to, dst = %r.from, "never accepted: resetting the program's connection");
-        write_packet(tun, sh, &packet::build_tcp_reset(r.from, r.to, r.seq, None));
+/// connection that was never accepted: `SWEEP_BATCH` at a time, letting the
+/// TUN thread have the table in between.
+async fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
+    loop {
+        let (n, done, resets) = {
+            let mut nat = sh.nat();
+            let (n, done) = nat.sweep_some(now, SWEEP_BATCH);
+            (n, done, nat.take_resets())
+        };
+        if n > 0 {
+            tracing::debug!(expired = n, reset = resets.len(), "swept address-rewriting entries");
+        }
+        for r in resets {
+            tracing::debug!(program = %r.to, dst = %r.from, "never accepted: resetting the program's connection");
+            write_packet(tun, sh, &packet::build_tcp_reset(r.from, r.to, r.seq, None));
+        }
+        if done {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -480,6 +520,7 @@ pub fn log_stats(sh: &Shared) {
         dropped_no_flow = n(&s.drop_no_flow),
         dropped_table_full = n(&s.drop_table_full),
         relays_refused = n(&s.relays_refused),
+        dropped_dns_busy = n(&s.drop_dns_busy),
         "stats"
     );
     let prev = std::mem::replace(&mut *sh.last_stats.lock().unwrap_or_else(|e| e.into_inner()), now);
@@ -532,8 +573,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn a_connection_the_listener_answered_outlives_a_stalled_accept() {
+    #[tokio::test]
+    async fn a_connection_the_listener_answered_outlives_a_stalled_accept() {
         let sh = shared("127.0.0.1:9".parse().unwrap());
         let (tun, _other) = std::os::unix::net::UnixDatagram::pair().unwrap();
         let tun = OwnedFd::from(tun);
@@ -569,7 +610,7 @@ pub(crate) mod tests {
         let mut written = vec![0u8; 4096];
         let got = out.read(&mut written).unwrap(); // the rewritten SYN and SYN-ACK
         assert_eq!(got, syn.len() + syn_ack.len());
-        sweep(&tun, &sh, Instant::now() + crate::nat::QUEUED);
+        sweep(&tun, &sh, Instant::now() + crate::nat::QUEUED).await;
         let got = out.read(&mut written).unwrap();
         let r = packet::parse(&written[..got]).unwrap();
         assert!(crate::packet::tests::checksums_ok(&written[..got]));
@@ -686,6 +727,43 @@ pub(crate) mod tests {
         // ended here, a lost reset would leave the program waiting forever
         // instead of reset after `nat::QUEUED`.
         assert_eq!(sh.nat().accept(second), Some(sa("9.9.9.9:53")));
+    }
+
+    #[tokio::test]
+    async fn a_dns_flood_is_dropped_beyond_what_is_being_answered() {
+        use std::io::Read;
+        let sh = Arc::new(shared(sa("127.0.0.1:4000")));
+        let (tun, mut out) = fake_tun();
+        let rt = Handle::current();
+        // An A query for example.com, from the program to our DNS address.
+        let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        let mut pkt = packet::build_udp(sa("198.19.255.1:5353"), sa("198.19.255.53:53"), &q).unwrap();
+        // As many being answered as may be: the next is dropped at once,
+        // no task, no copy of it kept.
+        sh.stats.dns_in_flight.store(MAX_DNS_IN_FLIGHT, Ordering::Relaxed);
+        on_packet(&tun, &sh, &rt, &mut pkt);
+        assert_eq!(sh.stats.drop_dns_busy.load(Ordering::Relaxed), 1);
+        assert_eq!(sh.stats.dns_in_flight.load(Ordering::Relaxed), MAX_DNS_IN_FLIGHT);
+        // With room again, it is answered, and leaves the count when done.
+        sh.stats.dns_in_flight.store(0, Ordering::Relaxed);
+        on_packet(&tun, &sh, &rt, &mut pkt);
+        let mut buf = [0u8; 512];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let n = loop {
+            match out.read(&mut buf) {
+                Ok(n) if n > 0 => break n,
+                _ => {
+                    assert!(Instant::now() < deadline, "no answer");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        assert_eq!(packet::parse(&buf[..n]).unwrap().dst, sa("198.19.255.1:5353"));
+        while sh.stats.dns_in_flight.load(Ordering::Relaxed) != 0 {
+            assert!(Instant::now() < deadline, "still counted as in flight");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A pipe stands in for the TUN device: what we write comes out of the

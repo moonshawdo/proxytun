@@ -275,10 +275,59 @@ struct Out {
     stderr: String,
 }
 
+/// Prefix of the directories the tests make in $TMPDIR, followed by our pid.
+const TMP_PREFIX: &str = "proxytun-test-";
+
+/// A directory of our own for one test, created by us (0700), never one
+/// someone else made first under the name: we write scripts there and run
+/// them. Leftovers of earlier runs are removed first, as far as we may.
 fn tmp_dir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("proxytun-e2e-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SWEPT.get_or_init(sweep_old_tmp_dirs);
+    let d = std::env::temp_dir().join(format!("{TMP_PREFIX}{}-{name}", std::process::id()));
+    match std::fs::DirBuilder::new().mode(0o700).create(&d) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Asked for again this run (a helper's own directory).
+            let m = std::fs::symlink_metadata(&d).unwrap();
+            assert!(
+                m.is_dir() && m.uid() == unsafe { libc::geteuid() },
+                "{} was not made by us",
+                d.display()
+            );
+        }
+        Err(e) => panic!("create {}: {e}", d.display()),
+    }
     d
+}
+
+/// Remove what earlier test runs (ours, their process gone) left in
+/// $TMPDIR. Best effort: the CentOS 7 simulation leaves files of other uids
+/// in directories we cannot empty.
+fn sweep_old_tmp_dirs() {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(TMP_PREFIX))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let ours = e
+            .path()
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_dir() && m.uid() == unsafe { libc::geteuid() });
+        if ours && pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// Write a config pointing at `proxy`, with `top` (top-level keys) and `rules`.
@@ -326,19 +375,22 @@ fn run_cmd(mut cmd: Command, env: &[(&str, &str)]) -> Out {
     }
     cmd.env("PROXYTUN_LOG", "debug");
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // A process group of its own: on a timeout, all it started goes with it.
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().expect("spawn proxytun");
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
-    let t_out = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = so.read_to_string(&mut s);
-        s
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = se.read_to_string(&mut s);
-        s
-    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pipes: [(usize, Box<dyn Read + Send>); 2] = [
+        (0, Box::new(child.stdout.take().unwrap())),
+        (1, Box::new(child.stderr.take().unwrap())),
+    ];
+    for (i, mut pipe) in pipes {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = pipe.read_to_string(&mut s);
+            let _ = tx.send((i, s));
+        });
+    }
     let deadline = Instant::now() + Duration::from_secs(60);
     let code = loop {
         if let Some(st) = child.try_wait().unwrap() {
@@ -348,17 +400,24 @@ fn run_cmd(mut cmd: Command, env: &[(&str, &str)]) -> Out {
                 .unwrap_or_else(|| -std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(1));
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.wait();
             break -999;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    Out {
-        code,
-        stdout: t_out.join().unwrap(),
-        stderr: t_err.join().unwrap(),
+    // Until both pipes close. Something that left the group (a session of
+    // its own) may still hold them: not for ever.
+    let mut got = [String::new(), String::new()];
+    let until = Instant::now() + Duration::from_secs(if code == -999 { 2 } else { 60 });
+    for _ in 0..2 {
+        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok((i, s)) => got[i] = s,
+            Err(_) => break,
+        }
     }
+    let [stdout, stderr] = got;
+    Out { code, stdout, stderr }
 }
 
 impl Out {
@@ -525,6 +584,30 @@ fn the_exit_code_survives_a_caller_that_ignores_sigchld() {
     let out = run_cmd(cmd, &[]);
     assert_eq!(out.code, 7, "{}", out.dump());
     assert_eq!(out.stdout, "True\n", "{}", out.dump());
+}
+
+#[test]
+fn host_mounts_made_later_reach_the_program_and_ours_never_leave() {
+    require!("unshare", "mount");
+    let dir = tmp_dir("propagation");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    std::fs::create_dir_all(dir.join("m")).unwrap();
+    // A host (root, with shared mounts) where a share is mounted after
+    // proxytun started (autofs, a USB disk): the program must see it; and
+    // the resolv.conf proxytun mounts for the program must stay inside.
+    let script = r#"
+        mount -t tmpfs none "$D/m" && mount --make-shared "$D/m"
+        "$BIN" -c "$D/cfg.toml" -- sh -c '
+            touch "$D/ready"; while [ ! -e "$D/go" ]; do sleep 0.05; done; cat "$D/m/sub/file"' &
+        until [ -e "$D/ready" ]; do sleep 0.05; done
+        mkdir "$D/m/sub" && mount -t tmpfs none "$D/m/sub" && echo late-mount > "$D/m/sub/file"
+        touch "$D/go"; wait $!; echo "code $?"
+        grep -c 198.19.255.53 /etc/resolv.conf"#;
+    let mut cmd = Command::new("unshare");
+    cmd.args(["-Urm", "--propagation", "shared", "sh", "-c", script]);
+    let out = run_cmd(cmd, &[("BIN", BIN), ("D", dir.to_str().unwrap())]);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines, ["late-mount", "code 0", "0"], "{}", out.dump());
 }
 
 #[test]
@@ -850,15 +933,27 @@ fn block_rules_and_a_dead_proxy_fail_closed() {
     assert_ne!(out.code, 0, "{}", out.dump());
     assert!(mock.seen().is_empty());
 
+    // The proxy dead: the connection fails, and is not made directly
+    // instead. The target is one a direct dial would reach (an origin on the
+    // host's own address, which the namespace routes through us), so that
+    // it would show.
     let (_dead, dead_addr) = refused_addr();
     let cfg = write_cfg(&dir, dead_addr, "", "");
-    let out = run(
-        &cfg,
-        &[],
-        &["curl", "-sS", "--max-time", "10", "http://site.test/"],
-        &[],
-    );
+    let host = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|u| u.connect("192.0.2.1:9").and_then(|_| u.local_addr()))
+        .map(|a| a.ip())
+        .ok()
+        .filter(|ip| !ip.is_loopback() && ip.is_ipv4());
+    let url = match host {
+        Some(ip) => format!("http://{ip}:{}/", start_origin_on(&format!("{ip}:0"))),
+        None => {
+            eprintln!("note: no non-loopback IPv4 address here; a direct fallback could not show");
+            "http://site.test/".to_string()
+        }
+    };
+    let out = run(&cfg, &[], &["curl", "-sS", "--max-time", "10", &url], &[]);
     assert_ne!(out.code, 0, "never silently direct\n{}", out.dump());
+    assert!(!out.stdout.contains(BODY), "reached directly\n{}", out.dump());
 }
 
 #[test]
@@ -1082,6 +1177,47 @@ fn proxy_override_flag_replaces_the_config_proxy() {
     assert_eq!(out.code, 0, "{}", out.dump());
     assert_eq!(right.seen().len(), 2);
     assert!(out.stderr.contains("no config file"), "{}", out.dump());
+
+    // A file with rules only, the proxy coming from the environment; one
+    // whose rules send traffic to a group of its own: all through the
+    // override (the file alone would be refused, or name proxies we skip).
+    let rules = dir.join("rules-only.toml");
+    std::fs::write(
+        &rules,
+        "[[rules]]\nmatch=\"domain\"\nvalue=\"skip.test\"\naction=\"block\"\n",
+    )
+    .unwrap();
+    let out = run(
+        &rules,
+        &[],
+        &["curl", "-sS", "-m", "20", "http://ov3.test/"],
+        &[("PROXYTUN_PROXY", flag.as_str())],
+    );
+    assert_eq!(out.code, 0, "{}", out.dump());
+    let grouped = dir.join("grouped.toml");
+    std::fs::write(
+        &grouped,
+        format!(
+            "[[proxies]]\nname=\"hk1\"\ntype=\"socks5\"\naddr=\"{}\"\n[[groups]]\nname=\"default\"\nmembers=[\"hk1\"]\n\
+             [[groups]]\nname=\"hk\"\nmembers=[\"hk1\"]\n\
+             [[rules]]\nmatch=\"domain-suffix\"\nvalue=\"test\"\naction=\"proxy\"\ngroup=\"hk\"\n",
+            wrong.addr
+        ),
+    )
+    .unwrap();
+    let out = run(
+        &grouped,
+        &["--proxy", &flag],
+        &["curl", "-sS", "-m", "20", "http://ov4.test/"],
+        &[],
+    );
+    assert_eq!(out.code, 0, "{}", out.dump());
+    assert!(
+        out.stderr.contains("rules for group(s) hk use it too"),
+        "{}",
+        out.dump()
+    );
+    assert_eq!((wrong.seen().len(), right.seen().len()), (0, 4));
 }
 
 #[test]
@@ -1818,17 +1954,14 @@ held = []
 for i in range(int(sys.argv[1])):
     s = socket.create_connection(("203.0.113.1", 80), timeout=10)
     held.append(s)
-time.sleep(1)
-# A TXT lookup (forwarded upstream) while proxytun has no fd to spare.
-q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 16, 1)
+# Just before they dial out (5 s of sniffing): TXT lookups, forwarded
+# upstream, which answers each after a second. Each forward holds an fd.
+time.sleep(4.6)
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-u.settimeout(1)
-u.sendto(q, ("8.8.8.8", 53))
-try:
-    u.recv(512)
-except OSError:
-    pass
-time.sleep(4)
+for i in range(int(sys.argv[2])):
+    q = struct.pack(">HHHHHH", i, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 16, 1)
+    u.sendto(q, ("8.8.8.8", 53))
+time.sleep(3)
 for s in held:
     s.close()
 # Once the leftovers (connections still in the accept queue) are through,
@@ -1877,27 +2010,62 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
     );
     assert!(out.stderr.contains("open-file limit"), "and says so\n{}", out.dump());
 
-    // With no room to raise it, proxytun runs out of fds while the program
-    // holds 50 connections (within its own limit). No host ports: each would
-    // hold an fd, and how many listeners the host has varies. The proxy is fine, though: it must
-    // not be marked down, and once they are gone the next request must go
-    // through it.
+    // With no room to raise it, the relay cap follows the limit: 24 at once
+    // for 64 fds; more are reset at once, not left to run proxytun out of
+    // fds. No host ports: each would hold an fd, and how many listeners the
+    // host has varies.
     let prog = dir.join("pressure.py");
     std::fs::write(&prog, PY_FD_PRESSURE).unwrap();
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg("ulimit -n 64; exec \"$BIN\" --no-host-ports -c \"$CFG\" -- python3 \"$PROG\" 50");
-    let out = run_cmd(
-        cmd,
-        &[
-            ("BIN", BIN),
-            ("CFG", cfg.to_str().unwrap()),
-            ("PROG", prog.to_str().unwrap()),
-        ],
+    let pressure = |cfg: &Path, held: &str, lookups: &str| {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("ulimit -n 64; exec \"$BIN\" --no-host-ports -c \"$CFG\" -- python3 \"$PROG\" \"$HELD\" \"$LOOKUPS\"");
+        run_cmd(
+            cmd,
+            &[
+                ("BIN", BIN),
+                ("CFG", cfg.to_str().unwrap()),
+                ("PROG", prog.to_str().unwrap()),
+                ("HELD", held),
+                ("LOOKUPS", lookups),
+            ],
+        )
+    };
+    let out = pressure(&cfg, "50", "0");
+    assert!(
+        out.stderr.contains("allows 24 connections relayed at once"),
+        "{}",
+        out.dump()
     );
+    assert!(out.stderr.contains("refusing new ones"), "{}", out.dump());
+    assert!(
+        !out.stderr.contains("lack of local resources"),
+        "never out of fds\n{}",
+        out.dump()
+    );
+    assert!(out.stdout.contains(&format!("final: {BODY}")), "{}", out.dump());
+
+    // Fds run out anyway, here to a burst of lookups forwarded upstream
+    // while the held connections dial out. Neither the proxy nor the
+    // upstream resolver (which answers, a second late) is to blame: it must
+    // not be marked down, and once it is over the next request must go
+    // through it.
+    let dns = start_slow_dns(Duration::from_secs(1));
+    let cfg = write_cfg(
+        &dir,
+        mock.addr,
+        &format!("sniff_timeout_ms = 5000\nupstream_dns = \"{dns}\""),
+        "[health]\ninterval_secs = 1",
+    );
+    let out = pressure(&cfg, "20", "150");
     assert!(
         out.stderr.contains("dial failed for lack of local resources"),
         "fds did run out\n{}",
+        out.dump()
+    );
+    assert!(
+        out.stderr.matches("dial failed for lack of local resources").count() <= 2,
+        "said now and then, not for every connection\n{}",
         out.dump()
     );
     assert!(!out.stderr.contains("marked DOWN"), "{}", out.dump());
@@ -1919,6 +2087,30 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
 }
 
 // ------------------------------------------------ sudo mode (CentOS 7) --
+
+/// A resolver on the host that answers every query (as NXDOMAIN) after
+/// `delay`.
+fn start_slow_dns(delay: Duration) -> SocketAddr {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = sock.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let mut reply = buf[..n].to_vec();
+            if reply.len() < 12 {
+                continue;
+            }
+            reply[2] |= 0x80; // a response
+            reply[3] = (reply[3] & 0xf0) | 3; // NXDOMAIN
+            let sock = sock.try_clone().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let _ = sock.send_to(&reply, from);
+            });
+        }
+    });
+    addr
+}
 
 /// A stand-in for sudo. Installed setuid in a user namespace where we are
 /// root, it really makes its caller root there. Like sudo it resets the
@@ -2121,7 +2313,9 @@ fn run_like_centos7(cfg: &Path, extra: &[&str], argv: &[&str], as_user: bool, en
 fn shared_dir(name: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let d = tmp_dir(name);
-    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+    // Sticky, as /tmp is: the other uids may add files, but not replace or
+    // remove ours (scripts we run among them).
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o1777)).unwrap();
     d
 }
 
@@ -2614,7 +2808,7 @@ fn a_tmpdir_too_long_for_the_helper_socket_says_so() {
     let long = dir.join("t".repeat(100));
     std::fs::create_dir(&long).unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o1777)).unwrap();
     let out = run_like_centos7(&cfg, &[], &["true"], true, &[("TMPDIR", long.to_str().unwrap())]);
     assert_ne!(out.code, 0, "{}", out.dump());
     assert!(
