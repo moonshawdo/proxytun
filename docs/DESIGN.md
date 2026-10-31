@@ -127,8 +127,15 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 - 沿用 proxyhook:级别 off/error/warn/info/debug/trace,`-q`、`-v`/`-vv`、`--log-level`、`--log-file`(追加、600、无颜色),环境变量 `PROXYTUN_LOG`。
 - 每条连接一个递增编号,span 为 `conn{id=… target=…}`;info 级别一行选路结果;trace 级别可从 TUN 收到 SYN 一直跟到代理握手。
   **不查发起连接的进程 pid**(TUN 上看不到,查 `/proc` 代价高)。
+- **连接结束汇总**(2026-10-31 加,info 级别):`closed ms dial_ms via up down`,失败写原因,被拦下写 `blocked by a rule`。
+  字节数由包在两个 socket 外的计数器边转发边累加,中途出错也有;同时累加进全局的 `relayed_up/down`,长连接在结束前就能在统计里看到。
+- **DNS**:`-v` 每条查询一行(fake IP / 本地空应答 / 转发及上游耗时);计数 `dns_queries`、`dns_forwarded`、`dns_forward_failed`,
+  上游第一次不应答时 warn 一次,之后记 debug。
 - 代理健康检查、故障转移同 proxyhook。
-- SIGUSR1 统计:proxyhook 已有内容 + 地址改写表大小、活跃连接、被拒 UDP 数、DNS 查询数、已转发的主机端口。
+- **SIGUSR1**:累计计数(改写表、连接、中继字节、DNS、TUN 收发的包数与字节数、按原因分开的丢包)、距上次打印的速率、每个代理的状态。
+- **TUN 循环跑在名为 `tun` 的专用线程上**(阻塞读),`top -H` 里一眼能看到瓶颈线程。改动前后本机基准(交替各 5 次):
+  经 TUN 约 1060 → 1030 MB/s,主机端口约 1220 → 1280 MB/s,2000 条短连接 1.64–1.78 → 1.75–1.82 s,都在 ±5% 的波动内,没有性能收益也没有损失,
+  保留它是为了可观测性。
 
 ## 7. 命令行与配置
 

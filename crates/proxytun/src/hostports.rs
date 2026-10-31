@@ -12,11 +12,12 @@
 //! the user excluded, nor listeners opened after start-up.
 
 use crate::capture::Shared;
-use proxytun_core::net::relay;
+use proxytun_core::net::relay::{self, Transfer};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
 
@@ -126,14 +127,15 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 sh.stats.connections.fetch_add(1, Ordering::Relaxed);
                 sh.stats.active.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("routing to the host's own port");
-                let r = match TcpStream::connect(addr).await {
-                    Ok(mut out) => relay::pump(&mut inbound, &mut out).await,
-                    Err(e) => Err(e.into()),
+                let start = Instant::now();
+                let dialed = TcpStream::connect(addr).await;
+                let dial = start.elapsed();
+                let (moved, r) = match dialed {
+                    Ok(mut out) => relay::pump(&mut inbound, &mut out, &sh.traffic).await,
+                    Err(e) => (Transfer::default(), Err(e.into())),
                 };
                 sh.stats.active.fetch_sub(1, Ordering::Relaxed);
-                if let Err(e) = r {
-                    tracing::debug!("host port relay error: {e:#}");
-                }
+                relay::log_closed(start, dial, "host", &moved, &r);
             }
             .instrument(span),
         );

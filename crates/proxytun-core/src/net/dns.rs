@@ -16,9 +16,20 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{rdata, DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
+
+/// What the DNS side has done, for the stats.
+#[derive(Default)]
+pub struct DnsStats {
+    pub queries: AtomicU64,
+    /// Queries sent to the upstream resolver and answered by it.
+    pub forwarded: AtomicU64,
+    /// Queries the upstream resolver did not answer (in time).
+    pub forward_failed: AtomicU64,
+}
 
 /// Fake answers live this long in the program's resolver cache.
 pub const FAKE_TTL: u32 = 60;
@@ -55,7 +66,10 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
                 Ipv4Addr::LOCALHOST
             } else {
                 match pool.alloc(&domain) {
-                    Ok(ip) => ip,
+                    Ok(ip) => {
+                        tracing::debug!(%domain, %ip, "dns: A -> fake ip");
+                        ip
+                    }
                     Err(_) => {
                         tracing::error!(%domain, "fake-ip pool exhausted, answering SERVFAIL");
                         return reply(base_response(&req, ResponseCode::ServFail));
@@ -71,8 +85,14 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
         // `disable-qtype-65`): their answers carry real IP hints and ECH keys
         // that would let a browser skip the fake IP, and forwarding them
         // upstream would leak the lookup outside the proxy.
-        RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB => reply(base_response(&req, ResponseCode::NoError)),
-        _ => Some(Answer::Forward),
+        RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB => {
+            tracing::debug!(%domain, qtype = %q.query_type(), "dns: answered empty");
+            reply(base_response(&req, ResponseCode::NoError))
+        }
+        _ => {
+            tracing::debug!(%domain, qtype = %q.query_type(), "dns: forwarding upstream");
+            Some(Answer::Forward)
+        }
     }
 }
 
@@ -100,7 +120,7 @@ pub const TCP_IDLE: Duration = Duration::from_secs(5);
 /// Serve DNS over one TCP connection: 2-byte length prefix, possibly several
 /// queries. Returns when the client closes, misbehaves, or stays silent for
 /// `TCP_IDLE`.
-pub async fn serve_tcp<S>(mut stream: S, pool: &FakePool, upstream: SocketAddr)
+pub async fn serve_tcp<S>(mut stream: S, pool: &FakePool, upstream: SocketAddr, stats: &DnsStats)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -119,7 +139,7 @@ where
         ) {
             return;
         }
-        let Some(resp) = respond(&q, pool, upstream, Transport::Tcp).await else {
+        let Some(resp) = respond(&q, pool, upstream, Transport::Tcp, stats).await else {
             return;
         };
         let mut out = (resp.len() as u16).to_be_bytes().to_vec();
@@ -140,13 +160,37 @@ pub enum Transport {
 
 /// Answer one query: locally when we can, else by forwarding it upstream over
 /// the same transport. `None` = drop it (unparseable, or no upstream answer).
-pub async fn respond(raw: &[u8], pool: &FakePool, upstream: SocketAddr, via: Transport) -> Option<Vec<u8>> {
+pub async fn respond(
+    raw: &[u8],
+    pool: &FakePool,
+    upstream: SocketAddr,
+    via: Transport,
+    stats: &DnsStats,
+) -> Option<Vec<u8>> {
+    stats.queries.fetch_add(1, Ordering::Relaxed);
     match answer(raw, pool)? {
         Answer::Reply(r) => Some(r),
-        Answer::Forward => match via {
-            Transport::Udp => forward_udp(raw, upstream).await,
-            Transport::Tcp => forward_tcp(raw, upstream).await,
-        },
+        Answer::Forward => {
+            let t0 = Instant::now();
+            let r = match via {
+                Transport::Udp => forward_udp(raw, upstream).await,
+                Transport::Tcp => forward_tcp(raw, upstream).await,
+            };
+            let ms = t0.elapsed().as_millis() as u64;
+            if r.is_some() {
+                stats.forwarded.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(%upstream, ?via, ms, "dns: upstream answered");
+            } else if stats.forward_failed.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::warn!(
+                    %upstream, ?via, ms,
+                    "dns: the upstream resolver did not answer; MX/TXT/PTR and other non-A lookups fail \
+                     (check upstream_dns). Later failures are logged at debug"
+                );
+            } else {
+                tracing::debug!(%upstream, ?via, ms, "dns: upstream did not answer");
+            }
+            r
+        }
     }
 }
 
@@ -396,7 +440,9 @@ mod tests {
             loop {
                 let (s, _) = l.accept().await.unwrap();
                 let p = p.clone();
-                tokio::spawn(async move { serve_tcp(s, &p, "127.0.0.1:9".parse().unwrap()).await });
+                tokio::spawn(
+                    async move { serve_tcp(s, &p, "127.0.0.1:9".parse().unwrap(), &DnsStats::default()).await },
+                );
             }
         });
         addr
@@ -408,9 +454,15 @@ mod tests {
         let addr = tcp_dns(p.clone()).await;
         let q = query("served.example.", RecordType::A, DNSClass::IN);
 
-        let udp = respond(&q, &p, "127.0.0.1:9".parse().unwrap(), Transport::Udp)
-            .await
-            .unwrap();
+        let udp = respond(
+            &q,
+            &p,
+            "127.0.0.1:9".parse().unwrap(),
+            Transport::Udp,
+            &DnsStats::default(),
+        )
+        .await
+        .unwrap();
         let udp_ip = a_ips(&Message::from_bytes(&udp).unwrap())[0];
 
         let mut t = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -450,15 +502,32 @@ mod tests {
             up.send_to(&as_response(&buf[..n]), from).await.unwrap();
         });
         let q = query("example.com.", RecordType::TXT, DNSClass::IN);
-        let got = respond(&q, &pool(), up_addr, Transport::Udp).await.unwrap();
+        let stats = DnsStats::default();
+        let got = respond(&q, &pool(), up_addr, Transport::Udp, &stats).await.unwrap();
         assert_eq!(got, as_response(&q));
 
         // Nothing listening: the answer is None, not a hang or a panic.
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
         let t0 = std::time::Instant::now();
-        assert!(respond(&q, &pool(), dead_addr, Transport::Udp).await.is_none());
+        assert!(respond(&q, &pool(), dead_addr, Transport::Udp, &stats).await.is_none());
         assert!(t0.elapsed() < Duration::from_secs(5));
+
+        // A local answer is a query too, but not a forward.
+        respond(
+            &query("a.example.", RecordType::A, DNSClass::IN),
+            &pool(),
+            dead_addr,
+            Transport::Udp,
+            &stats,
+        )
+        .await
+        .unwrap();
+        let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        assert_eq!(
+            (n(&stats.queries), n(&stats.forwarded), n(&stats.forward_failed)),
+            (3, 1, 1)
+        );
     }
 
     #[test]
@@ -569,7 +638,9 @@ mod tests {
         });
         let q = query("big.example.", RecordType::TXT, DNSClass::IN);
         assert_eq!(
-            respond(&q, &pool(), up_addr, Transport::Tcp).await.unwrap(),
+            respond(&q, &pool(), up_addr, Transport::Tcp, &DnsStats::default())
+                .await
+                .unwrap(),
             as_response(&q)
         );
     }

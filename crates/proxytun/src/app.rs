@@ -4,7 +4,7 @@
 //! The namespace is set up by a fresh proxytun process (see netns.rs) before
 //! the tokio runtime starts.
 
-use crate::capture::{self, Shared, Stats};
+use crate::capture::{self, Shared, Snapshot, Stats};
 use crate::nat::Nat;
 use crate::netns::{self, Addrs, Setup, UsernsUnusable};
 use crate::witness::{self, Witness};
@@ -13,8 +13,9 @@ use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use proxytun_core::config::{url_has_credentials, Config};
 use proxytun_core::health;
+use proxytun_core::net::dns::DnsStats;
 use proxytun_core::net::fakeip::FakePool;
-use proxytun_core::net::relay::build_live;
+use proxytun_core::net::relay::{build_live, Traffic};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -180,6 +181,9 @@ pub fn run(args: Args) -> Result<i32> {
         upstream_dns,
         live: RwLock::new(live.clone()),
         stats: Stats::default(),
+        dns: DnsStats::default(),
+        traffic: Traffic::default(),
+        last_stats: Mutex::new(Snapshot::zero()),
         last_id: AtomicU64::new(0),
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -199,12 +203,6 @@ pub fn run(args: Args) -> Result<i32> {
         rt.block_on(async move {
             listener.set_nonblocking(true)?;
             let listener = tokio::net::TcpListener::from_std(listener)?;
-            let tun_sh = sh.clone();
-            tokio::spawn(async move {
-                if let Err(e) = capture::run_tun(tun, tun_sh).await {
-                    tracing::error!("{e:#}; the program has no network from now on");
-                }
-            });
             tokio::spawn(capture::run_relay(listener, sh.clone()));
             for (addr, l) in forwards {
                 l.set_nonblocking(true)?;
@@ -223,6 +221,15 @@ pub fn run(args: Args) -> Result<i32> {
             Ok::<_, anyhow::Error>(())
         })?;
     }
+    let (tun_sh, handle) = (sh.clone(), rt.handle().clone());
+    std::thread::Builder::new()
+        .name("tun".into())
+        .spawn(move || {
+            if let Err(e) = capture::run_tun(tun, tun_sh, handle) {
+                tracing::error!("{e:#}; the program has no network from now on");
+            }
+        })
+        .context("start the TUN thread")?;
     tracing::info!(tun = %addrs.tun, dns = %addrs.dns, "namespace up");
     child.go()?;
 

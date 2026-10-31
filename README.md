@@ -158,8 +158,29 @@ proxytun -c proxytun.toml ltrace -f ./prog
 级别与 proxyhook 相同:`off`、`error`(`-q`)、`warn`、`info`(默认)、`debug`(`-v`)、`trace`(`-vv`);
 没有级别选项时读 `PROXYTUN_LOG`(可以按模块写,如 `proxytun=info,proxytun::capture=trace`)。
 
-每条连接有一个递增编号,日志里写作 `conn{id=… target=…}`,info 级别一行选路结果。`-vv` 时 TUN 收到的每个 SYN 也会记下(带改写用的端口),
-可以从 SYN 一直跟到代理握手。日志不记录是哪个进程发起的连接。
+每条连接有一个递增编号,日志里写作 `conn{id=… target=…}`。默认的 info 级别下,每条连接两行:开始时的选路结果,结束时的汇总:
+
+```
+conn{id=1 target=Domain("example.com", 443)}: routing decision=Proxy { group: "default" }
+conn{id=1 target=Domain("example.com", 443)}: closed ms=812 dial_ms=35 via=clash up=812 down=153204
+```
+
+`ms` 是连接存活时长,`dial_ms` 是连上代理(或直连目标)用的时间,`via` 是用的代理节点(`direct` / `host` 表示直连 / 主机端口),
+`up`、`down` 是两个方向的字节数。失败时写成 `closed: <原因>`,被规则拦下写成 `closed: blocked by a rule`。
+`-v` 另外记下每条 DNS 查询(`dns: A -> fake ip`、`dns: forwarding upstream`、上游耗时)和代理重试的原因;
+`-vv` 记下 TUN 上的每个 SYN 和它改写用的端口,可以从 SYN 一直跟到连接结束。日志不记录是哪个进程发起的连接。
+
+`kill -USR1 <pid>` 打印三类信息:累计计数(`stats`)、距上次打印的速率(`rates since the previous stats`)、每个代理的健康状态与延迟。
+
+### 排查问题看什么
+
+| 现象 | 看哪里 |
+|---|---|
+| 某个连接失败 | info 级别的 `closed: <原因>`;`-v` 看代理重试经过 |
+| 慢 | `closed` 行:`dial_ms` 大是连代理慢;`dial_ms` 小而 `ms` 大、字节数不多,是代理或目标传得慢 |
+| 吞吐上不去 | SIGUSR1 的速率行;`top -H -p <pid>` 里名为 `tun` 的线程接近 100% 时,是到了 proxytun 本身的上限(本机约 1 GB/s),否则瓶颈在代理 |
+| 域名解析不了 / 很慢 | `-v` 的 `dns:` 行;统计里的 `dns_forward_failed`(上游第一次不应答时会 warn) |
+| 连接卡住 | 统计里的丢包计数:`dropped_no_flow`(找不到连接的 TCP 包)、`dropped_table_full`(地址改写表满)、`dropped_unparsed`(IPv6、分片)、`dropped_other_proto`(ICMP 等) |
 
 ## 限制
 

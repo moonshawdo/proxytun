@@ -900,8 +900,27 @@ fn sighup_reloads_the_proxy_and_sigusr1_prints_stats() {
             "connections=1",
             "dns_queries=",
             "udp_refused=",
+            "relayed_up=",
+            "relayed_down=",
+            "dns_forward_failed=",
+            "tun_packets_in=",
+            "tun_bytes_out=",
+            "dropped_no_flow=",
+            "dropped_table_full=",
         ] {
             assert!(stats.contains(field), "{field} missing from: {stats}");
+        }
+        let rates = l
+            .lines()
+            .find(|l| l.contains("rates since the previous stats"))
+            .unwrap_or_default();
+        for field in [
+            "seconds=",
+            "connections_per_s=",
+            "tun_packets_in_per_s=",
+            "down_mb_per_s=",
+        ] {
+            assert!(rates.contains(field), "{field} missing from: {rates}");
         }
     }
 
@@ -2100,12 +2119,7 @@ fn a_program_dialing_our_proxy_itself_does_not_go_through_it_twice() {
         host: "twice.test".into(),
         port: 80,
     };
-    assert_eq!(
-        mock.seen(),
-        [once],
-        "one trip through the proxy\n{}",
-        out.dump()
-    );
+    assert_eq!(mock.seen(), [once], "one trip through the proxy\n{}", out.dump());
 
     // Switched off: the connection to the proxy is itself sent to the proxy.
     let cfg = write_cfg(&dir, proxy, "sniff = false\ndirect_to_proxies = false", "");
@@ -2116,4 +2130,123 @@ fn a_program_dialing_our_proxy_itself_does_not_go_through_it_twice() {
         port: proxy.port(),
     };
     assert_eq!(mock.seen()[1..], [nested], "proxied to itself\n{}", out.dump());
+}
+
+// ------------------------------------------------------- observability --
+
+/// The `closed` lines of a log, as maps of their `key=value` fields.
+fn closed_lines(log: &str) -> Vec<std::collections::HashMap<String, String>> {
+    log.lines()
+        .filter(|l| l.contains(" closed"))
+        .map(|l| {
+            l.split_whitespace()
+                .filter_map(|w| w.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn every_connection_ends_with_a_summary_line_at_the_default_level() {
+    require!("curl");
+    let origin = start_origin();
+    let mock = start_mock_proxy(origin);
+    let dir = tmp_dir("closed");
+    let cfg = write_cfg(
+        &dir,
+        mock.addr,
+        "sniff = false",
+        "[[rules]]\nmatch=\"domain-suffix\"\nvalue=\"blocked.test\"\naction=\"block\"",
+    );
+    let script =
+        "curl -sS --max-time 10 -o /dev/null http://ok.test/; curl -s --max-time 10 http://x.blocked.test/; true";
+    let out = run(&cfg, &["--log-level", "info"], &["sh", "-c", script], &[]);
+    let closed = closed_lines(&out.stderr);
+    assert_eq!(closed.len(), 2, "one line per connection\n{}", out.dump());
+    let ok = &closed[0];
+    assert_eq!(ok.get("via").map(String::as_str), Some("mock"), "{}", out.dump());
+    let down: u64 = ok["down"].parse().unwrap();
+    assert!(down >= BODY.len() as u64, "bytes from the origin are counted: {down}");
+    assert!(ok["up"].parse::<u64>().unwrap() > 0, "the request bytes are counted");
+    for k in ["ms", "dial_ms"] {
+        assert!(ok[k].parse::<u64>().is_ok(), "{k}\n{}", out.dump());
+    }
+    assert!(out.stderr.contains("closed: blocked by a rule"), "{}", out.dump());
+
+    // A proxy that is down: the failure is visible without -v.
+    let (_dead, dead) = refused_addr();
+    let cfg = write_cfg(&dir, dead, "sniff = false", "");
+    let out = run(
+        &cfg,
+        &["--log-level", "info"],
+        &["curl", "-s", "--max-time", "10", "http://down.test/"],
+        &[],
+    );
+    let closed = closed_lines(&out.stderr);
+    assert_eq!(closed.len(), 1, "{}", out.dump());
+    assert!(
+        out.stderr
+            .lines()
+            .any(|l| l.contains("closed: ") && l.contains("down.test")),
+        "the closing line names the failure\n{}",
+        out.dump()
+    );
+}
+
+#[test]
+fn dns_queries_are_logged_and_a_dead_upstream_warns_once() {
+    require!("dig");
+    let dir = tmp_dir("dns-log");
+    let (_dead, dead) = refused_addr(); // nothing answers UDP there either
+    let cfg = write_cfg(
+        &dir,
+        "127.0.0.1:1".parse().unwrap(),
+        &format!("upstream_dns = \"{dead}\""),
+        "",
+    );
+    let script = "dig +short +tries=1 +time=5 A a.test; dig +short +tries=1 +time=5 MX b.test; \
+                  dig +short +tries=1 +time=5 MX c.test; true";
+    let out = run(&cfg, &[], &["sh", "-c", script], &[]);
+    assert!(
+        out.stderr
+            .lines()
+            .any(|l| l.contains("dns: A -> fake ip") && l.contains("a.test")),
+        "{}",
+        out.dump()
+    );
+    assert_eq!(
+        out.stderr
+            .lines()
+            .filter(|l| l.contains("dns: forwarding upstream"))
+            .count(),
+        2,
+        "{}",
+        out.dump()
+    );
+    let warns = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("WARN") && l.contains("did not answer"))
+        .count();
+    assert_eq!(warns, 1, "warned once, the rest at debug\n{}", out.dump());
+}
+
+#[test]
+fn the_tun_loop_runs_on_its_own_named_thread() {
+    require!("sh");
+    let dir = tmp_dir("tun-thread");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let (child, _log) = spawn_bg(&cfg, &["sleep", "5"]);
+    let pid = child.id();
+    let names = || -> Vec<String> {
+        std::fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|d| {
+                d.filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+                    .map(|c| c.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    wait_for("the tun thread", || names().iter().any(|n| n == "tun"));
 }

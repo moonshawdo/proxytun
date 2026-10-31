@@ -10,8 +10,12 @@ use crate::proxy;
 use crate::sniff::{self, Sniffed};
 use crate::types::{Decision, Dest, Pending, Target};
 use anyhow::{anyhow, Result};
-use std::time::Duration;
-use tokio::io::copy_bidirectional_with_sizes;
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{field, Span};
 
@@ -78,9 +82,39 @@ pub fn build_live(cfg: &Config) -> Result<Live> {
     })
 }
 
-/// Carry one accepted connection to its target. Records `target` on the
-/// caller's span, which names the connection in every log line.
-pub async fn route(live: &Live, mut inbound: TcpStream, pending: Pending) -> Result<()> {
+/// Bytes relayed so far, all connections together: `up` from the program
+/// towards its targets, `down` back.
+#[derive(Default)]
+pub struct Traffic {
+    pub up: AtomicU64,
+    pub down: AtomicU64,
+}
+
+/// Bytes one connection moved each way.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Transfer {
+    pub up: u64,
+    pub down: u64,
+}
+
+/// The line every relayed connection ends with: how long it lived, how long
+/// reaching its proxy (or the target itself) took, through what, the bytes
+/// each way, and how it ended. Enough to tell a slow proxy from a slow
+/// transfer, at the default log level.
+pub fn log_closed(start: Instant, dial: Duration, via: &str, moved: &Transfer, r: &Result<()>) {
+    let (ms, dial_ms) = (start.elapsed().as_millis() as u64, dial.as_millis() as u64);
+    let (up, down) = (moved.up, moved.down);
+    match r {
+        Ok(()) => tracing::info!(ms, dial_ms, via = %via, up, down, "closed"),
+        Err(e) => tracing::info!(ms, dial_ms, via = %via, up, down, "closed: {e:#}"),
+    }
+}
+
+/// Carry one accepted connection to its target and log how it ended.
+/// Records `target` on the caller's span, which names the connection in
+/// every log line.
+pub async fn route(live: &Live, traffic: &Traffic, mut inbound: TcpStream, pending: Pending) -> Result<()> {
+    let start = Instant::now();
     let Pending { target, guard } = pending;
     // localnet and the program's own proxies: straight out, untouched.
     let passthrough = match target {
@@ -111,23 +145,32 @@ pub async fn route(live: &Live, mut inbound: TcpStream, pending: Pending) -> Res
     // Pin the fake-ip mapping for as long as this connection lives.
     let _pin = guard;
 
-    match decision {
-        Decision::Block => Ok(()),
-        Decision::Direct => {
-            let mut out = dial_direct(&target).await?;
+    let dial_start = Instant::now();
+    let dialed = match decision {
+        Decision::Block => {
+            tracing::info!(ms = start.elapsed().as_millis() as u64, "closed: blocked by a rule");
+            return Ok(());
+        }
+        Decision::Direct => dial_direct(&target).await.map(|s| (s, None, "direct".to_string())),
+        Decision::Proxy { group } => match live.registry.group(&group) {
+            Some(g) => proxy::dial_group(g, &target, live.retries, live.fail_threshold)
+                .await
+                .map(|(s, conn, node)| (s, Some(conn), node)),
+            None => Err(anyhow!("rule names unknown group '{group}'")),
+        },
+    };
+    let dial = dial_start.elapsed();
+    let (via, moved, r) = match dialed {
+        // `_conn` counts the connection as active on its proxy while it lasts.
+        Ok((mut out, _conn, via)) => {
             out.set_nodelay(true).ok();
-            pump(&mut inbound, &mut out).await
+            let (moved, r) = pump(&mut inbound, &mut out, traffic).await;
+            (via, moved, r)
         }
-        Decision::Proxy { group } => {
-            let g = live
-                .registry
-                .group(&group)
-                .ok_or_else(|| anyhow!("rule names unknown group '{group}'"))?;
-            let (mut out, _conn, node) = proxy::dial_group(g, &target, live.retries, live.fail_threshold).await?;
-            tracing::debug!(%node, "proxied");
-            pump(&mut inbound, &mut out).await
-        }
-    }
+        Err(e) => ("-".to_string(), Transfer::default(), Err(e)),
+    };
+    log_closed(start, dial, &via, &moved, &r);
+    r
 }
 
 /// For a literal-IP target on a sniff port, peek (without consuming) the
@@ -184,15 +227,62 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Copy both ways until both sides are done. A plain copy, not splice(2):
-/// for connections that came in through the TUN device it measured 20-30%
-/// faster (the TUN thread is the bottleneck either way, and splice only adds
-/// to it). See docs/DESIGN.md.
-pub async fn pump(a: &mut TcpStream, b: &mut TcpStream) -> Result<()> {
+/// Copy both ways until both sides are done, and say how many bytes went
+/// each way (`up` = read from `a`), also when it ended in an error. A plain
+/// copy, not splice(2): for connections that came in through the TUN device
+/// it measured 20-30% faster (the TUN thread is the bottleneck either way, and
+/// splice only adds to it). See docs/DESIGN.md.
+pub async fn pump(a: &mut TcpStream, b: &mut TcpStream, traffic: &Traffic) -> (Transfer, Result<()>) {
     a.set_nodelay(true).ok();
+    let mut a = Counted {
+        s: a,
+        n: 0,
+        total: &traffic.up,
+    };
+    let mut b = Counted {
+        s: b,
+        n: 0,
+        total: &traffic.down,
+    };
     // 64 KiB buffers: the 8 KiB default costs throughput on fast links.
-    copy_bidirectional_with_sizes(a, b, 64 * 1024, 64 * 1024).await?;
-    Ok(())
+    let r = copy_bidirectional_with_sizes(&mut a, &mut b, 64 * 1024, 64 * 1024).await;
+    (Transfer { up: a.n, down: b.n }, r.map(|_| ()).map_err(Into::into))
+}
+
+/// One side of a relayed connection, counting the bytes read from it (in `n`,
+/// and in the shared `total` as they pass, so long transfers show up in the
+/// stats before they end).
+struct Counted<'a> {
+    s: &'a mut TcpStream,
+    n: u64,
+    total: &'a AtomicU64,
+}
+
+impl AsyncRead for Counted<'_> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let r = Pin::new(&mut *self.s).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = r {
+            let k = (buf.filled().len() - before) as u64;
+            self.n += k;
+            self.total.fetch_add(k, Ordering::Relaxed);
+        }
+        r
+    }
+}
+
+impl AsyncWrite for Counted<'_> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.s).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.s).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.s).poll_shutdown(cx)
+    }
 }
 
 /// Direct connect. For a domain we must resolve it ourselves now, because the
@@ -291,7 +381,7 @@ mod tests {
         let live = live.clone();
         tokio::spawn(async move {
             let (s, _) = l.accept().await.unwrap();
-            let _ = route(&live, s, p).await;
+            let _ = route(&live, &Traffic::default(), s, p).await;
         });
         TcpStream::connect(addr).await.unwrap()
     }
@@ -728,11 +818,17 @@ mod tests {
         (c, s)
     }
 
+    type Pumped = tokio::task::JoinHandle<(Transfer, Result<()>, Arc<Traffic>)>;
+
     /// client <-> [a  pump  b] <-> server
-    async fn pumped() -> (TcpStream, TcpStream, tokio::task::JoinHandle<Result<()>>) {
+    async fn pumped() -> (TcpStream, TcpStream, Pumped) {
         let (client, mut a) = tcp_pair().await;
         let (mut b, server) = tcp_pair().await;
-        let h = tokio::spawn(async move { pump(&mut a, &mut b).await });
+        let traffic = Arc::new(Traffic::default());
+        let h = tokio::spawn(async move {
+            let (moved, r) = pump(&mut a, &mut b, &traffic).await;
+            (moved, r, traffic)
+        });
         (client, server, h)
     }
 
@@ -759,7 +855,15 @@ mod tests {
         client.read_to_end(&mut got).await.unwrap();
         assert!(got == down, "server->client bytes differ");
         srv.await.unwrap();
-        h.await.unwrap().unwrap();
+        let (moved, r, traffic) = h.await.unwrap();
+        r.unwrap();
+        let (up, down) = (up.len() as u64, down.len() as u64);
+        assert_eq!(moved, Transfer { up, down });
+        assert_eq!(
+            (traffic.up.load(Ordering::Relaxed), traffic.down.load(Ordering::Relaxed)),
+            (up, down),
+            "the shared totals follow"
+        );
     }
 
     #[tokio::test]
@@ -775,13 +879,19 @@ mod tests {
         let mut reply = Vec::new();
         client.read_to_end(&mut reply).await.unwrap();
         assert_eq!(reply, b"late reply");
-        h.await.unwrap().unwrap();
+        let (moved, r, _) = h.await.unwrap();
+        r.unwrap();
+        assert_eq!(moved, Transfer { up: 7, down: 10 });
     }
 
     #[tokio::test]
     async fn a_reset_peer_ends_the_pump_instead_of_hanging() {
         use std::os::fd::AsRawFd;
-        let (client, mut server, h) = pumped().await;
+        let (mut client, mut server, h) = pumped().await;
+        // Some bytes get through first: they must still be counted.
+        client.write_all(&[7; 1000]).await.unwrap();
+        let mut first = [0u8; 1000];
+        server.read_exact(&mut first).await.unwrap();
         // Abortive close of the client: RST instead of FIN.
         let abortive = libc::linger {
             l_onoff: 1,
@@ -800,6 +910,8 @@ mod tests {
         let mut buf = [0u8; 8];
         let _ = server.read(&mut buf).await;
         let r = tokio::time::timeout(Duration::from_secs(5), h).await;
-        assert!(r.is_ok(), "the pump must end after a reset");
+        let (moved, r, _) = r.expect("the pump must end after a reset").unwrap();
+        assert!(r.is_err(), "a reset is an error");
+        assert_eq!(moved.up, 1000, "bytes moved before the error are counted");
     }
 }

@@ -13,26 +13,86 @@ use crate::nat::Nat;
 use crate::netns::Addrs;
 use crate::packet::{self, Packet, PROTO_TCP, PROTO_UDP};
 use anyhow::{anyhow, bail, Result};
-use proxytun_core::net::dns::{self, Transport};
+use proxytun_core::net::dns::{self, DnsStats, Transport};
 use proxytun_core::net::fakeip::{FakeGuard, FakePool};
-use proxytun_core::net::relay::{self, Live};
+use proxytun_core::net::relay::{self, Live, Traffic};
 use proxytun_core::types::{Pending, Target};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
-use tokio::io::unix::AsyncFd;
 use tokio::net::TcpListener;
+use tokio::runtime::Handle;
 use tracing::{field, Instrument, Span};
 
+/// Counters for SIGUSR1. Packet counts are for the TUN device; drops are
+/// split by reason, since each points at a different problem.
 #[derive(Default)]
 pub struct Stats {
     pub connections: AtomicU64,
     pub active: AtomicU64,
-    pub dns_queries: AtomicU64,
     pub udp_refused: AtomicU64,
-    pub dropped: AtomicU64,
+    pub tun_packets_in: AtomicU64,
+    pub tun_bytes_in: AtomicU64,
+    pub tun_packets_out: AtomicU64,
+    pub tun_bytes_out: AtomicU64,
+    /// Not IPv4, a fragment, or malformed.
+    pub drop_unparsed: AtomicU64,
+    /// IPv4 but neither TCP nor UDP (ICMP...).
+    pub drop_other_proto: AtomicU64,
+    /// TCP for no known connection (a stray packet after the entry expired).
+    pub drop_no_flow: AtomicU64,
+    /// A SYN that found the address-rewriting table full.
+    pub drop_table_full: AtomicU64,
+}
+
+/// The counters `log_stats` turns into rates.
+#[derive(Clone, Copy)]
+pub struct Snapshot {
+    at: Instant,
+    connections: u64,
+    tun_packets_in: u64,
+    tun_bytes_in: u64,
+    up: u64,
+    down: u64,
+}
+
+/// Per-second rates between two snapshots (MB = 10^6 bytes).
+#[derive(Debug, PartialEq)]
+pub struct Rates {
+    seconds: f64,
+    connections: f64,
+    tun_packets_in: f64,
+    tun_mb_in: f64,
+    up_mb: f64,
+    down_mb: f64,
+}
+
+impl Snapshot {
+    fn rates_since(&self, prev: &Snapshot) -> Rates {
+        let seconds = self.at.duration_since(prev.at).as_secs_f64().max(1e-3);
+        let per_s = |a: u64, b: u64| a.saturating_sub(b) as f64 / seconds;
+        Rates {
+            seconds,
+            connections: per_s(self.connections, prev.connections),
+            tun_packets_in: per_s(self.tun_packets_in, prev.tun_packets_in),
+            tun_mb_in: per_s(self.tun_bytes_in, prev.tun_bytes_in) / 1e6,
+            up_mb: per_s(self.up, prev.up) / 1e6,
+            down_mb: per_s(self.down, prev.down) / 1e6,
+        }
+    }
+
+    pub fn zero() -> Self {
+        Snapshot {
+            at: Instant::now(),
+            connections: 0,
+            tun_packets_in: 0,
+            tun_bytes_in: 0,
+            up: 0,
+            down: 0,
+        }
+    }
 }
 
 /// State shared by the packet loop, the relay and the signal handlers.
@@ -46,6 +106,10 @@ pub struct Shared {
     /// Rules and proxies, swapped on SIGHUP.
     pub live: RwLock<Arc<Live>>,
     pub stats: Stats,
+    pub dns: DnsStats,
+    pub traffic: Traffic,
+    /// Counters at the previous `log_stats`, for rates.
+    pub last_stats: Mutex<Snapshot>,
     /// Last connection id handed out (TUN-captured and host-port alike).
     pub last_id: AtomicU64,
 }
@@ -65,62 +129,53 @@ impl Shared {
     }
 }
 
+fn count(c: &AtomicU64, n: usize) {
+    c.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 // ------------------------------------------------------------ packet loop --
 
-/// Read packets from the TUN device until it fails.
-pub async fn run_tun(tun: OwnedFd, sh: Arc<Shared>) -> Result<()> {
-    set_nonblocking(&tun)?;
-    // SAFETY: the OwnedFd stays open, and is the same fd, for as long as the
-    // AsyncFd owns it.
-    let tun = Arc::new(unsafe { AsyncFd::register(tun) }?);
+/// Read packets from the TUN device until it fails. Runs on its own thread
+/// (named "tun", easy to find in `top -H`): the namespace's TCP processing
+/// happens in our writes, so this is where the CPU goes. `rt` runs the DNS
+/// lookups, which may take seconds.
+pub fn run_tun(tun: OwnedFd, sh: Arc<Shared>, rt: Handle) -> Result<()> {
+    let tun = Arc::new(tun);
     let mut buf = vec![0u8; 65536];
     loop {
-        let mut ready = tun.readable().await?;
-        // SAFETY: read into our own buffer.
+        // SAFETY: read into our own buffer from a blocking fd.
         let n = unsafe { libc::read(tun.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                ready.clear_ready();
+            if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
             bail!("reading the TUN device: {e}");
         }
-        on_packet(&tun, &sh, &mut buf[..n as usize]);
+        on_packet(&tun, &sh, &rt, &mut buf[..n as usize]);
     }
 }
 
-fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
-    // SAFETY: plain fcntl on an fd we own.
-    unsafe {
-        let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-        if fl < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
-            bail!("fcntl O_NONBLOCK: {}", std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn on_packet(tun: &Arc<AsyncFd<OwnedFd>>, sh: &Arc<Shared>, pkt: &mut [u8]) {
+fn on_packet(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &mut [u8]) {
+    count(&sh.stats.tun_packets_in, 1);
+    count(&sh.stats.tun_bytes_in, pkt.len());
     let Some(p) = packet::parse(pkt) else {
-        sh.stats.dropped.fetch_add(1, Ordering::Relaxed);
+        count(&sh.stats.drop_unparsed, 1);
         return;
     };
     match p.proto {
         PROTO_TCP => on_tcp(tun, sh, pkt, &p),
-        PROTO_UDP if p.dst.port() == 53 => on_dns(tun, sh, pkt, &p),
+        PROTO_UDP if p.dst.port() == 53 => on_dns(tun, sh, rt, pkt, &p),
         PROTO_UDP => {
-            sh.stats.udp_refused.fetch_add(1, Ordering::Relaxed);
+            count(&sh.stats.udp_refused, 1);
             tracing::trace!(src = %p.src, dst = %p.dst, "udp refused");
-            write_packet(tun, &packet::build_port_unreachable(pkt, &p));
+            write_packet(tun, sh, &packet::build_port_unreachable(pkt, &p));
         }
-        _ => {
-            sh.stats.dropped.fetch_add(1, Ordering::Relaxed);
-        }
+        _ => count(&sh.stats.drop_other_proto, 1),
     }
 }
 
-fn on_tcp(tun: &AsyncFd<OwnedFd>, sh: &Shared, pkt: &mut [u8], p: &Packet) {
+fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
     let rewritten = if p.src == sh.listen && *p.dst.ip() == sh.addrs.nat {
         // The listener answering: back to the program, from where it dialed.
         sh.nat().inbound(p.dst.port())
@@ -137,27 +192,28 @@ fn on_tcp(tun: &AsyncFd<OwnedFd>, sh: &Shared, pkt: &mut [u8], p: &Packet) {
     match rewritten {
         Some((src, dst)) => {
             packet::rewrite_tcp(pkt, p, src, dst);
-            write_packet(tun, &pkt[..p.len]);
+            write_packet(tun, sh, &pkt[..p.len]);
         }
+        None if p.is_syn() => count(&sh.stats.drop_table_full, 1),
         None => {
-            sh.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            count(&sh.stats.drop_no_flow, 1);
+            tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
         }
     }
 }
 
-fn on_dns(tun: &Arc<AsyncFd<OwnedFd>>, sh: &Arc<Shared>, pkt: &[u8], p: &Packet) {
-    sh.stats.dns_queries.fetch_add(1, Ordering::Relaxed);
+fn on_dns(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &[u8], p: &Packet) {
     let query = packet::udp_payload(pkt, p).to_vec();
     let (client, server) = (p.src, p.dst);
     let (tun, sh) = (tun.clone(), sh.clone());
     // Forwarded queries can take seconds; never hold up the packet loop.
-    tokio::spawn(async move {
-        let Some(resp) = dns::respond(&query, &sh.pool, sh.upstream_dns, Transport::Udp).await else {
+    rt.spawn(async move {
+        let Some(resp) = dns::respond(&query, &sh.pool, sh.upstream_dns, Transport::Udp, &sh.dns).await else {
             return;
         };
         // From the address the program asked, so its resolver accepts it.
         if let Some(b) = packet::build_udp(server, client, &resp) {
-            write_packet(&tun, &b);
+            write_packet(&tun, &sh, &b);
         }
     });
 }
@@ -165,12 +221,15 @@ fn on_dns(tun: &Arc<AsyncFd<OwnedFd>>, sh: &Arc<Shared>, pkt: &[u8], p: &Packet)
 /// Hand a packet to the namespace's kernel. A TUN write never blocks; if the
 /// kernel refuses one (out of memory) the sender retransmits, as on a real
 /// link.
-fn write_packet(tun: &AsyncFd<OwnedFd>, b: &[u8]) {
+fn write_packet(tun: &OwnedFd, sh: &Shared, b: &[u8]) {
     // SAFETY: plain write of our own buffer.
     let n = unsafe { libc::write(tun.as_raw_fd(), b.as_ptr() as *const _, b.len()) };
     if n < 0 {
         tracing::debug!("writing to the TUN device: {}", std::io::Error::last_os_error());
+        return;
     }
+    count(&sh.stats.tun_packets_out, 1);
+    count(&sh.stats.tun_bytes_out, b.len());
 }
 
 // ------------------------------------------------------------------ relay --
@@ -236,11 +295,15 @@ async fn relay_one(sh: &Shared, stream: tokio::net::TcpStream, peer: SocketAddr)
         // DNS over TCP, to whatever server the program chose.
         Span::current().record("target", field::display(dst));
         tracing::info!("dns over tcp");
-        dns::serve_tcp(stream, &sh.pool, sh.upstream_dns).await;
+        let start = Instant::now();
+        dns::serve_tcp(stream, &sh.pool, sh.upstream_dns, &sh.dns).await;
+        tracing::info!(ms = start.elapsed().as_millis() as u64, "closed");
         return Ok(());
     }
     let (target, guard) = to_target(dst, &sh.pool);
-    relay::route(&sh.live(), stream, Pending { target, guard }).await
+    // `route` logs how the connection ended, errors included.
+    let _ = relay::route(&sh.live(), &sh.traffic, stream, Pending { target, guard }).await;
+    Ok(())
 }
 
 /// Map a fake IP back to its domain (pinning the mapping for the connection's
@@ -265,17 +328,50 @@ pub async fn run_sweeper(sh: Arc<Shared>) {
     }
 }
 
+/// SIGUSR1: totals since start, then rates since the previous dump (or since
+/// start), for telling where the time goes without outside tools.
 pub fn log_stats(sh: &Shared) {
-    let s = &sh.stats;
+    let (s, d) = (&sh.stats, &sh.dns);
+    let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+    let now = Snapshot {
+        at: Instant::now(),
+        connections: n(&s.connections),
+        tun_packets_in: n(&s.tun_packets_in),
+        tun_bytes_in: n(&s.tun_bytes_in),
+        up: n(&sh.traffic.up),
+        down: n(&sh.traffic.down),
+    };
     tracing::info!(
         fake_ips = sh.pool.len(),
         nat_entries = sh.nat().len(),
-        connections = s.connections.load(Ordering::Relaxed),
-        active = s.active.load(Ordering::Relaxed),
-        dns_queries = s.dns_queries.load(Ordering::Relaxed),
-        udp_refused = s.udp_refused.load(Ordering::Relaxed),
-        dropped_packets = s.dropped.load(Ordering::Relaxed),
+        connections = now.connections,
+        active = n(&s.active),
+        relayed_up = now.up,
+        relayed_down = now.down,
+        dns_queries = n(&d.queries),
+        dns_forwarded = n(&d.forwarded),
+        dns_forward_failed = n(&d.forward_failed),
+        udp_refused = n(&s.udp_refused),
+        tun_packets_in = now.tun_packets_in,
+        tun_bytes_in = now.tun_bytes_in,
+        tun_packets_out = n(&s.tun_packets_out),
+        tun_bytes_out = n(&s.tun_bytes_out),
+        dropped_unparsed = n(&s.drop_unparsed),
+        dropped_other_proto = n(&s.drop_other_proto),
+        dropped_no_flow = n(&s.drop_no_flow),
+        dropped_table_full = n(&s.drop_table_full),
         "stats"
+    );
+    let prev = std::mem::replace(&mut *sh.last_stats.lock().unwrap_or_else(|e| e.into_inner()), now);
+    let r = now.rates_since(&prev);
+    tracing::info!(
+        seconds = %format!("{:.1}", r.seconds),
+        connections_per_s = %format!("{:.1}", r.connections),
+        tun_packets_in_per_s = %format!("{:.0}", r.tun_packets_in),
+        tun_mb_in_per_s = %format!("{:.2}", r.tun_mb_in),
+        up_mb_per_s = %format!("{:.2}", r.up_mb),
+        down_mb_per_s = %format!("{:.2}", r.down_mb),
+        "rates since the previous stats"
     );
     for n in &sh.live().registry.nodes {
         let s = n.stats();
@@ -310,6 +406,9 @@ mod tests {
             upstream_dns: "127.0.0.1:9".parse().unwrap(),
             live: RwLock::new(Arc::new(relay::build_live(&cfg).unwrap())),
             stats: Stats::default(),
+            dns: DnsStats::default(),
+            traffic: Traffic::default(),
+            last_stats: Mutex::new(Snapshot::zero()),
             last_id: AtomicU64::new(0),
         }
     }
@@ -352,5 +451,115 @@ mod tests {
         assert_eq!(sh.nat().accept(port), None, "closed once the relay is done");
         assert_eq!(sh.stats.connections.load(Ordering::Relaxed), 1);
         assert_eq!(sh.stats.active.load(Ordering::Relaxed), 0);
+    }
+
+    /// A pipe stands in for the TUN device: what we write comes out of the
+    /// returned file.
+    fn fake_tun() -> (Arc<OwnedFd>, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        unsafe {
+            (
+                Arc::new(OwnedFd::from_raw_fd(fds[1])),
+                std::fs::File::from_raw_fd(fds[0]),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn every_packet_is_counted_and_every_drop_has_its_reason() {
+        use crate::packet::tests::tcp;
+        use crate::packet::{TCP_ACK, TCP_SYN};
+        use std::io::Read;
+        let listen = sa("127.0.0.1:4000");
+        let sh = Arc::new(shared(listen));
+        let (tun, mut out) = fake_tun();
+        let rt = Handle::current();
+        let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+
+        let mut v6 = tcp(sa("1.1.1.1:1"), sa("2.2.2.2:2"), TCP_SYN, b"");
+        v6[0] = 0x60;
+        let mut icmp = tcp(sa("1.1.1.1:1"), sa("2.2.2.2:2"), TCP_SYN, b"");
+        icmp[9] = packet::PROTO_ICMP;
+        let mut stray = tcp(sa("198.19.255.1:40000"), sa("198.18.0.9:443"), TCP_ACK, b"x");
+        let mut syn = tcp(sa("198.19.255.1:40000"), sa("198.18.0.9:443"), TCP_SYN, b"");
+        let mut quic = packet::build_udp(sa("198.19.255.1:5000"), sa("1.2.3.4:443"), b"quic").unwrap();
+        let mut sizes = 0;
+        for pkt in [&mut v6, &mut icmp, &mut stray, &mut syn, &mut quic] {
+            sizes += pkt.len();
+            on_packet(&tun, &sh, &rt, pkt);
+        }
+        // Fill the table: the next SYN has nowhere to go.
+        {
+            let mut nat = sh.nat();
+            for i in 0..crate::nat::PORTS.len() {
+                let src = SocketAddrV4::new([10, 0, (i >> 8) as u8, i as u8].into(), 1);
+                nat.outbound(src, sa("1.1.1.1:80"), true, Instant::now());
+            }
+        }
+        let mut late = tcp(sa("198.19.255.1:40001"), sa("198.18.0.9:443"), TCP_SYN, b"");
+        sizes += late.len();
+        on_packet(&tun, &sh, &rt, &mut late);
+
+        let s = &sh.stats;
+        assert_eq!((n(&s.tun_packets_in), n(&s.tun_bytes_in)), (6, sizes as u64));
+        assert_eq!(
+            (
+                n(&s.drop_unparsed),
+                n(&s.drop_other_proto),
+                n(&s.drop_no_flow),
+                n(&s.drop_table_full),
+                n(&s.udp_refused)
+            ),
+            (1, 1, 1, 1, 1),
+            "IPv6, ICMP, a stray ACK, a SYN into a full table, a QUIC datagram"
+        );
+        // Out: the rewritten SYN, then the ICMP refusal of the datagram.
+        let mut written = vec![0u8; 4096];
+        let got = out.read(&mut written).unwrap();
+        assert_eq!(n(&s.tun_packets_out), 2);
+        assert_eq!(n(&s.tun_bytes_out), got as u64);
+        let first = packet::parse(&written[..got]).unwrap();
+        assert_eq!(
+            (first.dst, *first.src.ip()),
+            (listen, sh.addrs.nat),
+            "the SYN was rewritten to the listener"
+        );
+    }
+
+    #[test]
+    fn rates_are_deltas_over_the_time_between_two_dumps() {
+        let t0 = Instant::now();
+        let prev = Snapshot {
+            at: t0,
+            connections: 10,
+            tun_packets_in: 1000,
+            tun_bytes_in: 5_000_000,
+            up: 1_000_000,
+            down: 2_000_000,
+        };
+        let now = Snapshot {
+            at: t0 + Duration::from_secs(2),
+            connections: 30,
+            tun_packets_in: 101_000,
+            tun_bytes_in: 205_000_000,
+            up: 3_000_000,
+            down: 202_000_000,
+        };
+        assert_eq!(
+            now.rates_since(&prev),
+            Rates {
+                seconds: 2.0,
+                connections: 10.0,
+                tun_packets_in: 50_000.0,
+                tun_mb_in: 100.0,
+                up_mb: 1.0,
+                down_mb: 100.0
+            }
+        );
     }
 }
