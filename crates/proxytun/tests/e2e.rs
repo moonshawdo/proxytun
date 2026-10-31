@@ -50,7 +50,11 @@ fn mappable(host: &str) -> bool {
 }
 
 fn start_mock(origin_port: u16, http: bool) -> Mock {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    start_mock_on("127.0.0.1:0", origin_port, http)
+}
+
+fn start_mock_on(bind: &str, origin_port: u16, http: bool) -> Mock {
+    let l = TcpListener::bind(bind).unwrap();
     let addr = l.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen2 = seen.clone();
@@ -2062,4 +2066,54 @@ fn doctor_reports_the_sudo_mode_without_running_sudo() {
     let out = run_like_centos7(&cfg, &["--doctor", "--no-sudo"], &[], true, &[]);
     assert!(out.stdout.contains("[FAIL] sudo mode"), "{}", out.dump());
     assert_eq!(out.code, 1, "{}", out.dump());
+}
+
+#[test]
+fn a_program_dialing_our_proxy_itself_does_not_go_through_it_twice() {
+    require!("curl");
+    let Some(ip) = host_ip() else {
+        eprintln!("SKIP: no non-loopback IPv4 address on this host");
+        return;
+    };
+    let origin = start_origin();
+    // On a real address: a loopback proxy would be reached through the host
+    // ports instead of the relay.
+    let mock = start_mock_on("0.0.0.0:0", origin, false);
+    let proxy = SocketAddr::new(ip.into(), mock.addr.port());
+    let dir = tmp_dir("direct-to-proxies");
+    // The program uses our proxy through its own option, not its environment.
+    let argv = [
+        "curl",
+        "-sS",
+        "--max-time",
+        "10",
+        "-x",
+        &format!("socks5h://{proxy}"),
+        "http://twice.test/",
+    ];
+
+    let cfg = write_cfg(&dir, proxy, "sniff = false", "");
+    let out = run(&cfg, &[], &argv, &[]);
+    assert_eq!(out.stdout, BODY, "{}", out.dump());
+    let once = Seen {
+        atyp: 3,
+        host: "twice.test".into(),
+        port: 80,
+    };
+    assert_eq!(
+        mock.seen(),
+        [once],
+        "one trip through the proxy\n{}",
+        out.dump()
+    );
+
+    // Switched off: the connection to the proxy is itself sent to the proxy.
+    let cfg = write_cfg(&dir, proxy, "sniff = false\ndirect_to_proxies = false", "");
+    let out = run(&cfg, &[], &argv, &[]);
+    let nested = Seen {
+        atyp: 1,
+        host: ip.to_string(),
+        port: proxy.port(),
+    };
+    assert_eq!(mock.seen()[1..], [nested], "proxied to itself\n{}", out.dump());
 }

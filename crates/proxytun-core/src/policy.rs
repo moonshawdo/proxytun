@@ -2,9 +2,9 @@
 //! environment. Pure logic: no I/O, so every branch is unit-tested.
 //!
 //! Two layers decide what happens to a connect():
-//!   1. `is_passthrough`: localnet CIDRs and the proxy endpoints named in the
-//!      program's `*_proxy` env vars. These go straight out: no sniffing, no
-//!      rules, no proxy.
+//!   1. `is_passthrough`: localnet CIDRs, the proxy endpoints named in the
+//!      program's `*_proxy` env vars and (`direct_to_proxies`) our own
+//!      [[proxies]]. These go straight out: no sniffing, no rules, no proxy.
 //!   2. `decide`: the rule list, first match wins.
 
 use crate::config::{Action, Config, EnvProxies, RuleKind, DEFAULT_GROUP};
@@ -27,7 +27,17 @@ pub struct Policy {
 }
 
 impl Policy {
-    pub fn new(cfg: &Config, env: EnvProxies) -> Result<Self> {
+    pub fn new(cfg: &Config, mut env: EnvProxies) -> Result<Self> {
+        // The program dialing one of our proxies itself (its own proxy
+        // setting, not in its environment) must not go through it twice.
+        if cfg.direct_to_proxies {
+            for p in &cfg.proxies {
+                let a = p.socket_addr()?;
+                if !env.ips.contains(&(a.ip(), a.port())) {
+                    env.ips.push((a.ip(), a.port()));
+                }
+            }
+        }
         let localnet = cfg
             .localnet
             .iter()
@@ -161,7 +171,7 @@ pub fn unmap(ip: IpAddr) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::env_proxies;
+    use crate::config::{env_proxies, EnvProxies};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn policy(extra: &str, env: &[(&str, &str)]) -> Policy {
@@ -327,6 +337,27 @@ mod tests {
         let p = policy_top("localnet = [\"10.0.0.0/8\"]", "", &[]);
         assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(10, 9, 9, 9), 1)));
         assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::new(127, 0, 0, 1), 1)));
+    }
+
+    #[test]
+    fn our_own_proxies_are_reached_directly_by_ip_and_port_only() {
+        // The helper's proxy is 127.0.0.1:1080.
+        let p = policy("", &[]);
+        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1080)));
+        assert!(p.is_passthrough(&Dest::V6("::ffff:127.0.0.1".parse().unwrap(), 1080)));
+        assert!(
+            !p.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1081)),
+            "other ports of the proxy's host follow the rules"
+        );
+        let off = policy_top("direct_to_proxies = false", "", &[]);
+        assert!(!off.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1080)));
+
+        // --proxy / $PROXYTUN_PROXY: the proxy in effect is the one let through.
+        let mut cfg = Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1080\"\n").unwrap();
+        cfg.override_proxy("socks5://10.1.2.3:7897").unwrap();
+        let p = Policy::new(&cfg, EnvProxies::default()).unwrap();
+        assert!(p.is_passthrough(&Dest::V4(Ipv4Addr::new(10, 1, 2, 3), 7897)));
+        assert!(!p.is_passthrough(&Dest::V4(Ipv4Addr::LOCALHOST, 1080)));
     }
 
     #[test]

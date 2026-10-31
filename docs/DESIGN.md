@@ -83,6 +83,9 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 - **MTU**:65520。包只在本机内核与 proxytun 之间流转,包越大用户态处理的包数越少。
 - **localnet / 程序环境里的代理**:沿用 proxyhook 的 `Policy::is_passthrough`,命中的目标由 proxytun 直连,不走规则与代理(避免代理套代理)。
   `localnet` 默认为空(proxyhook 默认 `127.0.0.0/8`,在 proxytun 里不起作用:命名空间的回环到不了 proxytun)。
+  `direct_to_proxies`(默认开,2026-10-31 加):`[[proxies]]` 的 IP+端口并入同一张放行表,程序自己连这些代理(它自己的代理设置、`curl -x`)
+  时直连,不再经代理绕一次。与 `localnet` 的区别:只放行那个端口,同一主机的其他端口照常走规则。匹配在每条连接 accept 后做一次、
+  逐个比较几个地址,不在每个包上做,没有性能影响。
 - **非 A 记录的上游 DNS**:`upstream_dns` 不写时用主机 `/etc/resolv.conf` 的第一个 nameserver(没有则 `127.0.0.1:53`,同 glibc),
   从主机发出,所以主机上的 `127.0.0.53` 之类本地解析器也能用。proxyhook 默认 `1.1.1.1:53`,在内网或 CentOS 服务器上常被挡,
   MX/TXT/PTR 查询会卡满 3 秒超时。

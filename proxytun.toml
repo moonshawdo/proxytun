@@ -19,6 +19,12 @@
 # http_proxy / https_proxy / all_proxy are added automatically. Default empty.
 # localnet = ["10.0.0.0/8", "192.168.0.0/16"]
 
+# The program's own connections to one of the [[proxies]] below (same ip and
+# port: its own proxy setting, `curl -x`) go direct instead of through the
+# proxy a second time. Unlike localnet, only that port: other ports of the
+# proxy's host still follow the rules.
+# direct_to_proxies = true
+
 # --- hostname sniffing ----------------------------------------------------
 # For connections to a bare IP (DoH, hard-coded addresses, names resolved
 # through nscd / systemd-resolved), read the hostname from the TLS SNI or HTTP

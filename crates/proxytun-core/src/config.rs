@@ -84,6 +84,13 @@ pub struct Config {
     #[serde(default)]
     pub host_ports_exclude: Vec<u16>,
 
+    /// The program's own connections to one of the [[proxies]] (same ip and
+    /// port: its own proxy setting, `curl -x`) go direct instead of through
+    /// the proxy a second time. Other ports of that host follow the rules.
+    /// Default true.
+    #[serde(default = "yes")]
+    pub direct_to_proxies: bool,
+
     #[serde(default)]
     pub health: HealthCfg,
 
@@ -647,6 +654,7 @@ mod tests {
         assert_eq!(c.retries, 2);
         assert_eq!(c.upstream_dns, None, "the host's resolver unless set");
         assert!(c.host_ports_forward);
+        assert!(c.direct_to_proxies);
         assert!(c.host_ports_exclude.is_empty());
         assert!(c.sniff);
         assert_eq!(c.sniff_ports, vec![80, 443, 8443]);

@@ -106,6 +106,7 @@ proxytun 的退出码就是程序的退出码(信号终止为 `128+信号`)。�
 | `fake_ip_range` | 末尾的 /24 留给命名空间内部(TUN `.1`、假 DNS `.53`),所以至少要 /22 |
 | `upstream_dns` | MX/TXT/PTR 等非 A 查询从主机转发到这里。**默认用主机 `/etc/resolv.conf` 的第一个 nameserver**(proxyhook 默认 `1.1.1.1:53`) |
 | `localnet` | 命中的目标由 proxytun 从主机直连,不走规则与代理。**默认为空**:命名空间里的 `127.0.0.0/8` 是命名空间自己的回环,到不了 proxytun |
+| `direct_to_proxies` | 程序自己连 `[[proxies]]` 里的某个代理时(它自己的代理设置、`curl -x`),按 IP+端口直连,不再经代理绕一次;同一主机的其他端口照常走规则。默认 `true`(proxyhook 只放行程序环境变量里的代理) |
 | `host_ports_forward` | 是否把主机的回环监听转发进命名空间,默认 `true` |
 | `host_ports_exclude` | 不转发的端口(程序要自己在这个端口上监听时用) |
 
