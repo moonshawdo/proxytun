@@ -114,7 +114,7 @@ impl Snapshot {
         }
     }
 
-    fn zero() -> Self {
+    pub fn zero() -> Self {
         Snapshot {
             at: Instant::now(),
             connections: 0,
@@ -138,8 +138,6 @@ pub struct Shared {
     pub stats: Stats,
     pub dns: DnsStats,
     pub traffic: Traffic,
-    /// Counters at the previous `log_stats`, for rates.
-    pub last_stats: Mutex<Snapshot>,
     /// Last connection id handed out (TUN-captured and host-port alike).
     pub last_id: AtomicU64,
     /// The full address-rewriting table, reported once in a while.
@@ -219,7 +217,6 @@ impl Shared {
             stats: Stats::default(),
             dns: DnsStats::default(),
             traffic: Traffic::default(),
-            last_stats: Mutex::new(Snapshot::zero()),
             last_id: AtomicU64::new(0),
             table_full_logged: Throttle::new(),
             accept_failed_logged: Throttle::new(),
@@ -506,9 +503,9 @@ async fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
     }
 }
 
-/// SIGUSR1: totals since start, then rates since the previous dump (or since
-/// start), for telling where the time goes without outside tools.
-pub fn log_stats(sh: &Shared) {
+/// SIGUSR1: totals since start, then rates since `prev`, the previous dump
+/// (or start), for telling where the time goes without outside tools.
+pub fn log_stats(sh: &Shared, prev: &mut Snapshot) {
     let (s, d) = (&sh.stats, &sh.dns);
     let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
     let now = Snapshot {
@@ -546,7 +543,7 @@ pub fn log_stats(sh: &Shared) {
         dropped_dns_busy = n(&s.drop_dns_busy),
         "stats"
     );
-    let prev = std::mem::replace(&mut *sh.last_stats.lock().unwrap_or_else(|e| e.into_inner()), now);
+    let prev = std::mem::replace(prev, now);
     let r = now.rates_since(&prev);
     tracing::info!(
         seconds = %format!("{:.1}", r.seconds),
@@ -660,7 +657,7 @@ pub(crate) mod tests {
                 std::io::sink()
             })
             .finish();
-        tracing::subscriber::with_default(sub, || log_stats(&sh));
+        tracing::subscriber::with_default(sub, || log_stats(&sh, &mut Snapshot::zero()));
         let free = free.lock().unwrap();
         assert!(!free.is_empty() && free.iter().all(|&f| f), "{free:?}");
     }

@@ -42,7 +42,7 @@ pub const QUEUED: Duration = Duration::from_secs(30);
 /// Ports handed out on each NAT address.
 pub const PORTS: std::ops::RangeInclusive<u16> = 1024..=65535;
 /// NAT addresses, from `Addrs::nat` on: about a million entries in all (some
-/// 200-280 MB when full).
+/// 200-280 MB when full). Below `Addrs::dns` (checked in netns.rs).
 pub const NAT_ADDRS: u8 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3305,6 +3305,33 @@ fn doctor_reports_rootless_mode_and_each_proxy() {
 }
 
 #[test]
+fn doctor_with_a_broken_config_fails_it_and_still_checks_the_host() {
+    require!();
+    let dir = tmp_dir("doctor-bad-config");
+    let unparsable = dir.join("bad.toml");
+    std::fs::write(&unparsable, "this is = = not toml\n").unwrap();
+    // There, but not a file that can be read (whoever runs the tests).
+    let unreadable = dir.join("dir.toml");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    for (cfg, why) in [(&unparsable, "parsing config toml"), (&unreadable, "reading config")] {
+        let mut cmd = Command::new(BIN);
+        cmd.arg("-c").arg(cfg).arg("--doctor");
+        let out = run_cmd(cmd, &[]);
+        assert_eq!(out.code, 1, "a broken config fails the doctor\n{}", out.dump());
+        let first = out.stdout.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("[FAIL] config") && first.contains(why),
+            "the config's problem comes first\n{}",
+            out.dump()
+        );
+        // The host is checked all the same, without a proxy: the stand-in
+        // settings name none worth probing.
+        assert!(out.stdout.contains("[ OK ] namespace"), "{}", out.dump());
+        assert!(!out.stdout.contains("upstream proxy"), "{}", out.dump());
+    }
+}
+
+#[test]
 fn doctor_is_not_fooled_by_a_caller_that_ignores_sigchld() {
     require!("python3");
     let dir = tmp_dir("doctor-sigchld");

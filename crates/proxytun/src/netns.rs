@@ -48,16 +48,30 @@ pub struct Addrs {
 
 impl Addrs {
     pub const PREFIX: u8 = 24;
+    /// How many addresses at the top of `fake_ip_range` are set aside for
+    /// these (the TUN device's /24): the fake-ip pool never hands them out.
+    pub const RESERVED: u32 = 1 << (32 - Self::PREFIX);
+    /// Each address's offset in that block.
+    const TUN_OFFSET: u32 = 1;
+    const NAT_OFFSET: u32 = 2;
+    const DNS_OFFSET: u32 = 53;
 
     pub fn new(range: Ipv4Net) -> Self {
-        let block = u32::from(range.broadcast()) & !0xff;
+        let block = u32::from(range.broadcast()) & !(Self::RESERVED - 1);
         Addrs {
-            tun: Ipv4Addr::from(block + 1),
-            nat: Ipv4Addr::from(block + 2),
-            dns: Ipv4Addr::from(block + 53),
+            tun: Ipv4Addr::from(block + Self::TUN_OFFSET),
+            nat: Ipv4Addr::from(block + Self::NAT_OFFSET),
+            dns: Ipv4Addr::from(block + Self::DNS_OFFSET),
         }
     }
 }
+
+// The NAT source addresses, `nat::NAT_ADDRS` of them from `Addrs::nat` on,
+// must stay clear of the DNS address.
+const _: () = assert!(
+    Addrs::NAT_OFFSET + crate::nat::NAT_ADDRS as u32 <= Addrs::DNS_OFFSET,
+    "the NAT addresses reach the DNS address"
+);
 
 /// The resolv.conf the program sees: only our DNS server, keeping the host's
 /// search domains and options, but for `ndots`. Our DNS answers every name

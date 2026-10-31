@@ -52,7 +52,7 @@ TRACE conn{id=1}: proxytun::capture: accepted nat=198.19.255.2:1024 dst=198.18.0
 INFO  conn{id=1 target=Domain("www.baidu.com", 443)}: proxytun_core::net::relay: routing decision=Proxy { group: "default" }
                     ^ 中继按对端地址查回目标，反查出域名，规则判定后交给代理。之后这条连接的每一行都带同一个 conn{…}
 http=200 remote_ip=198.18.0.1
-INFO  proxytun::app: program exited exit=Code(0)
+INFO  proxytun::signals: program exited exit=Code(0)
 ```
 
 ### 3.1 启动流程(user namespace 模式)

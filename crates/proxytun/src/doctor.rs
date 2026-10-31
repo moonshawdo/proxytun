@@ -4,26 +4,28 @@
 //! reports the sudo mode instead, without running sudo. Meant to be run once on
 //! a new host (especially CentOS 7) and pasted into a bug report.
 
-use crate::hostports;
 use crate::netns::{self, Setup, UsernsUnusable};
 use crate::procfs::parse_kernel;
+use crate::{app, hostports};
+use anyhow::Result;
 use proxytun_core::balancer::Node;
 use proxytun_core::config::Config;
 use proxytun_core::health;
+use std::path::Path;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
+enum Status {
     Ok,
     Warn,
     Fail,
 }
 
 #[derive(Debug, Clone)]
-pub struct Check {
-    pub name: &'static str,
-    pub status: Status,
-    pub detail: String,
+struct Check {
+    name: &'static str,
+    status: Status,
+    detail: String,
 }
 
 fn check(name: &'static str, status: Status, detail: impl Into<String>) -> Check {
@@ -34,7 +36,33 @@ fn check(name: &'static str, status: Status, detail: impl Into<String>) -> Check
     }
 }
 
-pub fn run_checks(cfg: &Config, no_sudo: bool) -> Vec<Check> {
+/// Check the host for a run with the config at `path` and `--proxy` (`proxy`)
+/// and print the report; returns the process exit code. A config that does
+/// not load is a failed check of its own.
+pub fn main(path: &Path, proxy: Option<&str>, no_sudo: bool) -> Result<i32> {
+    let proxy = app::take_proxy_override(proxy);
+    let (cfg, problem) = match app::load_config(path, proxy.as_deref()) {
+        Ok(c) => (c, None),
+        // Still check the host, with the default settings and no proxy.
+        Err(e) => {
+            let mut c = Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n")?;
+            c.proxies.clear();
+            (c, Some(format!("{e:#}")))
+        }
+    };
+    let mut checks = Vec::new();
+    if let Some(p) = problem {
+        checks.push(Check {
+            name: "config",
+            status: Status::Fail,
+            detail: p,
+        });
+    }
+    checks.extend(run_checks(&cfg, no_sudo));
+    Ok(report(&checks))
+}
+
+fn run_checks(cfg: &Config, no_sudo: bool) -> Vec<Check> {
     let mut out = vec![check_arch(), check_kernel(), check_tun_device()];
     out.extend(check_mode(cfg, no_sudo));
     out.push(check_yama());
@@ -44,7 +72,7 @@ pub fn run_checks(cfg: &Config, no_sudo: bool) -> Vec<Check> {
 }
 
 /// Print a report; returns the process exit code (1 if anything FAILed).
-pub fn report(checks: &[Check]) -> i32 {
+fn report(checks: &[Check]) -> i32 {
     let mut code = 0;
     for c in checks {
         let tag = match c.status {

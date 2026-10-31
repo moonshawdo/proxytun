@@ -7,20 +7,21 @@
 use crate::capture::{self, Shared};
 use crate::nat::Nat;
 use crate::netns::{self, Addrs, Setup, UsernsUnusable};
+use crate::signals::{self, Exit};
 use crate::witness::Witness;
-use crate::{hostports, procfs, sudo};
+use crate::{hostports, sudo};
 use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use proxytun_core::config::proxy_url::url_has_credentials;
-use proxytun_core::config::Config;
+use proxytun_core::config::{Config, HealthCfg};
 use proxytun_core::health;
 use proxytun_core::live::build_live;
 use proxytun_core::net::fakeip::FakePool;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicI32;
+use std::sync::Arc;
 
 pub struct Args {
     pub config: PathBuf,
@@ -96,13 +97,13 @@ pub fn run(args: Args) -> Result<Exit> {
         "starting"
     );
     let proxy_override = take_proxy_override(args.proxy.as_deref());
-    // Before any thread exists (see `exit_signal_fd`).
-    let ignored = ignored_signals(&[libc::SIGHUP, libc::SIGUSR1, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]);
+    // Before any thread exists (see `signals::exit_signal_fd`).
+    let ignored = signals::ignored_signals(&[libc::SIGHUP, libc::SIGUSR1, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]);
     let exit_sigs: Vec<libc::c_int> = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]
         .into_iter()
         .filter(|s| !ignored.contains(s))
         .collect();
-    let exit_fd = exit_signal_fd(&exit_sigs);
+    let exit_fd = signals::exit_signal_fd(&exit_sigs);
     // Still single-threaded, signals blocked, not yet a subreaper: see witness.rs.
     let witness = match exit_fd {
         Some(_) => Witness::start(&exit_sigs)
@@ -124,7 +125,7 @@ pub fn run(args: Args) -> Result<Exit> {
 
     let fake_net: Ipv4Net = cfg.fake_ip_range.parse().context("parse fake_ip_range")?;
     let addrs = Addrs::new(fake_net);
-    let pool = FakePool::with_reserved_tail(fake_net, 256);
+    let pool = FakePool::with_reserved_tail(fake_net, Addrs::RESERVED);
     let host_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     let upstream_dns = cfg.upstream_dns_addr(&host_resolv)?;
     let from = if cfg.upstream_dns.is_some() {
@@ -147,26 +148,7 @@ pub fn run(args: Args) -> Result<Exit> {
             Vec::new()
         },
     };
-    let (child, ns) = match netns::spawn(&setup) {
-        Err(e) if e.is::<UsernsUnusable>() => {
-            if args.no_sudo {
-                return Err(e.context("--no-sudo forbids falling back to sudo"));
-            }
-            tracing::warn!("{e}; asking sudo to create the namespace (--no-sudo refuses)");
-            let (child, ns, joined) = sudo::spawn(&setup)?;
-            if !joined {
-                tracing::warn!(
-                    "sudo started the program in a terminal session of its own (sudoers `use_pty`?): \
-                     it now runs in a session of its own without a controlling terminal: proxytun \
-                     passes Ctrl+C and Ctrl+\\ on to it, but job control (Ctrl+Z) and window size \
-                     changes do not reach it, and programs that open /dev/tty (password prompts of \
-                     ssh, git, sudo) fail"
-                );
-            }
-            (child, ns)
-        }
-        r => r?,
-    };
+    let (child, ns) = spawn_program(&setup, args.no_sudo)?;
     let relays = relay_capacity(raise_fd_limit(), ns.forwards.len());
     // A caller that ignores SIGCHLD (that survives exec) would have the kernel
     // reap our children unasked, the program's exit status with them. The
@@ -196,7 +178,7 @@ pub fn run(args: Args) -> Result<Exit> {
         Nat::new(addrs.nat, crate::nat::NAT_ADDRS),
         pool,
         upstream_dns,
-        live.clone(),
+        live,
         relays,
     ));
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -209,38 +191,14 @@ pub fn run(args: Args) -> Result<Exit> {
         .max_blocking_threads(64)
         .build()
         .context("build tokio runtime")?;
-    let health_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    {
-        let (sh, main_pid, health_task, cfg_path, proxy_override, sweep_tun) = (
-            sh.clone(),
-            main_pid.clone(),
-            health_task.clone(),
-            args.config.clone(),
-            proxy_override.clone(),
-            tun.clone(),
-        );
-        let health_cfg = cfg.health.clone();
-        rt.block_on(async move {
-            listener.set_nonblocking(true)?;
-            let listener = tokio::net::TcpListener::from_std(listener)?;
-            tokio::spawn(capture::run_relay(listener, sh.clone()));
-            for (addr, l) in forwards {
-                l.set_nonblocking(true)?;
-                tokio::spawn(hostports::serve(
-                    tokio::net::TcpListener::from_std(l)?,
-                    addr,
-                    sh.clone(),
-                ));
-            }
-            tokio::spawn(capture::run_sweeper(sweep_tun, sh.clone()));
-            *health_task.lock().unwrap() = Some(health::spawn(live.registry.nodes.clone(), health_cfg));
-            spawn_signal_handlers(sh, cfg_path, proxy_override, health_task);
-            if let Some(fd) = exit_fd {
-                spawn_exit_signal_task(fd, main_pid, witness);
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
-    }
+    rt.block_on(async {
+        let prober = start_services(&sh, &tun, listener, forwards, cfg.health.clone())?;
+        spawn_signal_handlers(sh.clone(), args.config.clone(), proxy_override, prober);
+        if let Some(fd) = exit_fd {
+            signals::spawn_exit_signal_task(fd, main_pid.clone(), witness);
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
     let (tun_sh, handle) = (sh.clone(), rt.handle().clone());
     std::thread::Builder::new()
         .name("tun".into())
@@ -253,109 +211,60 @@ pub fn run(args: Args) -> Result<Exit> {
     tracing::info!(tun = %addrs.tun, dns = %addrs.dns, "namespace up");
     child.go()?;
 
-    let exit = wait_tree(child.pid, &main_pid, tree_witness.as_deref());
+    let exit = signals::wait_tree(child.pid, &main_pid, tree_witness.as_deref());
     rt.shutdown_background();
     Ok(exit)
 }
 
-/// How proxytun ends: as the program did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Exit {
-    Code(i32),
-    /// Killed by this signal.
-    Signal(libc::c_int),
-}
-
-/// End the process as `exit` says. Killed by a signal, the program has us
-/// end by the same one, as timeout(1) and sudo do: a shell sees WIFSIGNALED
-/// (bash stops a loop on Ctrl+C only then), and a service stopped with
-/// SIGTERM counts as stopped, not failed. Without a core dump of ours.
-pub fn finish(exit: Exit) -> ! {
-    let sig = match exit {
-        Exit::Code(c) => std::process::exit(c),
-        Exit::Signal(sig) => sig,
-    };
-    // SAFETY: plain syscalls on our own process.
-    unsafe {
-        let none = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        libc::setrlimit(libc::RLIMIT_CORE, &none);
-        libc::signal(sig, libc::SIG_DFL);
-        let set = crate::sys::sigset(&[sig]);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-        libc::raise(sig);
-    }
-    // A signal whose default is not to end a process (SIGCHLD, SIGWINCH).
-    std::process::exit(128 + sig)
-}
-
-/// Wait until every process of the program's tree is gone (we are their
-/// subreaper) and return how the program itself ended. Once it has, the
-/// witness is let go: should it be our child too (we are a pid namespace's
-/// init, or were made a subreaper), it is part of what we wait for.
-fn wait_tree(main: libc::pid_t, main_pid: &AtomicI32, witness: Option<&Witness>) -> Exit {
-    let (mut main, mut exit) = (Some(main), Exit::Code(1));
-    loop {
-        let mut status = 0;
-        // SAFETY: plain syscall.
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
-        if pid < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+/// Start the program in its namespace, waiting for the go-ahead: through a
+/// user namespace of our own, or where that is unusable, through sudo and
+/// its root helper (unless `no_sudo`).
+fn spawn_program(setup: &Setup, no_sudo: bool) -> Result<(netns::Child, netns::Handover)> {
+    match netns::spawn(setup) {
+        Err(e) if e.is::<UsernsUnusable>() => {
+            if no_sudo {
+                return Err(e.context("--no-sudo forbids falling back to sudo"));
             }
-            return exit; // ECHILD: nobody left
-        }
-        // Once only: its pid may be reused by a later child of the tree.
-        if main == Some(pid) {
-            main = None;
-            exit = if libc::WIFEXITED(status) {
-                Exit::Code(libc::WEXITSTATUS(status))
-            } else {
-                Exit::Signal(libc::WTERMSIG(status))
-            };
-            main_pid.store(0, Ordering::SeqCst);
-            tracing::info!(?exit, "program exited");
-            if let Some(w) = witness {
-                w.stop();
+            tracing::warn!("{e}; asking sudo to create the namespace (--no-sudo refuses)");
+            let (child, ns, joined) = sudo::spawn(setup)?;
+            if !joined {
+                tracing::warn!(
+                    "sudo started the program in a terminal session of its own (sudoers `use_pty`?): \
+                     it now runs in a session of its own without a controlling terminal: proxytun \
+                     passes Ctrl+C and Ctrl+\\ on to it, but job control (Ctrl+Z) and window size \
+                     changes do not reach it, and programs that open /dev/tty (password prompts of \
+                     ssh, git, sudo) fail"
+                );
             }
+            Ok((child, ns))
         }
+        r => r,
     }
 }
 
-/// Which of `sigs` are ignored right now. A caller that ignores a signal
-/// (`cmd &` in a script ignores SIGINT/SIGQUIT, nohup ignores SIGHUP) means the
-/// program should start with it ignored too, as it would if run directly.
-fn ignored_signals(sigs: &[libc::c_int]) -> Vec<libc::c_int> {
-    sigs.iter()
-        .copied()
-        .filter(|&s| unsafe {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            libc::sigaction(s, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
-        })
-        .collect()
-}
-
-/// SIGINT, SIGQUIT and SIGTERM are read from a signalfd rather than through a
-/// tokio handler: whether to forward one depends on who sent it (`ssi_code`),
-/// which tokio does not report. They are blocked here, before any thread
-/// exists, so every thread inherits the mask (netns.rs unblocks them again for
-/// the program). Signals the caller ignores are left ignored and not handled.
-fn exit_signal_fd(sigs: &[libc::c_int]) -> Option<OwnedFd> {
-    if sigs.is_empty() {
-        return None;
+/// Serve the namespace, on the runtime: the relay's and the host ports'
+/// accept loops, the sweeper, and health probes of the proxies. Returns the
+/// prober, which SIGHUP replaces.
+fn start_services(
+    sh: &Arc<Shared>,
+    tun: &Arc<OwnedFd>,
+    listener: std::net::TcpListener,
+    forwards: Vec<(SocketAddr, std::net::TcpListener)>,
+    health_cfg: HealthCfg,
+) -> Result<tokio::task::JoinHandle<()>> {
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+    tokio::spawn(capture::run_relay(listener, sh.clone()));
+    for (addr, l) in forwards {
+        l.set_nonblocking(true)?;
+        tokio::spawn(hostports::serve(
+            tokio::net::TcpListener::from_std(l)?,
+            addr,
+            sh.clone(),
+        ));
     }
-    unsafe {
-        let set = crate::sys::sigset(sigs);
-        let fd = libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
-        if fd < 0 {
-            tracing::warn!("signalfd: {}", std::io::Error::last_os_error());
-            return None;
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        Some(OwnedFd::from_raw_fd(fd))
-    }
+    tokio::spawn(capture::run_sweeper(tun.clone(), sh.clone()));
+    Ok(health::spawn(sh.live().registry.nodes.clone(), health_cfg))
 }
 
 /// Every relayed connection holds two fds, and the usual soft limit is 1024.
@@ -428,138 +337,22 @@ fn fd_target(now: libc::rlimit, nr_open: Option<libc::rlim_t>) -> Option<libc::r
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ExitSignal {
-    /// End now, by the signal received. The program's tree keeps running,
-    /// cut off from the network (the TUN device goes with us).
-    Exit,
-    /// From the terminal, to our whole foreground group: pass it on only if
-    /// the program is not in that group (see `forward_to`).
-    Terminal,
-    /// From a process: pass it on unless it got it too.
-    Forward,
-}
-
-/// SIGINT / SIGQUIT / SIGTERM never stop proxytun while the main program runs:
-/// the program decides, and proxytun exits when its tree is gone. `code` is
-/// the sender's si_code; `terms` counts SIGTERMs so far.
-fn on_exit_signal(sig: libc::c_int, code: i32, program_running: bool, terms: u32) -> ExitSignal {
-    // Nobody left to decide (e.g. only a background child keeps us waiting),
-    // or a second SIGTERM: whoever sent it wants us gone.
-    if !program_running || (sig == libc::SIGTERM && terms >= 2) {
-        return ExitSignal::Exit;
-    }
-    // Sent by the kernel: the terminal's Ctrl+C / Ctrl+\ signals the whole
-    // foreground group, the program included if it is still in it.
-    if code == libc::SI_KERNEL {
-        return ExitSignal::Terminal;
-    }
-    // From a process: `kill <proxytun>`, or `kill -- -<group>` / `kill %1` /
-    // systemd, which look the same from here.
-    ExitSignal::Forward
-}
-
-/// Where to pass on a signal we got, if anywhere (a pid, or minus a process
-/// group). Sent to our whole group (`to_group`: by the terminal, or the
-/// witness has it), the program has it too if it is still in that group.
-/// From the terminal (`terminal`: Ctrl+C) while the program leads a group of
-/// its own (sudo's `use_pty` gave it a session of its own), that whole group
-/// gets it, as the terminal would have done: a pipeline or a child is no
-/// less interrupted there. A group signal from a process may have reached
-/// every process already (systemd signals each one of a service): the
-/// program alone gets the copy we pass on. Sent to proxytun alone: the
-/// program.
-fn forward_to(
-    to_group: bool,
-    terminal: bool,
-    program: libc::pid_t,
-    program_pgrp: Option<libc::pid_t>,
-    our_pgrp: libc::pid_t,
-) -> Option<libc::pid_t> {
-    match program_pgrp {
-        Some(p) if to_group && p == our_pgrp => None,
-        Some(p) if terminal && p == program => Some(-p),
-        _ => Some(program),
-    }
-}
-
-/// How long to wait before asking the witness: a group-wide signal is
-/// delivered to the members one after another, and we may run first.
-const WITNESS_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option<Arc<Witness>>) {
-    tokio::spawn(async move {
-        // SAFETY: an OwnedFd stays open and is the same fd for as long as the
-        // AsyncFd owns it.
-        let afd = match unsafe { tokio::io::unix::AsyncFd::register(fd) } {
-            Ok(a) => a,
-            Err(e) => return tracing::warn!("cannot watch the signalfd: {e}"),
-        };
-        let mut terms = 0;
-        loop {
-            let Ok(mut ready) = afd.readable().await else { return };
-            // SAFETY: a plain C struct of integers, filled by read().
-            let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<libc::signalfd_siginfo>();
-            let n = unsafe { libc::read(afd.as_raw_fd(), &mut info as *mut _ as *mut libc::c_void, size) };
-            if n != size as isize {
-                ready.clear_ready(); // EAGAIN: drained
-                continue;
-            }
-            let sig = info.ssi_signo as libc::c_int;
-            if sig == libc::SIGTERM {
-                terms += 1;
-            }
-            let pid = main_pid.load(Ordering::SeqCst);
-            let action = on_exit_signal(sig, info.ssi_code, pid > 0, terms);
-            if action == ExitSignal::Exit {
-                tracing::info!(sig, "exiting on a signal");
-                finish(Exit::Signal(sig))
-            }
-            let (witness, main_pid) = (witness.clone(), main_pid.clone());
-            tokio::spawn(async move {
-                tokio::time::sleep(WITNESS_DELAY).await;
-                // Reaped meanwhile: the pid may already be someone else's.
-                if main_pid.load(Ordering::SeqCst) != pid {
-                    return;
-                }
-                let terminal = action == ExitSignal::Terminal;
-                // Asking the witness blocks (a second at most): not on a
-                // runtime worker.
-                let saw = match (&witness, terminal) {
-                    (Some(w), false) => {
-                        let w = w.clone();
-                        tokio::task::spawn_blocking(move || w.saw(sig)).await.unwrap_or(false)
-                    }
-                    _ => false,
-                };
-                // SAFETY: plain syscall.
-                let ours = unsafe { libc::getpgrp() };
-                if let Some(to) = forward_to(terminal || saw, terminal, pid, procfs::pgrp_of(pid), ours) {
-                    tracing::debug!(sig, to, "forwarding the signal to the program");
-                    unsafe { libc::kill(to, sig) };
-                }
-                if let Some(w) = witness {
-                    w.clear();
-                }
-            });
-        }
-    });
-}
-
-/// SIGHUP reloads rules and proxy groups, SIGUSR1 dumps statistics. SIGINT,
-/// SIGQUIT and SIGTERM: see `spawn_exit_signal_task`.
+/// SIGHUP reloads rules and proxy groups, replacing `prober` (the health
+/// probes) with one for the new proxies; SIGUSR1 dumps statistics. SIGINT,
+/// SIGQUIT and SIGTERM: see `signals::spawn_exit_signal_task`.
 fn spawn_signal_handlers(
     sh: Arc<Shared>,
     cfg_path: PathBuf,
     proxy_override: Option<String>,
-    health_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    mut prober: tokio::task::JoinHandle<()>,
 ) {
     use tokio::signal::unix::{signal, SignalKind};
     let (Ok(mut hup), Ok(mut usr1)) = (signal(SignalKind::hangup()), signal(SignalKind::user_defined1())) else {
         tracing::warn!("cannot install signal handlers");
         return;
     };
+    // The counters at the previous dump, for rates.
+    let mut prev = capture::Snapshot::zero();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -568,15 +361,14 @@ fn spawn_signal_handlers(
                         Ok((c, live)) => {
                             let nodes = live.registry.nodes.clone();
                             *sh.live.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(live);
-                            let mut slot = health_task.lock().unwrap();
-                            if let Some(h) = slot.take() { h.abort(); }
-                            *slot = Some(health::spawn(nodes, c.health.clone()));
+                            prober.abort();
+                            prober = health::spawn(nodes, c.health.clone());
                             tracing::info!("configuration reloaded (rules, localnet, proxies, groups; fake_ip_range and upstream_dns need a restart)");
                         }
                         Err(e) => tracing::error!("reload failed, keeping the old configuration: {e:#}"),
                     }
                 }
-                _ = usr1.recv() => capture::log_stats(&sh),
+                _ = usr1.recv() => capture::log_stats(&sh, &mut prev),
             }
         }
     });
@@ -585,54 +377,6 @@ fn spawn_signal_handlers(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SI_USER: i32 = 0;
-
-    #[test]
-    fn exit_signals_are_left_to_the_running_program() {
-        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
-            // Ctrl+C / Ctrl+\ on the terminal: the program got it too.
-            assert_eq!(on_exit_signal(sig, libc::SI_KERNEL, true, 1), ExitSignal::Terminal);
-            // kill(2) from some process: maybe only we got it.
-            assert_eq!(on_exit_signal(sig, SI_USER, true, 1), ExitSignal::Forward);
-            // Main program gone (a background child keeps us waiting): exit,
-            // or Ctrl+C would do nothing at all.
-            assert_eq!(on_exit_signal(sig, SI_USER, false, 1), ExitSignal::Exit);
-            assert_eq!(on_exit_signal(sig, libc::SI_KERNEL, false, 1), ExitSignal::Exit);
-        }
-        assert_eq!(
-            on_exit_signal(libc::SIGTERM, SI_USER, true, 2),
-            ExitSignal::Exit,
-            "second SIGTERM"
-        );
-        assert_eq!(
-            on_exit_signal(libc::SIGINT, SI_USER, true, 2),
-            ExitSignal::Forward,
-            "only SIGTERM counts"
-        );
-    }
-
-    #[test]
-    fn a_signal_is_only_held_back_when_the_program_shares_our_group() {
-        // Program 50; our group 7. (to_group, terminal, ...)
-        // Sent to the group, and the program is in it: it has its own copy.
-        assert_eq!(forward_to(true, false, 50, Some(7), 7), None);
-        assert_eq!(forward_to(true, true, 50, Some(7), 7), None);
-        // Sent to proxytun alone.
-        assert_eq!(forward_to(false, false, 50, Some(7), 7), Some(50));
-        // Ctrl+C, the program leading a group of its own (sudo's use_pty):
-        // that whole group gets it, its pipeline too.
-        assert_eq!(forward_to(true, true, 50, Some(50), 7), Some(-50));
-        // A group signal from a process (systemd's, one to each process):
-        // the others may have theirs already; the program alone.
-        assert_eq!(forward_to(true, false, 50, Some(50), 7), Some(50));
-        // Moved into someone else's group: the program alone.
-        assert_eq!(forward_to(true, true, 50, Some(9), 7), Some(50));
-        // Program already gone: nothing to hold back for.
-        assert_eq!(forward_to(true, false, 50, None, 7), Some(50));
-        // Sent to proxytun alone, the program leading its own group: only it.
-        assert_eq!(forward_to(false, false, 50, Some(50), 7), Some(50));
-    }
 
     #[test]
     fn the_relay_cap_follows_the_open_file_limit() {

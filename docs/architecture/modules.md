@@ -14,22 +14,28 @@
 ```mermaid
 flowchart LR
     subgraph BIN["crates/proxytun"]
-        MAIN["main.rs<br/>命令行, 日志"] --> APP["app.rs<br/>组装与生命周期"]
+        MAIN["main.rs<br/>命令行, 入口分派"] --> APP["app.rs<br/>组装与生命周期"]
+        MAIN --> LOG["logging.rs<br/>日志写入"]
+        MAIN --> SIG["signals.rs<br/>退出, 信号转发"]
+        APP --> SIG
         APP --> NETNS["netns.rs<br/>准备进程"]
         APP --> SUDO["sudo.rs<br/>特权助手"]
         APP --> CAP["capture.rs<br/>TUN 循环, 中继 accept"]
         APP --> HP["hostports.rs<br/>主机端口"]
         APP --> WIT["witness.rs<br/>见证进程"]
+        SIG --> WIT
         MAIN --> DOC["doctor.rs<br/>自检"]
+        DOC --> APP
         NETNS --> NETCFG["netcfg.rs<br/>ioctl 配网"]
         SUDO --> NETNS
         CAP --> NAT["nat.rs<br/>地址改写表"]
+        NETNS --> NAT
         CAP --> PKT["packet.rs<br/>包解析与改写"]
-        APP --> PFS["procfs.rs<br/>/proc 解析"]
+        SIG --> PFS["procfs.rs<br/>/proc 解析"]
         SUDO --> PFS
         NETNS --> PFS
         DOC --> PFS
-        APP --> SYS["sys.rs<br/>pipe, sigset"]
+        SIG --> SYS["sys.rs<br/>pipe, sigset"]
         SUDO --> SYS
         WIT --> SYS
         HP --> NETNS
@@ -79,9 +85,11 @@ flowchart LR
 
 | 文件 | 职责 |
 |---|---|
-| `main.rs` | 命令行解析(程序名之后的参数原样交给程序)、日志初始化(stderr 从不阻塞的写入器)、拒绝经 sudo / setuid 以 root 运行、分派内部入口 |
-| `app.rs` | 把各部分接起来：读配置与 `--proxy` 覆盖、建命名空间(userns 或 sudo)、提高 fd 上限并算出中继上限、启动 tokio 与 tun 线程、放行程序、等整棵进程树、按程序的方式退出;SIGHUP 热加载、SIGUSR1 统计、INT/QUIT/TERM 的转发判断 |
-| `netns.rs` | 准备进程：fork 后重新 exec 自己，建 user / 网络 / 挂载命名空间，写 `resolv.conf` 并 bind mount,建 TUN 与捕获监听，经 socketpair 交回 fd,等放行后 exec 程序;exec 前恢复信号屏蔽和调用方的 SIGPIPE 处置 |
+| `main.rs` | 命令行解析(程序名之后的参数原样交给程序)、拒绝经 sudo / setuid 以 root 运行、分派内部入口、`--doctor` 与正常运行 |
+| `logging.rs` | 日志初始化：stderr 从不阻塞、从不失败的写入器(见 [6.5](lifecycle.md#65-日志的写入)),或追加写 `--log-file` |
+| `app.rs` | 把各部分接起来：读配置与 `--proxy` 覆盖、建命名空间(userns,不能用时 sudo)、提高 fd 上限并算出中继上限、启动 tokio 上的服务(中继、主机端口、清扫、健康探测)与 tun 线程、放行程序;SIGHUP 热加载(并换掉健康探测)、SIGUSR1 统计 |
+| `signals.rs` | 退出与 INT/QUIT/TERM:在任何线程之前屏蔽、改由 signalfd 读取，判断要不要转发给程序(问见证进程),等整棵进程树，按程序的方式退出(第 6 节) |
+| `netns.rs` | proxytun 自己的地址(`Addrs`:假 IP 范围最后一个 /24,假 IP 池不分配);准备进程：fork 后重新 exec 自己，建 user / 网络 / 挂载命名空间，写 `resolv.conf` 并 bind mount,建 TUN 与捕获监听，经 socketpair 交回 fd,等放行后 exec 程序;exec 前恢复信号屏蔽和调用方的 SIGPIPE 处置 |
 | `netcfg.rs` | 用 ioctl 配网(不依赖 `ip` 命令和 netlink):建 TUN、地址与 MTU、链路 up、默认路由、绑定监听 |
 | `sudo.rs` | sudo 模式：proxytun 一侧(私有目录里的 unix socket、调 sudo、发请求)与 root 助手一侧(校验调用者、建命名空间、让降权后的程序接收请求和 fd) |
 | `capture.rs` | tun 线程的包循环(TCP 改写、UDP 53 派给假 DNS、其他 UDP 回 ICMP),中继的 accept 循环与并发槽位、假 IP 反查并钉住、TCP DNS 分派，改写表清扫，统计 |
@@ -89,9 +97,9 @@ flowchart LR
 | `packet.rs` | IPv4 / TCP / UDP 头的解析、地址改写与增量校验和，构造 RST、UDP 应答、ICMP 端口不可达 |
 | `hostports.rs` | 启动时扫描主机上回环与通配地址的监听(`/proc/net/tcp`、`tcp6`),算出命名空间里要开的地址(监听由准备进程或特权助手绑定);accept 后把连接转到主机 |
 | `witness.rs` | 见证进程:double-fork、改名为 `signal-witness`、屏蔽 INT/QUIT/TERM,经管道回答"有哪些待处理信号" |
-| `doctor.rs` | `--doctor`:按真实路径建一次命名空间跑 `true`,报告模式、TUN、Yama、主机端口、每个代理 |
+| `doctor.rs` | `--doctor`:配置读不了或有错时记一项 FAIL,仍用默认设置检查主机;按真实路径建一次命名空间跑 `true`,报告模式、TUN、Yama、主机端口、每个代理 |
 | `procfs.rs` | 解析 `/proc/<pid>/stat` 里的父进程、进程组、会话(从最后一个 `)` 往后数，程序名含空格和括号也不错位)与内核版本号;信号转发、sudo 助手(校验调用者、加入进程组)、挂载传播方式、自检都用它 |
-| `sys.rs` | 几个模块共用的 libc 薄封装:close-on-exec 的管道(sudo 助手、见证进程)、由信号列表构造 `sigset_t`(app、见证进程) |
+| `sys.rs` | 几个模块共用的 libc 薄封装:close-on-exec 的管道(sudo 助手、见证进程)、由信号列表构造 `sigset_t`(signals、见证进程) |
 
 ### 4.3 `crates/proxytun-core` 各模块
 
