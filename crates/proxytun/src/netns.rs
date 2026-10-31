@@ -527,8 +527,7 @@ fn raise_somaxconn() {
 /// Point /etc/resolv.conf at `dns` in our own mount namespace. The file is
 /// written here, by whoever sets up the namespace (root, for sudo), never
 /// taken from a path someone else chose. Mount events must not propagate
-/// back to the host, hence MS_SLAVE first: the host's still reach us (an
-/// automounted share, a USB disk), ours never reach the host.
+/// back to the host: see `propagation`.
 fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
     use nix::mount::{mount, MsFlags};
     use std::io::Write;
@@ -559,10 +558,10 @@ fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
         None::<&str>,
         "/",
         None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_SLAVE,
+        MsFlags::MS_REC | propagation(&std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default()),
         None::<&str>,
     )
-    .context("make mounts one-way (slave)")?;
+    .context("cut mount propagation to the host")?;
     // The target may be a symlink (systemd-resolved, WSL): mount follows it.
     // The mount keeps the file alive after `dir` is removed.
     mount(
@@ -604,6 +603,19 @@ fn sigpipe_disposition(ignored: bool) -> libc::sighandler_t {
         libc::SIG_IGN
     } else {
         libc::SIG_DFL
+    }
+}
+
+/// How our mounts relate to the host's, on kernel `release`: slave, so the
+/// host's later mounts reach us (an automounted share, a USB disk) and ours
+/// never reach the host. Before Linux 4.11 a mount propagated onto
+/// /etc/resolv.conf (a VPN script binding its own there) would go on top of
+/// ours, and the program would bypass our DNS; since, it goes underneath.
+/// There: private, the host's later mounts staying out.
+fn propagation(release: &str) -> nix::mount::MsFlags {
+    match crate::doctor::parse_kernel(release) {
+        Some(v) if v >= (4, 11) => nix::mount::MsFlags::MS_SLAVE,
+        _ => nix::mount::MsFlags::MS_PRIVATE,
     }
 }
 
@@ -654,6 +666,16 @@ mod tests {
         );
         let a = Addrs::new("10.20.0.0/22".parse().unwrap());
         assert_eq!(a.tun, Ipv4Addr::new(10, 20, 3, 1));
+    }
+
+    #[test]
+    fn host_mounts_come_in_only_where_they_cannot_cover_our_resolv_conf() {
+        use nix::mount::MsFlags;
+        assert_eq!(propagation("6.18.54.1-microsoft-standard-WSL2"), MsFlags::MS_SLAVE);
+        assert_eq!(propagation("4.11.0"), MsFlags::MS_SLAVE);
+        assert_eq!(propagation("4.10.17"), MsFlags::MS_PRIVATE);
+        assert_eq!(propagation("3.10.0-1160.el7.x86_64"), MsFlags::MS_PRIVATE, "CentOS 7");
+        assert_eq!(propagation(""), MsFlags::MS_PRIVATE, "unknown: the safe one");
     }
 
     #[test]

@@ -771,11 +771,54 @@ fn adopt_limits(limits: &[libc::rlimit]) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// A session keyring of our own. pam_keyinit (RHEL's /etc/pam.d/sudo) may
-/// have given the helper root's, with root's user keyring linked into it;
-/// session keyrings survive fork, setuid and exec.
-fn own_session_keyring() -> std::result::Result<(), String> {
+/// What becomes of the session keyring the program would inherit, given its
+/// description (`KEYCTL_DESCRIBE`: "type;uid;gid;perm;name") or why there is
+/// none to read. pam_keyinit (RHEL's /etc/pam.d/sudo) may have given the
+/// helper root's, with root's user keyring linked into it: replaced. The
+/// caller's own (sudo without pam_keyinit) stays, as in userns mode. One we
+/// cannot look at (keyctl filtered out, as Docker's default seccomp profile
+/// does) might be root's: refused.
+fn keyring_action(described: std::result::Result<String, i32>, uid: libc::uid_t) -> std::result::Result<bool, String> {
+    match described {
+        Ok(d) => Ok(d.split(';').nth(1).and_then(|o| o.parse::<libc::uid_t>().ok()) != Some(uid)),
+        // A kernel without keyrings: no root's to reach either.
+        Err(libc::ENOSYS) => Ok(false),
+        Err(e @ (libc::EPERM | libc::EACCES)) => Err(format!(
+            "cannot tell whose session keyring the program would get ({}); in a container, \
+             allow keyctl in its seccomp profile",
+            std::io::Error::from_raw_os_error(e)
+        )),
+        // Revoked, expired: a new one does no harm.
+        Err(_) => Ok(true),
+    }
+}
+
+/// A session keyring the user may have: see `keyring_action`. Runs as the
+/// user already, so a new keyring is theirs.
+fn own_session_keyring(uid: libc::uid_t) -> std::result::Result<(), String> {
     const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+    const KEYCTL_DESCRIBE: libc::c_long = 6;
+    const KEY_SPEC_SESSION_KEYRING: libc::c_long = -3;
+    let mut buf = [0u8; 4096];
+    // SAFETY: the kernel writes at most `buf.len()` bytes.
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_DESCRIBE,
+            KEY_SPEC_SESSION_KEYRING,
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+    let described = if n < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        let text = &buf[..(n as usize).min(buf.len())];
+        Ok(String::from_utf8_lossy(text.strip_suffix(&[0]).unwrap_or(text)).into_owned())
+    };
+    if !keyring_action(described, uid)? {
+        return Ok(());
+    }
     // SAFETY: a NULL name asks for a new anonymous keyring.
     let r = unsafe {
         libc::syscall(
@@ -784,12 +827,13 @@ fn own_session_keyring() -> std::result::Result<(), String> {
             std::ptr::null::<libc::c_char>(),
         )
     };
-    let e = std::io::Error::last_os_error();
-    // ENOSYS: a kernel without keyrings, no root's to reach either.
-    if r >= 0 || e.raw_os_error() == Some(libc::ENOSYS) {
-        return Ok(());
+    if r < 0 {
+        return Err(format!(
+            "leaving root's session keyring: {}",
+            std::io::Error::last_os_error()
+        ));
     }
-    Err(format!("leaving root's session keyring: {e}"))
+    Ok(())
 }
 
 /// Write the report to the parent (see `read_report`) and close the pipe,
@@ -866,7 +910,7 @@ fn become_program(
         if (r, e, s) != (who.uid, who.uid, who.uid) || libc::setuid(0) == 0 {
             return fail("privileges were not dropped".into());
         }
-        if let Err(e) = own_session_keyring() {
+        if let Err(e) = own_session_keyring(who.uid) {
             return fail(e);
         }
         if !capabilities_gone(std::fs::read_to_string("/proc/self/status").ok().as_deref()) {
@@ -1135,6 +1179,24 @@ mod tests {
         // A fd limit of 0 leaves /proc unreadable: that proves nothing.
         assert!(!capabilities_gone(None));
         assert!(!capabilities_gone(Some("")));
+    }
+
+    #[test]
+    fn only_the_callers_own_session_keyring_reaches_the_program() {
+        let desc = |uid: u32| Ok(format!("keyring;{uid};{uid};3f030000;_ses"));
+        assert_eq!(keyring_action(desc(1000), 1000), Ok(false), "the caller's: kept");
+        assert_eq!(
+            keyring_action(desc(0), 1000),
+            Ok(true),
+            "root's (pam_keyinit): replaced"
+        );
+        assert_eq!(keyring_action(desc(1001), 1000), Ok(true), "anyone else's: replaced");
+        assert_eq!(keyring_action(Ok("garbage".into()), 1000), Ok(true));
+        assert_eq!(keyring_action(Err(libc::ENOSYS), 1000), Ok(false), "no keyrings at all");
+        assert_eq!(keyring_action(Err(libc::EKEYREVOKED), 1000), Ok(true));
+        // keyctl filtered out (a container): it might be root's; refused.
+        assert!(keyring_action(Err(libc::EPERM), 1000).unwrap_err().contains("seccomp"));
+        assert!(keyring_action(Err(libc::EACCES), 1000).is_err());
     }
 
     #[test]

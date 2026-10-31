@@ -69,14 +69,19 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
     端口非 0 非 53、不重复、最多 250 个。
   - socket 收发超时 10 秒,客户端不说话时 root 进程不会一直挂着;程序读完请求后清除超时,因为它等放行要多久都行。
   - 不读配置、不写日志、不以 root 打开用户给的任何路径;程序先降权(附加组 → gid → uid,确认 `setuid(0)` 失败且 CapPrm/CapEff 为 0;
-    读不到 `/proc/self/status`,例如调用者把 fd 上限设为 0,也按失败处理),换上一个自己的会话 keyring(RHEL 的 `/etc/pam.d/sudo` 里
-    `pam_keyinit` 可能给助手建了 root 的会话 keyring 并链着 root 的 user keyring,会话 keyring 跨 fork、setuid、exec 保留;
-    只有内核不支持 keyring 的 ENOSYS 放过,其余错误一律拒绝),再设置 `PR_SET_NO_NEW_PRIVS`:命名空间里的网络(DNS、路由)完全由用户的 proxytun 控制,setuid 程序(sudo、su,或经 LDAP/Kerberos 认证的 PAM)
+    读不到 `/proc/self/status`,例如调用者把 fd 上限设为 0,也按失败处理),检查会话 keyring(RHEL 的 `/etc/pam.d/sudo` 里
+    `pam_keyinit` 可能给助手建了 root 的会话 keyring 并链着 root 的 user keyring,会话 keyring 跨 fork、setuid、exec 保留):
+    属于调用者的(sudo 没配 pam_keyinit 时继承下来的)保留,与 userns 模式一致;属于别人(root)的换成用户自己的新 keyring;
+    内核不支持 keyring(ENOSYS)时放过;keyctl 被过滤(EPERM/EACCES,如 Docker 默认的 seccomp)、看不出属于谁时拒绝运行
+    (第六轮复查,用户决定 A:原先一律换成空 keyring,调用者的 CIFS/AFS/Kerberos 凭据随之丢失;keyctl 被过滤时原先也是拒绝,
+    现在报错说明要在容器的 seccomp 配置里放行 keyctl)。再设置 `PR_SET_NO_NEW_PRIVS`:命名空间里的网络(DNS、路由)完全由用户的 proxytun 控制,setuid 程序(sudo、su,或经 LDAP/Kerberos 认证的 PAM)
     在里面拿到 root 就等于用户拿到 root。之后以用户身份 `chdir`、查 PATH、`exec`。
   - root 进程写 `resolv.conf` 一律放在 `/tmp` 下(不看 `$TMPDIR`):在用户能控制的目录里,mkdtemp 建的目录可能在写入前被换成指向 `/etc` 的链接;
     粘滞位的 `/tmp` 里别人改不了我们的目录名。文件用 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建,权限经 fd 设置。
-  - root 模式下先把挂载传播设为 slave,否则 bind-mount 的 `resolv.conf` 会传播回主机。第五轮复查前设为 private,
-    主机之后的挂载(autofs、插上的 U 盘)也传不进来;slave 是单向的。
+  - root 模式下先切断挂载传播,否则 bind-mount 的 `resolv.conf` 会传播回主机。第五轮复查改为 slave(单向:主机之后的挂载,
+    如 autofs、插上的 U 盘,能传进来),第六轮复查补正(用户决定 A):只在 4.11 及以后的内核用 slave,之前的内核(CentOS 7 的 3.10)
+    仍用 private。4.11 以前,主机之后在 `/etc/resolv.conf` 上的挂载(VPN 脚本绑定自己的 resolv.conf)传进来会叠在我们的挂载之上,
+    程序绕开假 DNS;4.11 起传进来的挂载放在已有挂载之下。本机(6.x)有端到端测试;3.10 上的行为没有在真机上核实。
   - 安装要求:sudo 以 root 执行的是 proxytun 自己的文件,必须放在只有 root 能写的位置;免密码的 sudoers 规则只放行
     `/usr/local/bin/proxytun __proxytun_root_setup *`(多余参数会被助手拒绝)。
   - sudoers 开了 `use_pty` 时,sudo 的监控进程在新会话里以新伪终端为控制终端运行助手;助手退出后监控进程(会话首进程)随之退出,

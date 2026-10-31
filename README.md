@@ -61,13 +61,14 @@ sudo 模式的安全边界:
   它自己的祖先进程,且属于 `SUDO_UID`,否则直接断开、什么也不告诉对方。程序的 gid 和附加组取自你的进程在 `/proc` 里的记录,
   不信任请求里自报的身份。
 - 请求的每个字段都重新校验(假 IP 段 /8–/22、进程组必须是调用者自己的、只转发回环地址且不超过 250 个),10 秒内收不到请求就退出。
-- 不读配置、不以 root 打开你给的任何路径。程序先完全降权、换上自己的会话 keyring 并设置 `no_new_privs`(命名空间里的网络由你控制,
+- 不读配置、不以 root 打开你给的任何路径。程序先完全降权、不带走 root 的会话 keyring(你自己的照常保留)并设置 `no_new_privs`(命名空间里的网络由你控制,
   不能让 `sudo`、`su` 这类 setuid 程序在里面重新拿到 root),再进入你的工作目录、按你的 `PATH` 找程序;助手把 fd 交回后立即退出。
 - root 助手从不接收你传来的 fd:请求和 fd 由已经降为你的身份的程序接收,再把请求内容转给助手。关闭某些 fd 可能一直阻塞
   (设了 linger 的 socket、FUSE 文件),那只会卡住你自己的进程,不会留下杀不掉的 root 进程。
 - 程序在 sudo 模式下看到的进程属性与非 root 模式一致:你的 umask、你继承给 proxytun 的 fd(如 make 的 jobserver、`3<file`,按原编号),
   与你完全相同的资源限制(PAM 或 sudo 给 root 的不同限制,如更多进程数、不许 core dump,都不会带进来)。
   sudoers 给命令设了 SELinux `ROLE`/`TYPE`,或开了 `intercept` / `log_subcmds`(sudo 会跟踪程序或给它加系统调用过滤器)时拒绝运行。
+  系统调用过滤器禁止了 keyctl 时(Docker 默认的 seccomp 配置)也拒绝运行:看不出程序会拿到谁的会话 keyring;容器里请在 seccomp 配置中放行 keyctl。
 
 proxytun 拒绝经 sudo、doas、pkexec 或 setuid 以 root 身份运行(只有特权助手例外),内部的命名空间准备入口也一样:
 即使 sudoers 只放行了 proxytun,也拿不到一个 root 程序。需要 root 模式,请以 root 登录(或 `su -`)后运行。`--no-sudo` 禁止回退到 sudo。

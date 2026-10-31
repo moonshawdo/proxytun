@@ -598,16 +598,25 @@ fn host_mounts_made_later_reach_the_program_and_ours_never_leave() {
     let script = r#"
         mount -t tmpfs none "$D/m" && mount --make-shared "$D/m"
         "$BIN" -c "$D/cfg.toml" -- sh -c '
-            touch "$D/ready"; while [ ! -e "$D/go" ]; do sleep 0.05; done; cat "$D/m/sub/file"' &
+            touch "$D/ready"; while [ ! -e "$D/go" ]; do sleep 0.05; done; cat "$D/m/sub/file"
+            grep nameserver /etc/resolv.conf' &
         until [ -e "$D/ready" ]; do sleep 0.05; done
         mkdir "$D/m/sub" && mount -t tmpfs none "$D/m/sub" && echo late-mount > "$D/m/sub/file"
+        echo "nameserver 127.0.0.53" > "$D/host-resolv" && mount --bind "$D/host-resolv" /etc/resolv.conf
         touch "$D/go"; wait $!; echo "code $?"
         grep -c 198.19.255.53 /etc/resolv.conf"#;
     let mut cmd = Command::new("unshare");
     cmd.args(["-Urm", "--propagation", "shared", "sh", "-c", script]);
     let out = run_cmd(cmd, &[("BIN", BIN), ("D", dir.to_str().unwrap())]);
     let lines: Vec<&str> = out.stdout.lines().collect();
-    assert_eq!(lines, ["late-mount", "code 0", "0"], "{}", out.dump());
+    // A host tool binding its own resolv.conf meanwhile (a VPN script) does
+    // not cover ours: since Linux 4.11 a propagated mount goes underneath.
+    assert_eq!(
+        lines,
+        ["late-mount", "nameserver 198.19.255.53", "code 0", "0"],
+        "{}",
+        out.dump()
+    );
 }
 
 #[test]
@@ -2781,6 +2790,106 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     for c in ["range", "pgrp", "fds"] {
         assert!(!dir.join(format!("ran-{c}")).exists(), "{c}: nothing may run");
     }
+}
+
+/// Join a session keyring named argv[1], then run argv[2:].
+const PY_JOIN_KEYRING: &str = r#"
+import ctypes, os, sys
+if ctypes.CDLL(None, use_errno=True).syscall(250, 1, sys.argv[1].encode()) < 0:  # keyctl JOIN (x86_64)
+    sys.exit("keyctl: %d" % ctypes.get_errno())
+os.execvp(sys.argv[2], sys.argv[2:])
+"#;
+
+/// Print the name of our session keyring.
+const PY_SESSION_KEYRING: &str = r#"
+import ctypes
+buf = ctypes.create_string_buffer(4096)
+n = ctypes.CDLL(None).syscall(250, 6, -3, buf, 4096)  # keyctl DESCRIBE @s (x86_64)
+print(buf.value.decode().split(";")[-1] if n > 0 else "none")
+"#;
+
+/// Run argv[1:] under a syscall filter that fails keyctl with EPERM, as
+/// Docker's default seccomp profile does. Needs CAP_SYS_ADMIN (no
+/// no_new_privs, so that sudo still works under it).
+const PY_NO_KEYCTL: &str = r#"
+import ctypes, os, struct, sys
+ins = lambda code, k, jt=0, jf=0: struct.pack("HBBI", code, jt, jf, k)
+prog = ins(0x20, 0) + ins(0x15, 250, 0, 1) + ins(0x06, 0x00050001) + ins(0x06, 0x7fff0000)
+buf = ctypes.create_string_buffer(prog)
+class Fprog(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+fp = Fprog(len(prog) // 8, ctypes.addressof(buf))
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(22, 2, ctypes.byref(fp), 0, 0) != 0:  # PR_SET_SECCOMP, FILTER
+    sys.exit("seccomp: %d" % ctypes.get_errno())
+os.execvp(sys.argv[1], sys.argv[1:])
+"#;
+
+#[test]
+fn the_callers_own_session_keyring_reaches_the_program_in_either_mode() {
+    require_centos7!("python3");
+    let dir = shared_dir("sudo-own-keyring");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    std::fs::write(dir.join("join.py"), PY_JOIN_KEYRING).unwrap();
+    std::fs::write(dir.join("session.py"), PY_SESSION_KEYRING).unwrap();
+    // Without sudo (user namespaces), as the reference.
+    let mut cmd = Command::new("python3");
+    cmd.arg(dir.join("join.py"))
+        .args(["callers-own", BIN, "-c", dir.join("cfg.toml").to_str().unwrap(), "--"])
+        .arg("python3")
+        .arg(dir.join("session.py"));
+    let plain = run_cmd(cmd, &[]);
+    assert_eq!(
+        (plain.code, plain.stdout.as_str()),
+        (0, "callers-own\n"),
+        "{}",
+        plain.dump()
+    );
+    // Through sudo (without pam_keyinit) the same: not a fresh, empty one.
+    let user = "python3 \"$D/join.py\" callers-own \"$D/pt\" -c \"$D/cfg.toml\" -- python3 \"$D/session.py\"";
+    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", user);
+    assert!(out.stderr.contains("asking sudo"), "{}", out.dump());
+    assert_eq!((out.code, out.stdout.as_str()), (0, "callers-own\n"), "{}", out.dump());
+    // With pam_keyinit's root keyring in between, a fresh one of the user's.
+    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", &format!("FAKE_SUDO_KEYRING=1 {user}"));
+    assert_eq!((out.code, out.stdout.as_str()), (0, "_ses\n"), "{}", out.dump());
+}
+
+#[test]
+fn without_keyctl_the_helper_cannot_check_the_keyring_and_refuses() {
+    require_centos7!("python3");
+    let dir = shared_dir("sudo-no-keyctl");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    std::fs::write(dir.join("no-keyctl.py"), PY_NO_KEYCTL).unwrap();
+    let marker = dir.join("ran");
+    // A container's filter, the caller's and so the helper's too: the
+    // program might be left with root's session keyring, unseen.
+    let sudo_dir = fake_sudo_dir().unwrap();
+    let mut cmd = Command::new("unshare");
+    cmd.stdin(Stdio::null());
+    cmd.args(["--user", "--map-auto", "--map-root-user", "--", "sh", "-c"]);
+    cmd.arg(
+        "echo 0 > /proc/sys/user/max_user_namespaces && PATH=\"$SUDO_DIR:$PATH\" exec python3 \"$D/no-keyctl.py\" \
+         setpriv --reuid=1000 --regid=1000 --groups=1000 -- \"$BIN\" -c \"$CFG\" -- touch \"$MARK\"",
+    );
+    let out = run_cmd(
+        cmd,
+        &[
+            ("BIN", BIN),
+            ("D", dir.to_str().unwrap()),
+            ("CFG", cfg.to_str().unwrap()),
+            ("MARK", marker.to_str().unwrap()),
+            ("SUDO_DIR", sudo_dir.to_str().unwrap()),
+        ],
+    );
+    assert_ne!(out.code, 0, "{}", out.dump());
+    assert!(out.stderr.contains("asking sudo"), "{}", out.dump());
+    assert!(
+        out.stderr.contains("cannot tell whose session keyring"),
+        "{}",
+        out.dump()
+    );
+    assert!(!marker.exists(), "the program must not run");
 }
 
 #[test]
