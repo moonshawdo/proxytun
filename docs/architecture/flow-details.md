@@ -72,7 +72,7 @@ stateDiagram-v2
 
 ### 3.5 中继：一条连接去哪里
 
-捕获监听 accept 到连接后，按下图决定它的去向(`capture.rs` 的 accept 循环与 `relay::route`)。
+捕获监听 accept 到连接后，按下图决定它的去向(`accept.rs` 的 accept 循环与 `relay::route`)。
 
 ```mermaid
 flowchart TD

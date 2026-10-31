@@ -3,8 +3,10 @@
 //! its TCP goes to a SOCKS5/HTTP proxy with domain names preserved. No ptrace,
 //! so strace and gdb keep working.
 
+mod accept;
 mod app;
 mod capture;
+mod ctl;
 mod doctor;
 mod hostports;
 mod logging;
@@ -14,6 +16,7 @@ mod netns;
 mod packet;
 mod procfs;
 mod signals;
+mod state;
 mod sudo;
 mod sys;
 mod witness;

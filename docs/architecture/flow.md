@@ -48,7 +48,7 @@ DEBUG proxytun_core::net::dns: dns: A -> fake ip domain=www.baidu.com ip=198.18.
                     ^ 程序的 A 查询到了假 DNS,分到假 IP
 TRACE proxytun::capture: syn src=198.19.255.1:34830 dst=198.18.0.1:443 nat=198.19.255.2:1024
                     ^ 程序连假 IP,SYN 被改写到改写用的源地址 198.19.255.2:1024
-TRACE conn{id=1}: proxytun::capture: accepted nat=198.19.255.2:1024 dst=198.18.0.1:443
+TRACE conn{id=1}: proxytun::accept: accepted nat=198.19.255.2:1024 dst=198.18.0.1:443
 INFO  conn{id=1 target=Domain("www.baidu.com", 443)}: proxytun_core::net::relay: routing decision=Proxy { group: "default" }
                     ^ 中继按对端地址查回目标，反查出域名，规则判定后交给代理。之后这条连接的每一行都带同一个 conn{…}
 http=200 remote_ip=198.18.0.1

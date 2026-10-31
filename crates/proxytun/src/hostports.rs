@@ -11,11 +11,11 @@
 //! Port 53 is never forwarded (DNS must reach the fake-ip DNS), nor are ports
 //! the user excluded, nor listeners opened after start-up.
 
-use crate::capture::Shared;
+use crate::accept::{accept_with_slot, Relaying};
+use crate::state::Shared;
 use proxytun_core::net::pump;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
@@ -24,7 +24,7 @@ use tracing::Instrument;
 /// The fds of one setup answer must fit in one SCM_RIGHTS message, together
 /// with the TUN device and the capture listener.
 pub const MAX_FORWARDS: usize = 250;
-const _: () = assert!(2 + MAX_FORWARDS <= crate::netns::SCM_MAX_FDS);
+const _: () = assert!(2 + MAX_FORWARDS <= crate::ctl::SCM_MAX_FDS);
 
 const LISTEN: &str = "0A";
 
@@ -113,15 +113,14 @@ pub fn scan(exclude: &[u16]) -> Vec<SocketAddr> {
 pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
     let what = format!("host port {addr}");
     loop {
-        let (inbound, _, slot) = crate::capture::accept_with_slot(&listener, &sh, &what).await;
+        let (inbound, _, slot) = accept_with_slot(&listener, &sh, &what).await;
         let id = sh.next_conn_id();
         let span = tracing::error_span!("conn", id, target = %addr);
         let sh = sh.clone();
         tokio::spawn(
             async move {
                 let _slot = slot;
-                sh.stats.connections.fetch_add(1, Ordering::Relaxed);
-                sh.stats.active.fetch_add(1, Ordering::Relaxed);
+                let _relaying = Relaying::new(&sh, None);
                 tracing::info!("routing to the host's own port");
                 let start = Instant::now();
                 let dialed = TcpStream::connect(addr).await;
@@ -129,7 +128,6 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 // As for relayed connections, an abort is a reset: a host port
                 // closed since startup looks refused, not empty.
                 let _ = pump::finish(inbound, dialed.map_err(Into::into), &sh.traffic, start, dial, "host").await;
-                sh.stats.active.fetch_sub(1, Ordering::Relaxed);
             }
             .instrument(span),
         );
@@ -163,7 +161,7 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let inside = l.local_addr().unwrap();
         let SocketAddr::V4(listen) = inside else { unreachable!() };
-        let sh = Arc::new(crate::capture::tests::shared(listen));
+        let sh = Arc::new(crate::state::tests::shared(listen));
         let gone = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()

@@ -20,15 +20,21 @@ flowchart LR
         APP --> SIG
         APP --> NETNS["netns.rs<br/>准备进程"]
         APP --> SUDO["sudo.rs<br/>特权助手"]
-        APP --> CAP["capture.rs<br/>TUN 循环, 中继 accept"]
+        APP --> CAP["capture.rs<br/>TUN 循环, 清扫"]
+        APP --> ACC["accept.rs<br/>中继 accept, 槽位"]
         APP --> HP["hostports.rs<br/>主机端口"]
+        APP --> STATE["state.rs<br/>Shared, 统计"]
         APP --> WIT["witness.rs<br/>见证进程"]
         SIG --> WIT
         MAIN --> DOC["doctor.rs<br/>自检"]
         DOC --> APP
         NETNS --> NETCFG["netcfg.rs<br/>ioctl 配网"]
         SUDO --> NETNS
+        CAP --> STATE
+        ACC --> STATE
+        HP --> ACC
         CAP --> NAT["nat.rs<br/>地址改写表"]
+        STATE --> NAT
         NETNS --> NAT
         CAP --> PKT["packet.rs<br/>包解析与改写"]
         SIG --> PFS["procfs.rs<br/>/proc 解析"]
@@ -38,7 +44,10 @@ flowchart LR
         SIG --> SYS["sys.rs<br/>pipe, sigset"]
         SUDO --> SYS
         WIT --> SYS
-        HP --> NETNS
+        APP --> CTL["ctl.rs<br/>控制通道"]
+        NETNS --> CTL
+        SUDO --> CTL
+        HP --> CTL
     end
     subgraph CORE["crates/proxytun-core"]
         RELAY["net/relay.rs<br/>route"]
@@ -54,7 +63,8 @@ flowchart LR
         CFG["config/<br/>配置, --proxy URL"]
         ERR["errno.rs<br/>按 errno 分类"]
     end
-    CAP --> RELAY
+    ACC --> RELAY
+    ACC --> DNS
     CAP --> DNS
     HP --> PUMP
     DNS --> FAKE
@@ -72,8 +82,7 @@ flowchart LR
     PRX --> ERR
     HEA --> ERR
     DNS --> ERR
-    CAP --> FAKE
-    HP --> CAP
+    ACC --> FAKE
     MAIN --> NETNS
     MAIN --> SUDO
     APP --> CFG
@@ -90,9 +99,12 @@ flowchart LR
 | `app.rs` | 把各部分接起来：读配置与 `--proxy` 覆盖、建命名空间(userns,不能用时 sudo)、提高 fd 上限并算出中继上限、启动 tokio 上的服务(中继、主机端口、清扫、健康探测)与 tun 线程、放行程序;SIGHUP 热加载(并换掉健康探测)、SIGUSR1 统计 |
 | `signals.rs` | 退出与 INT/QUIT/TERM:在任何线程之前屏蔽、改由 signalfd 读取，判断要不要转发给程序(问见证进程),等整棵进程树，按程序的方式退出(第 6 节) |
 | `netns.rs` | proxytun 自己的地址(`Addrs`:假 IP 范围最后一个 /24,假 IP 池不分配);准备进程：fork 后重新 exec 自己，建 user / 网络 / 挂载命名空间，写 `resolv.conf` 并 bind mount,建 TUN 与捕获监听，经 socketpair 交回 fd,等放行后 exec 程序;exec 前恢复信号屏蔽和调用方的 SIGPIPE 处置 |
+| `ctl.rs` | proxytun 与建命名空间的一方(准备进程;sudo 模式下是特权助手及其 fork 出的程序一侧)之间的控制通道：一个 SOCK_SEQPACKET socket 上带 fd(SCM_RIGHTS)的消息、`OK` / `ERR` 应答(`recv_setup`,读到失败应答时回收准备进程)、放行(`Child::go` / `wait_go`)、列表编码 |
 | `netcfg.rs` | 用 ioctl 配网(不依赖 `ip` 命令和 netlink):建 TUN、地址与 MTU、链路 up、默认路由、绑定监听 |
 | `sudo.rs` | sudo 模式：proxytun 一侧(私有目录里的 unix socket、调 sudo、发请求)与 root 助手一侧(校验调用者、建命名空间、让降权后的程序接收请求和 fd) |
-| `capture.rs` | tun 线程的包循环(TCP 改写、UDP 53 派给假 DNS、其他 UDP 回 ICMP),中继的 accept 循环与并发槽位、假 IP 反查并钉住、TCP DNS 分派，改写表清扫，统计 |
+| `capture.rs` | tun 线程的包循环(TCP 按方向改写：捕获监听回给程序的包、程序发出的包;UDP 53 派给假 DNS、其他 UDP 回 ICMP),改写表清扫 |
+| `accept.rs` | 捕获监听 accept 之后：accept 循环与中继槽位(主机端口转发共用,超出上限立即 RST)、按改写表找回目标、假 IP 反查并钉住、TCP DNS 分派、交给 `relay::route`;中继中的连接(捕获的与主机端口的)各有一个守卫 `Relaying`,无论怎样结束都退出 `active` 计数、关闭改写表条目 |
+| `state.rs` | 共享状态 `Shared`(见 [4.4](#44-共享状态与线程))、同时中继的上限 `MAX_RELAYS`、统计计数(`Stats`),SIGUSR1 时打印总数与速率 |
 | `nat.rs` | 地址改写表：键的分配与回收、条目状态机、到期队列、分批清扫 |
 | `packet.rs` | IPv4 / TCP / UDP 头的解析、地址改写与增量校验和，构造 RST、UDP 应答、ICMP 端口不可达 |
 | `hostports.rs` | 启动时扫描主机上回环与通配地址的监听(`/proc/net/tcp`、`tcp6`),算出命名空间里要开的地址(监听由准备进程或特权助手绑定);accept 后把连接转到主机 |
@@ -122,7 +134,7 @@ flowchart LR
 
 ### 4.4 共享状态与线程
 
-proxytun 进程里各部分通过一个 `Shared` 结构共享状态，主要字段如下(另有监听地址、上游 DNS 地址、日志限速等):
+proxytun 进程里各部分通过一个 `Shared` 结构(`state.rs`)共享状态，主要字段如下(另有监听地址、上游 DNS 地址、日志限速等):
 
 | 状态 | 类型 | 谁在用 |
 |---|---|---|

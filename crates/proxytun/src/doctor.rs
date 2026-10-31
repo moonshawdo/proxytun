@@ -4,7 +4,8 @@
 //! reports the sudo mode instead, without running sudo. Meant to be run once on
 //! a new host (especially CentOS 7) and pasted into a bug report.
 
-use crate::netns::{self, Setup, UsernsUnusable};
+use crate::ctl::UsernsUnusable;
+use crate::netns::{self, Setup};
 use crate::procfs::parse_kernel;
 use crate::{app, hostports};
 use anyhow::Result;

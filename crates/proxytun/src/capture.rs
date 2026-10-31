@@ -1,4 +1,5 @@
-//! Serving the namespace: the TUN packet loop and the relay's accept loop.
+//! Serving the namespace: the TUN packet loop and the sweeper of the
+//! address-rewriting table.
 //!
 //! Every packet the program's kernel routes out of the namespace arrives on
 //! the TUN device:
@@ -9,51 +10,16 @@
 //!   * other UDP gets ICMP port unreachable (QUIC falls back to TCP);
 //!   * everything else (ICMP, IPv6, fragments) is dropped.
 
-use crate::nat::Nat;
 use crate::packet::{self, Packet, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_RST, TCP_SYN};
-use anyhow::{anyhow, bail, Result};
-use proxytun_core::live::Live;
-use proxytun_core::net::dns::{self, DnsStats, Transport};
-use proxytun_core::net::fakeip::{FakeGuard, FakePool};
-use proxytun_core::net::pump::Traffic;
-use proxytun_core::net::relay::{self, Pending};
-use proxytun_core::throttle::{self, Throttle};
-use proxytun_core::types::Target;
-use std::net::{SocketAddr, SocketAddrV4};
+use crate::state::{count, Shared};
+use anyhow::{bail, Result};
+use proxytun_core::net::dns::{self, Transport};
+use proxytun_core::throttle;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
 use tokio::runtime::Handle;
-use tracing::{field, Instrument, Span};
-
-/// Counters for SIGUSR1. Packet counts are for the TUN device; drops are
-/// split by reason, since each points at a different problem.
-#[derive(Default)]
-pub struct Stats {
-    pub connections: AtomicU64,
-    pub active: AtomicU64,
-    pub udp_refused: AtomicU64,
-    pub tun_packets_in: AtomicU64,
-    pub tun_bytes_in: AtomicU64,
-    pub tun_packets_out: AtomicU64,
-    pub tun_bytes_out: AtomicU64,
-    /// Not IPv4, a fragment, or malformed.
-    pub drop_unparsed: AtomicU64,
-    /// IPv4 but neither TCP nor UDP (ICMP...).
-    pub drop_other_proto: AtomicU64,
-    /// TCP for no known connection (a stray packet after the entry expired).
-    pub drop_no_flow: AtomicU64,
-    /// A SYN that found the address-rewriting table full.
-    pub drop_table_full: AtomicU64,
-    /// Connections reset because `MAX_RELAYS` were being relayed already.
-    pub relays_refused: AtomicU64,
-    /// DNS queries being answered now, and those dropped because
-    /// `MAX_DNS_IN_FLIGHT` were.
-    pub dns_in_flight: AtomicU64,
-    pub drop_dns_busy: AtomicU64,
-}
 
 /// At most this many DNS queries are answered at once; more are dropped,
 /// and the resolver asks again. Each is a task holding a copy of the query:
@@ -71,176 +37,6 @@ impl Drop for Answering {
     fn drop(&mut self) {
         self.0.stats.dns_in_flight.fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-/// At most this many connections are relayed at once (captured and host-port
-/// alike): each holds two 64 KiB buffers, and the fd limit no longer stops
-/// them short of the address-rewriting table. 1 GiB of buffers at most.
-pub const MAX_RELAYS: usize = 8192;
-
-/// The counters `log_stats` turns into rates.
-#[derive(Clone, Copy)]
-pub struct Snapshot {
-    at: Instant,
-    connections: u64,
-    tun_packets_in: u64,
-    tun_bytes_in: u64,
-    up: u64,
-    down: u64,
-}
-
-/// Per-second rates between two snapshots (MB = 10^6 bytes).
-#[derive(Debug, PartialEq)]
-pub struct Rates {
-    seconds: f64,
-    connections: f64,
-    tun_packets_in: f64,
-    tun_mb_in: f64,
-    up_mb: f64,
-    down_mb: f64,
-}
-
-impl Snapshot {
-    fn rates_since(&self, prev: &Snapshot) -> Rates {
-        let seconds = self.at.duration_since(prev.at).as_secs_f64().max(1e-3);
-        let per_s = |a: u64, b: u64| a.saturating_sub(b) as f64 / seconds;
-        Rates {
-            seconds,
-            connections: per_s(self.connections, prev.connections),
-            tun_packets_in: per_s(self.tun_packets_in, prev.tun_packets_in),
-            tun_mb_in: per_s(self.tun_bytes_in, prev.tun_bytes_in) / 1e6,
-            up_mb: per_s(self.up, prev.up) / 1e6,
-            down_mb: per_s(self.down, prev.down) / 1e6,
-        }
-    }
-
-    pub fn zero() -> Self {
-        Snapshot {
-            at: Instant::now(),
-            connections: 0,
-            tun_packets_in: 0,
-            tun_bytes_in: 0,
-            up: 0,
-            down: 0,
-        }
-    }
-}
-
-/// State shared by the packet loop, the relay and the signal handlers.
-pub struct Shared {
-    /// The listener captured TCP is rewritten to.
-    pub listen: SocketAddrV4,
-    pub nat: Mutex<Nat>,
-    pub pool: FakePool,
-    pub upstream_dns: SocketAddr,
-    /// Rules and proxies, swapped on SIGHUP.
-    pub live: RwLock<Arc<Live>>,
-    pub stats: Stats,
-    pub dns: DnsStats,
-    pub traffic: Traffic,
-    /// Last connection id handed out (TUN-captured and host-port alike).
-    pub last_id: AtomicU64,
-    /// The full address-rewriting table, reported once in a while.
-    table_full_logged: Throttle,
-    /// accept failing, reported once in a while for all accept loops
-    /// (captured and host ports) together.
-    accept_failed_logged: Throttle,
-    /// Connections refused over `MAX_RELAYS`, likewise.
-    relays_refused_logged: Throttle,
-    /// One per connection being relayed, `MAX_RELAYS` at most (fewer when the
-    /// open-file limit is low: `app::relay_capacity`).
-    pub relay_slots: Arc<tokio::sync::Semaphore>,
-}
-
-/// The next connection on `listener` that may be relayed, with its slot.
-/// accept failing (out of fds) fails again at once while connections wait:
-/// reported now and then, retried after a pause. A connection over
-/// `MAX_RELAYS` is reset, and the next one taken. (Its table entry ends when
-/// the reset passes the TUN device; should the reset be lost there, it is
-/// still waiting to be accepted, and `nat::QUEUED` resets the program.)
-pub async fn accept_with_slot(
-    listener: &TcpListener,
-    sh: &Shared,
-    what: &str,
-) -> (tokio::net::TcpStream, SocketAddr, tokio::sync::OwnedSemaphorePermit) {
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                if sh.accept_failed_logged.due() {
-                    tracing::warn!(
-                        "{what} accept: {e} (repeats within {}s not logged)",
-                        throttle::EVERY.as_secs()
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            }
-        };
-        match sh.relay_slots.clone().try_acquire_owned() {
-            Ok(slot) => return (stream, peer, slot),
-            Err(_) => refuse_busy(sh, stream),
-        }
-    }
-}
-
-/// A connection over `MAX_RELAYS`: reset at once, so the program fails fast
-/// instead of waiting on a connection nobody serves.
-fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream) {
-    count(&sh.stats.relays_refused, 1);
-    if sh.relays_refused_logged.due() {
-        tracing::warn!(
-            "as many connections as may be relayed at once are being relayed (see the open-file limit \
-             at startup): refusing new ones (relays_refused; repeats within {}s not logged)",
-            throttle::EVERY.as_secs()
-        );
-    }
-    let _ = stream.set_zero_linger();
-}
-
-impl Shared {
-    /// `relays` connections may be relayed at once.
-    pub fn new(
-        listen: SocketAddrV4,
-        nat: Nat,
-        pool: FakePool,
-        upstream_dns: SocketAddr,
-        live: Arc<Live>,
-        relays: usize,
-    ) -> Shared {
-        Shared {
-            listen,
-            nat: Mutex::new(nat),
-            pool,
-            upstream_dns,
-            live: RwLock::new(live),
-            stats: Stats::default(),
-            dns: DnsStats::default(),
-            traffic: Traffic::default(),
-            last_id: AtomicU64::new(0),
-            table_full_logged: Throttle::new(),
-            accept_failed_logged: Throttle::new(),
-            relays_refused_logged: Throttle::new(),
-            relay_slots: Arc::new(tokio::sync::Semaphore::new(relays)),
-        }
-    }
-
-    pub fn next_conn_id(&self) -> u64 {
-        self.last_id.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    pub fn live(&self) -> Arc<Live> {
-        self.live.read().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    pub fn nat(&self) -> MutexGuard<'_, Nat> {
-        // A poisoned lock only means a panic mid-update of plain maps.
-        self.nat.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-fn count(c: &AtomicU64, n: usize) {
-    c.fetch_add(n as u64, Ordering::Relaxed);
 }
 
 // ------------------------------------------------------------ packet loop --
@@ -284,10 +80,20 @@ fn on_packet(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &mut [u8]) 
     }
 }
 
+/// A TCP packet: from the listener back to the program, or from the program
+/// onto the listener. One hold of the table either way.
 fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
+    if p.src == sh.listen {
+        from_listener(tun, sh, pkt, p);
+    } else {
+        from_program(tun, sh, pkt, p);
+    }
+}
+
+/// The listener answering: back to the program, from where it dialed.
+fn from_listener(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
     let rst = p.flags & TCP_RST != 0;
-    let rewritten = if p.src == sh.listen {
-        // The listener answering: back to the program, from where it dialed.
+    let back = {
         let mut nat = sh.nat();
         let syn_ack = (p.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK).then(|| packet::tcp_seq(pkt, p));
         // Only these change an entry's state: no second lookup per data packet.
@@ -295,55 +101,66 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
             nat.listener_sent(p.dst, syn_ack, rst, Instant::now());
         }
         nat.inbound(p.dst)
-    } else {
-        let mut table = sh.nat();
-        let syn = p.is_syn().then(|| packet::tcp_seq(pkt, p));
-        let nat = table.outbound(p.src, p.dst, syn, Instant::now());
-        if rst {
-            table.program_reset(p.src, p.dst, Instant::now());
-        }
-        drop(table);
-        if p.is_syn() {
-            match nat {
-                Some(nat) => tracing::trace!(src = %p.src, dst = %p.dst, %nat, "syn"),
-                None => {
-                    // Every retried SYN lands here (`dropped_table_full`
-                    // counts them all).
-                    if sh.table_full_logged.due() {
-                        tracing::error!(
-                            src = %p.src, dst = %p.dst,
-                            "address-rewriting table full, refusing new connections (see \
-                             dropped_table_full; reported every {}s)",
-                            throttle::EVERY.as_secs()
-                        );
-                    }
-                }
-            }
-        }
-        nat.map(|nat| (nat, sh.listen))
     };
-    match rewritten {
+    match back {
         Some((src, dst)) => {
             packet::rewrite_tcp(pkt, p, src, dst);
             write_packet(tun, sh, &pkt[..p.len]);
         }
+        // Late, its entry gone: dropped, the listener left unanswered.
         None => {
-            // From the program: answered as by a host without such a
-            // connection. A SYN that found the table full gets ECONNREFUSED
-            // now rather than retrying for two minutes; anything else (its
-            // connection ended here long ago) ECONNRESET rather than
-            // retransmitting for a quarter of an hour.
-            if p.src != sh.listen {
-                if let Some(r) = packet::reset_answering(pkt, p) {
-                    write_packet(tun, sh, &r);
-                }
+            count(&sh.stats.drop_no_flow, 1);
+            tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
+        }
+    }
+}
+
+/// The program sending: onto the listener, from the NAT address and port of
+/// its entry. Its SYN makes the entry, its reset ends one not yet accepted.
+/// With no entry it is answered as by a host without such a connection: a
+/// SYN that found the table full gets ECONNREFUSED now rather than retrying
+/// for two minutes; anything else (its connection ended here long ago)
+/// ECONNRESET rather than retransmitting for a quarter of an hour.
+fn from_program(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
+    let syn = p.is_syn().then(|| packet::tcp_seq(pkt, p));
+    let nat = {
+        let mut table = sh.nat();
+        let nat = table.outbound(p.src, p.dst, syn, Instant::now());
+        if p.flags & TCP_RST != 0 {
+            table.program_reset(p.src, p.dst, Instant::now());
+        }
+        nat
+    };
+    match (nat, syn) {
+        (Some(nat), _) => {
+            if syn.is_some() {
+                tracing::trace!(src = %p.src, dst = %p.dst, %nat, "syn");
             }
-            if p.is_syn() {
-                count(&sh.stats.drop_table_full, 1);
-            } else {
-                count(&sh.stats.drop_no_flow, 1);
-                tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
+            packet::rewrite_tcp(pkt, p, nat, sh.listen);
+            write_packet(tun, sh, &pkt[..p.len]);
+        }
+        (None, Some(_)) => {
+            // Every retried SYN lands here (`dropped_table_full` counts them
+            // all).
+            if sh.table_full_logged.due() {
+                tracing::error!(
+                    src = %p.src, dst = %p.dst,
+                    "address-rewriting table full, refusing new connections (see \
+                     dropped_table_full; reported every {}s)",
+                    throttle::EVERY.as_secs()
+                );
             }
+            if let Some(r) = packet::reset_answering(pkt, p) {
+                write_packet(tun, sh, &r);
+            }
+            count(&sh.stats.drop_table_full, 1);
+        }
+        (None, None) => {
+            if let Some(r) = packet::reset_answering(pkt, p) {
+                write_packet(tun, sh, &r);
+            }
+            count(&sh.stats.drop_no_flow, 1);
+            tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
         }
     }
 }
@@ -385,85 +202,7 @@ fn write_packet(tun: &OwnedFd, sh: &Shared, b: &[u8]) {
     count(&sh.stats.tun_bytes_out, b.len());
 }
 
-// ------------------------------------------------------------------ relay --
-
-/// Accept captured connections and relay each one.
-pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
-    loop {
-        let (stream, peer, slot) = accept_with_slot(&listener, &sh, "relay").await;
-        let id = sh.next_conn_id();
-        // Every line about this connection names it. Error level: present
-        // whenever anything is logged, so a proxy failing at warn names it too.
-        let span = tracing::error_span!("conn", id, target = field::Empty);
-        let sh = sh.clone();
-        tokio::spawn(
-            async move {
-                let _slot = slot;
-                if let Err(e) = relay_one(&sh, stream, peer).await {
-                    tracing::debug!("relay conn error: {e:#}");
-                }
-            }
-            .instrument(span),
-        );
-    }
-}
-
-/// Marks the connection's table entry closed (and the connection inactive)
-/// however the relay ends.
-struct Closing<'a> {
-    sh: &'a Shared,
-    nat: SocketAddrV4,
-}
-
-impl Drop for Closing<'_> {
-    fn drop(&mut self) {
-        self.sh.nat().close(self.nat, Instant::now());
-        self.sh.stats.active.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-async fn relay_one(sh: &Shared, stream: tokio::net::TcpStream, peer: SocketAddr) -> Result<()> {
-    let SocketAddr::V4(peer) = peer else {
-        bail!("not a captured connection: {peer}");
-    };
-    if !sh.nat().is_nat(*peer.ip()) {
-        bail!("not a captured connection: {peer}");
-    }
-    let dst = sh
-        .nat()
-        .accept(peer)
-        .ok_or_else(|| anyhow!("no address-rewriting entry for {peer}"))?;
-    sh.stats.connections.fetch_add(1, Ordering::Relaxed);
-    sh.stats.active.fetch_add(1, Ordering::Relaxed);
-    let _closing = Closing { sh, nat: peer };
-    tracing::trace!(nat = %peer, %dst, "accepted");
-
-    if dst.port() == 53 {
-        // DNS over TCP, to whatever server the program chose.
-        Span::current().record("target", field::display(dst));
-        tracing::info!("dns over tcp");
-        let start = Instant::now();
-        dns::serve_tcp(stream, &sh.pool, sh.upstream_dns, &sh.dns).await;
-        tracing::info!(ms = start.elapsed().as_millis() as u64, "closed");
-        return Ok(());
-    }
-    let (target, guard) = to_target(dst, &sh.pool);
-    // `route` logs how the connection ended, errors included.
-    let _ = relay::route(&sh.live(), &sh.traffic, stream, Pending { target, guard }).await;
-    Ok(())
-}
-
-/// Map a fake IP back to its domain (pinning the mapping for the connection's
-/// lifetime); anything else stays a literal IP, and a fake IP the pool never
-/// handed out goes to the proxy as one, which fails it. A program that kept
-/// an answer past `REUSE_AFTER` (twice its TTL) may find the address
-/// recycled, naming another domain by then.
-fn to_target(dst: SocketAddrV4, pool: &FakePool) -> (Target, Option<FakeGuard>) {
-    match pool.acquire(*dst.ip()) {
-        Some((domain, guard)) => (Target::Domain(domain, dst.port()), Some(guard)),
-        None => (Target::V4(*dst.ip(), dst.port()), None),
-    }
-}
+// ---------------------------------------------------------------- sweeper --
 
 /// Drop table entries whose connection is long gone. Every second: what
 /// expires comes in small bites (see `sweep`).
@@ -503,90 +242,13 @@ async fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
     }
 }
 
-/// SIGUSR1: totals since start, then rates since `prev`, the previous dump
-/// (or start), for telling where the time goes without outside tools.
-pub fn log_stats(sh: &Shared, prev: &mut Snapshot) {
-    let (s, d) = (&sh.stats, &sh.dns);
-    let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
-    let now = Snapshot {
-        at: Instant::now(),
-        connections: n(&s.connections),
-        tun_packets_in: n(&s.tun_packets_in),
-        tun_bytes_in: n(&s.tun_bytes_in),
-        up: n(&sh.traffic.up),
-        down: n(&sh.traffic.down),
-    };
-    // Read first: a lock taken inside the macro is held while the line is
-    // written, and a stalled stderr (Ctrl+S, a paused pager) would stall the
-    // TUN thread with it.
-    let (fake_ips, nat_entries) = (sh.pool.len(), sh.nat().len());
-    tracing::info!(
-        fake_ips,
-        nat_entries,
-        connections = now.connections,
-        active = n(&s.active),
-        relayed_up = now.up,
-        relayed_down = now.down,
-        dns_queries = n(&d.queries),
-        dns_forwarded = n(&d.forwarded),
-        dns_forward_failed = n(&d.forward_failed),
-        udp_refused = n(&s.udp_refused),
-        tun_packets_in = now.tun_packets_in,
-        tun_bytes_in = now.tun_bytes_in,
-        tun_packets_out = n(&s.tun_packets_out),
-        tun_bytes_out = n(&s.tun_bytes_out),
-        dropped_unparsed = n(&s.drop_unparsed),
-        dropped_other_proto = n(&s.drop_other_proto),
-        dropped_no_flow = n(&s.drop_no_flow),
-        dropped_table_full = n(&s.drop_table_full),
-        relays_refused = n(&s.relays_refused),
-        dropped_dns_busy = n(&s.drop_dns_busy),
-        "stats"
-    );
-    let prev = std::mem::replace(prev, now);
-    let r = now.rates_since(&prev);
-    tracing::info!(
-        seconds = %format!("{:.1}", r.seconds),
-        connections_per_s = %format!("{:.1}", r.connections),
-        tun_packets_in_per_s = %format!("{:.0}", r.tun_packets_in),
-        tun_mb_in_per_s = %format!("{:.2}", r.tun_mb_in),
-        up_mb_per_s = %format!("{:.2}", r.up_mb),
-        down_mb_per_s = %format!("{:.2}", r.down_mb),
-        "rates since the previous stats"
-    );
-    for n in &sh.live().registry.nodes {
-        let s = n.stats();
-        tracing::info!(
-            proxy = %s.name, healthy = s.healthy, active = s.active,
-            latency_ms = s.latency_us as f64 / 1000.0, ok = s.ok_total, failed = s.fail_total,
-            "proxy stats"
-        );
-    }
-}
-
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::packet::tests::sa;
-    use proxytun_core::config::Config;
-    use proxytun_core::live::build_live;
-    use std::net::Ipv4Addr;
-    use tokio::net::{TcpSocket, TcpStream};
-
-    /// The (one) NAT address here, so a test can play the rewritten client.
-    const NAT: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
-
-    pub(crate) fn shared(listen: SocketAddrV4) -> Shared {
-        let cfg = Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n").unwrap();
-        Shared::new(
-            listen,
-            Nat::new(NAT, 1),
-            FakePool::with_reserved_tail("198.18.0.0/15".parse().unwrap(), 0),
-            "127.0.0.1:9".parse().unwrap(),
-            Arc::new(build_live(&cfg).unwrap()),
-            MAX_RELAYS,
-        )
-    }
+    use crate::state::tests::{shared, NAT};
+    use std::net::SocketAddrV4;
+    use std::sync::atomic::AtomicU64;
 
     #[tokio::test]
     async fn a_connection_the_listener_answered_outlives_a_stalled_accept() {
@@ -643,178 +305,18 @@ pub(crate) mod tests {
         let p = packet::parse(&rst).unwrap();
         on_tcp(&tun, &sh, &mut rst, &p);
         assert_eq!(sh.nat().accept(nat), None, "the program's reset ended it");
-    }
 
-    #[test]
-    fn stats_are_written_without_holding_the_address_table() {
-        let sh = Arc::new(shared("127.0.0.1:9".parse().unwrap()));
-        let free = Arc::new(Mutex::new(Vec::new()));
-        let (sh2, free2) = (sh.clone(), free.clone());
-        // Whenever a line is written, could the TUN thread take the table?
-        let sub = tracing_subscriber::fmt()
-            .with_writer(move || {
-                free2.lock().unwrap().push(sh2.nat.try_lock().is_ok());
-                std::io::sink()
-            })
-            .finish();
-        tracing::subscriber::with_default(sub, || log_stats(&sh, &mut Snapshot::zero()));
-        let free = free.lock().unwrap();
-        assert!(!free.is_empty() && free.iter().all(|&f| f), "{free:?}");
-    }
-
-    async fn relay_from(l: &TcpListener, sh: &Shared, from: SocketAddrV4) -> (TcpStream, Result<()>) {
-        let sock = TcpSocket::new_v4().unwrap();
-        sock.set_reuseaddr(true).unwrap();
-        sock.bind(SocketAddr::V4(from)).unwrap();
-        let client = sock.connect(l.local_addr().unwrap()).await.unwrap();
-        let (s, peer) = l.accept().await.unwrap();
-        // The client hangs up at once: a DNS-over-TCP relay then ends cleanly.
-        let mut client = client;
-        tokio::io::AsyncWriteExt::shutdown(&mut client).await.unwrap();
-        (client, relay_one(sh, s, peer).await)
-    }
-
-    #[tokio::test]
-    async fn only_rewritten_connections_are_relayed_and_their_entry_closes_after() {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let SocketAddr::V4(listen) = l.local_addr().unwrap() else {
-            unreachable!()
-        };
-        let sh = shared(listen);
-
-        // Not from NAT_IP: something in the namespace dialed the listener itself.
-        let (_c, r) = relay_from(&l, &sh, sa("127.0.0.1:0")).await;
-        assert!(r.unwrap_err().to_string().contains("not a captured connection"));
-
-        // From NAT_IP on a port the TUN loop never handed out.
-        let (_c, r) = relay_from(&l, &sh, sa("127.0.0.2:0")).await;
-        assert!(r.unwrap_err().to_string().contains("no address-rewriting entry"));
-
-        // A real entry (a DNS-over-TCP connection) is relayed, then closed.
-        let nat = sh
-            .nat()
-            .outbound(sa("198.19.255.1:5555"), sa("9.9.9.9:53"), Some(1), Instant::now())
-            .unwrap();
-        let (_c, r) = relay_from(&l, &sh, nat).await;
-        r.unwrap();
-        assert_eq!(sh.nat().accept(nat), None, "closed once the relay is done");
-        assert_eq!(sh.stats.connections.load(Ordering::Relaxed), 1);
-        assert_eq!(sh.stats.active.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn over_the_relay_cap_a_connection_is_reset_at_once() {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let SocketAddr::V4(listen) = l.local_addr().unwrap() else {
-            unreachable!()
-        };
-        let mut sh = shared(listen);
-        sh.relay_slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let sh = Arc::new(sh);
-        tokio::spawn(run_relay(l, sh.clone()));
-        let connect = |nat: SocketAddrV4| {
-            let sock = TcpSocket::new_v4().unwrap();
-            sock.set_reuseaddr(true).unwrap();
-            sock.bind(SocketAddr::V4(nat)).unwrap();
-            sock.connect(SocketAddr::V4(listen))
-        };
-        let entry = |program: &str| {
-            sh.nat()
-                .outbound(sa(program), sa("9.9.9.9:53"), Some(1), Instant::now())
-                .unwrap()
-        };
-        // One connection (DNS over TCP, held open) takes the only slot.
-        let first = entry("198.19.255.1:5001");
-        let _held = connect(first).await.unwrap();
-        while sh.stats.active.load(Ordering::Relaxed) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        // The next one is reset, not left waiting, and its entry ends.
-        let second = entry("198.19.255.1:5002");
-        let mut c = connect(second).await.unwrap();
-        let mut b = [0u8; 1];
-        let r = tokio::time::timeout(Duration::from_secs(2), tokio::io::AsyncReadExt::read(&mut c, &mut b))
-            .await
-            .expect("answered at once");
-        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::ConnectionReset);
-        assert_eq!(sh.stats.relays_refused.load(Ordering::Relaxed), 1);
-        // Its entry is left to the TUN thread, which sees the reset go by:
-        // ended here, a lost reset would leave the program waiting forever
-        // instead of reset after `nat::QUEUED`.
-        assert_eq!(sh.nat().accept(second), Some(sa("9.9.9.9:53")));
-    }
-
-    /// What is logged on this thread (the test's, which runs every task of a
-    /// current-thread runtime) until the guard is dropped.
-    fn logged() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-        struct Lines(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Lines {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let to = lines.clone();
-        let sub = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || Lines(to.clone()))
-            .finish();
-        (lines, tracing::subscriber::set_default(sub))
-    }
-
-    fn count_in(lines: &Mutex<Vec<u8>>, what: &str) -> usize {
-        String::from_utf8_lossy(&lines.lock().unwrap()).matches(what).count()
-    }
-
-    #[tokio::test]
-    async fn refusals_are_reported_once_for_all_accept_loops_together() {
-        let (lines, _log) = logged();
-        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let host_port = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (to_relay, to_host_port) = (relay.local_addr().unwrap(), host_port.local_addr().unwrap());
-        let SocketAddr::V4(listen) = to_relay else {
-            unreachable!()
-        };
-        let mut sh = shared(listen);
-        sh.relay_slots = Arc::new(tokio::sync::Semaphore::new(0));
-        let sh = Arc::new(sh);
-        tokio::spawn(run_relay(relay, sh.clone()));
-        tokio::spawn(crate::hostports::serve(host_port, to_host_port, sh.clone()));
-        // One connection over the cap on each loop: two refused, within the
-        // same 10 s.
-        let _a = TcpStream::connect(to_relay).await.unwrap();
-        let _b = TcpStream::connect(to_host_port).await.unwrap();
-        while sh.stats.relays_refused.load(Ordering::Relaxed) < 2 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(
-            count_in(&lines, "refusing new ones"),
-            1,
-            "one line, whichever loop refused"
-        );
-    }
-
-    #[tokio::test]
-    async fn accept_failures_are_reported_once_for_all_accept_loops_together() {
-        use std::os::fd::{FromRawFd, IntoRawFd};
-        let (lines, _log) = logged();
-        // Bound but not listening: every accept fails at once (EINVAL), as
-        // one out of fds would.
-        let failing = || {
-            let s = TcpSocket::new_v4().unwrap();
-            s.bind(sa("127.0.0.1:0").into()).unwrap();
-            TcpListener::from_std(unsafe { std::net::TcpListener::from_raw_fd(s.into_raw_fd()) }).unwrap()
-        };
-        let sh = Arc::new(shared(sa("127.0.0.1:9")));
-        tokio::spawn(run_relay(failing(), sh.clone()));
-        tokio::spawn(crate::hostports::serve(failing(), sa("127.0.0.1:9").into(), sh.clone()));
-        // Each loop fails several times over (retrying every 20 ms).
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(count_in(&lines, "accept:"), 1, "one line, whichever loop failed");
+        // A fourth, reset by the listener before accept (its queue was full):
+        // over too, or the entry would wait out its timeout for nothing.
+        let fourth = crate::packet::tests::sa("198.19.255.1:40003");
+        let mut syn = crate::packet::tests::tcp(fourth, dst, TCP_SYN, b"");
+        let p = packet::parse(&syn).unwrap();
+        on_tcp(&tun, &sh, &mut syn, &p);
+        let nat = sh.nat().outbound(fourth, dst, None, Instant::now()).unwrap();
+        let mut rst = crate::packet::tests::tcp(sh.listen, nat, TCP_RST, b"");
+        let p = packet::parse(&rst).unwrap();
+        on_tcp(&tun, &sh, &mut rst, &p);
+        assert_eq!(sh.nat().accept(nat), None, "the listener's reset ended it");
     }
 
     #[tokio::test]
@@ -957,38 +459,6 @@ pub(crate) mod tests {
             u32::from_be_bytes(reset[28..32].try_into().unwrap()),
             late_seq + 1,
             "it acknowledges the SYN"
-        );
-    }
-
-    #[test]
-    fn rates_are_deltas_over_the_time_between_two_dumps() {
-        let t0 = Instant::now();
-        let prev = Snapshot {
-            at: t0,
-            connections: 10,
-            tun_packets_in: 1000,
-            tun_bytes_in: 5_000_000,
-            up: 1_000_000,
-            down: 2_000_000,
-        };
-        let now = Snapshot {
-            at: t0 + Duration::from_secs(2),
-            connections: 30,
-            tun_packets_in: 101_000,
-            tun_bytes_in: 205_000_000,
-            up: 3_000_000,
-            down: 202_000_000,
-        };
-        assert_eq!(
-            now.rates_since(&prev),
-            Rates {
-                seconds: 2.0,
-                connections: 10.0,
-                tun_packets_in: 50_000.0,
-                tun_mb_in: 100.0,
-                up_mb: 1.0,
-                down_mb: 100.0
-            }
         );
     }
 }

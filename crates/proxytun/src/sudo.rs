@@ -39,7 +39,11 @@
 //!     stdio, directory and environment, waits for the go-ahead, and puts
 //!     the inherited fds back at their numbers.
 
-use crate::netns::{self, Child, Handover, Setup, TempDir};
+use crate::ctl::{
+    join_list, recv_setup, recv_with_fds, send_error, send_ok, send_with_fds, split_list, wait_go, Child, Handover,
+    SetupError, SCM_MAX_FDS,
+};
+use crate::netns::{self, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ipnet::Ipv4Net;
 use nix::sys::socket::{
@@ -87,10 +91,10 @@ impl Request {
         field(b"3");
         field(self.fake_range.to_string().as_bytes());
         field(self.pgrp.to_string().as_bytes());
-        field(netns::join_list(&self.forwards).as_bytes());
+        field(join_list(&self.forwards).as_bytes());
         field(format!("{:o}", self.umask).as_bytes());
         field(if self.sigpipe_ignored { b"1" } else { b"0" });
-        field(netns::join_list(&self.inherit).as_bytes());
+        field(join_list(&self.inherit).as_bytes());
         field(self.argv.len().to_string().as_bytes());
         for a in &self.argv {
             field(a.as_bytes());
@@ -109,14 +113,14 @@ impl Request {
         }
         let fake_range = text()?.parse().ok()?;
         let pgrp = text()?.parse().ok()?;
-        let forwards = netns::split_list(&text()?)?;
+        let forwards = split_list(&text()?)?;
         let umask = libc::mode_t::from_str_radix(&text()?, 8).ok()?;
         let sigpipe_ignored = match text()?.as_str() {
             "1" => true,
             "0" => false,
             _ => return None,
         };
-        let inherit = netns::split_list(&text()?)?;
+        let inherit = split_list(&text()?)?;
         let argc: usize = text()?.parse().ok()?;
         let argv: Vec<OsString> = (0..argc)
             .map(|_| fields.next().map(|a| OsString::from_vec(a.to_vec())))
@@ -208,7 +212,7 @@ pub fn root_refusal_here() -> Option<String> {
 
 /// One SCM_RIGHTS message carries them all; four are stdio and the working
 /// directory.
-const MAX_INHERIT: usize = netns::SCM_MAX_FDS - 4;
+const MAX_INHERIT: usize = SCM_MAX_FDS - 4;
 
 /// No fd number reaches this (the kernel's default fs.nr_open).
 const FD_CEILING: RawFd = 1 << 20;
@@ -462,9 +466,8 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
         .into_iter()
         .chain(req.inherit.iter().copied())
         .collect();
-    netns::send_with_fds(&ctl, &req.encode(), &fds)
-        .context("send the request to the helper (environment too large?)")?;
-    let handover = netns::recv_setup(&ctl, None)?;
+    send_with_fds(&ctl, &req.encode(), &fds).context("send the request to the helper (environment too large?)")?;
+    let handover = recv_setup(&ctl, None)?;
     let report = &handover.report;
     let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
     let pid = value("pid=")
@@ -492,9 +495,9 @@ pub fn helper_main(args: &[OsString]) -> ! {
 
 /// Tell the client why, then fail.
 fn refuse(ctl: &OwnedFd, e: anyhow::Error) -> Result<()> {
-    netns::send_error(
+    send_error(
         ctl,
-        &netns::SetupError {
+        &SetupError {
             userns: false,
             err: anyhow!("sudo helper: {e:#}"),
         },
@@ -568,7 +571,7 @@ fn helper(args: &[OsString]) -> Result<()> {
     // request and its fds go to the program, once it is the user; it passes
     // the request on to us as bytes, on a pipe, which carries no fds.
     if let Err(e) = netns::enter_namespace(false) {
-        netns::send_error(&ctl, &e);
+        send_error(&ctl, &e);
         return Err(e.err);
     }
     // sudo gave us a terminal session of its own (`use_pty`): when its
@@ -614,7 +617,7 @@ fn helper(args: &[OsString]) -> Result<()> {
         let ns = match netns::configure_namespace(req.fake_range, false, &req.forwards) {
             Ok(v) => v,
             Err(e) => {
-                netns::send_error(&ctl, &e);
+                send_error(&ctl, &e);
                 return Err(e.err);
             }
         };
@@ -624,7 +627,7 @@ fn helper(args: &[OsString]) -> Result<()> {
         // SAFETY: plain syscall.
         let joined = unsafe { libc::setpgid(pid, req.pgrp) } == 0 || crate::procfs::pgrp_of(pid) == Some(req.pgrp);
         let report = format!("pid={pid} pgrp={}", if joined { "joined" } else { "alone" });
-        netns::send_ok(&ctl, &ns, &report)
+        send_ok(&ctl, &ns, &report)
     })();
     if served.is_err() {
         // Not waited for: it holds the user's fds, and its exit may block on
@@ -897,7 +900,7 @@ fn become_program(
         }
     }
     let mut buf = vec![0u8; REQUEST_MAX];
-    let (n, fds) = match netns::recv_with_fds(ctl, &mut buf) {
+    let (n, fds) = match recv_with_fds(ctl, &mut buf) {
         Ok(v) => v,
         Err(e) => return fail(format!("read the request: {e:#}")),
     };
@@ -946,7 +949,7 @@ fn become_program(
             libc::putenv(e.as_ptr() as *mut _);
         }
     }
-    netns::wait_go(ctl);
+    wait_go(ctl);
     // The inherited fds at the numbers they had in proxytun. Each is first
     // copied to the lowest free number that is no one's target (a target
     // may be held by one of them, or by ctl, done with now), staying under

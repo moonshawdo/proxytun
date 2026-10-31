@@ -4,12 +4,13 @@
 //! The namespace is set up by a fresh proxytun process (see netns.rs) before
 //! the tokio runtime starts.
 
-use crate::capture::{self, Shared};
+use crate::ctl::{self, UsernsUnusable};
 use crate::nat::Nat;
-use crate::netns::{self, Addrs, Setup, UsernsUnusable};
+use crate::netns::{self, Addrs, Setup};
 use crate::signals::{self, Exit};
+use crate::state::{self, Shared};
 use crate::witness::Witness;
-use crate::{hostports, sudo};
+use crate::{accept, capture, hostports, sudo};
 use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use proxytun_core::config::proxy_url::url_has_credentials;
@@ -156,7 +157,7 @@ pub fn run(args: Args) -> Result<Exit> {
     // caller's setting.
     // SAFETY: plain syscall.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let netns::Handover {
+    let ctl::Handover {
         tun,
         listener,
         forwards,
@@ -219,7 +220,7 @@ pub fn run(args: Args) -> Result<Exit> {
 /// Start the program in its namespace, waiting for the go-ahead: through a
 /// user namespace of our own, or where that is unusable, through sudo and
 /// its root helper (unless `no_sudo`).
-fn spawn_program(setup: &Setup, no_sudo: bool) -> Result<(netns::Child, netns::Handover)> {
+fn spawn_program(setup: &Setup, no_sudo: bool) -> Result<(ctl::Child, ctl::Handover)> {
     match netns::spawn(setup) {
         Err(e) if e.is::<UsernsUnusable>() => {
             if no_sudo {
@@ -254,7 +255,7 @@ fn start_services(
 ) -> Result<tokio::task::JoinHandle<()>> {
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
-    tokio::spawn(capture::run_relay(listener, sh.clone()));
+    tokio::spawn(accept::run_relay(listener, sh.clone()));
     for (addr, l) in forwards {
         l.set_nonblocking(true)?;
         tokio::spawn(hostports::serve(
@@ -314,13 +315,13 @@ fn raise_fd_limit() -> u64 {
 fn relay_capacity(soft: u64, host_ports: usize) -> usize {
     let rest = 64 + host_ports + proxytun_core::net::dns::MAX_FORWARDS + proxytun_core::net::relay::MAX_LOOKUPS;
     let reserve = (rest as u64).min(soft / 2);
-    let n = (soft.saturating_sub(reserve) / 2).clamp(1, capture::MAX_RELAYS as u64) as usize;
-    if n < capture::MAX_RELAYS {
+    let n = (soft.saturating_sub(reserve) / 2).clamp(1, state::MAX_RELAYS as u64) as usize;
+    if n < state::MAX_RELAYS {
         tracing::warn!(
             soft,
             "the open-file limit allows {n} connections relayed at once, not {}: raise the hard limit \
              (`ulimit -Hn`, limits.conf) for more",
-            capture::MAX_RELAYS
+            state::MAX_RELAYS
         );
     }
     n
@@ -352,7 +353,7 @@ fn spawn_signal_handlers(
         return;
     };
     // The counters at the previous dump, for rates.
-    let mut prev = capture::Snapshot::zero();
+    let mut prev = state::Snapshot::zero();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -368,7 +369,7 @@ fn spawn_signal_handlers(
                         Err(e) => tracing::error!("reload failed, keeping the old configuration: {e:#}"),
                     }
                 }
-                _ = usr1.recv() => capture::log_stats(&sh, &mut prev),
+                _ = usr1.recv() => state::log_stats(&sh, &mut prev),
             }
         }
     });
@@ -388,7 +389,7 @@ mod tests {
         // 1024, with a hundred host ports: forwards and lookups at their
         // most still find fds.
         assert_eq!(relay_capacity(1024, 100), (1024 - rest - 100) / 2);
-        assert_eq!(relay_capacity(1 << 20, 250), crate::capture::MAX_RELAYS);
+        assert_eq!(relay_capacity(1 << 20, 250), crate::state::MAX_RELAYS);
         // A small limit: half for the rest at most.
         assert_eq!(relay_capacity(64, 4), 16);
         assert_eq!(relay_capacity(0, 0), 1);
