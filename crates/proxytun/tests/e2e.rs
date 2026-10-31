@@ -1674,6 +1674,82 @@ fn gdb_attaches_from_outside_to_a_running_program() {
     assert!(text.contains(&format!("process {pid}")), "{text}");
 }
 
+/// Opens `n` connections and holds them (proxytun runs out of fds on the
+/// way), drops them, then makes one ordinary request.
+const PY_FD_PRESSURE: &str = r#"
+import socket, sys, time, urllib.request
+held = []
+for i in range(int(sys.argv[1])):
+    s = socket.create_connection(("203.0.113.1", 80), timeout=10)
+    held.append(s)
+time.sleep(6)
+for s in held:
+    s.close()
+time.sleep(1)
+try:
+    body = urllib.request.urlopen("http://after.test/", timeout=10).read().decode()
+    print("final:", body, flush=True)
+except Exception as e:
+    print("final: failed", e, flush=True)
+"#;
+
+#[test]
+fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
+    require!("python3");
+    let origin = start_origin();
+    let mock = start_mock_proxy(origin);
+    let dir = tmp_dir("fd-pressure");
+    // The held connections go to a literal IP, so proxytun sniffs them, for
+    // 5 s: they are more than its fds, each keeps its accepted one while
+    // proxytun waits for its first bytes, and the dials that follow find none
+    // left. Probes every second meanwhile find none either.
+    let cfg = write_cfg(
+        &dir,
+        mock.addr,
+        "sniff_timeout_ms = 5000",
+        "[health]\ninterval_secs = 1",
+    );
+    // Our soft limit goes up to the hard one; the program keeps its own.
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(
+        "ulimit -Sn 100; exec \"$BIN\" -c \"$CFG\" -- \
+         sh -c 'ulimit -Sn; awk \"/Max open files/ {print (\\$4 == \\$5)}\" /proc/$PPID/limits'",
+    );
+    let out = run_cmd(cmd, &[("BIN", BIN), ("CFG", cfg.to_str().unwrap())]);
+    assert_eq!(out.code, 0, "{}", out.dump());
+    assert_eq!(
+        out.stdout,
+        "100\n1\n",
+        "program: 100; proxytun: soft = hard\n{}",
+        out.dump()
+    );
+
+    // With no room to raise it, proxytun runs out of fds while the program
+    // holds 50 connections (within its own limit). The proxy is fine, though: it must
+    // not be marked down, and once they are gone the next request must go
+    // through it.
+    let prog = dir.join("pressure.py");
+    std::fs::write(&prog, PY_FD_PRESSURE).unwrap();
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg("ulimit -n 64; exec \"$BIN\" -c \"$CFG\" -- python3 \"$PROG\" 50");
+    let out = run_cmd(
+        cmd,
+        &[
+            ("BIN", BIN),
+            ("CFG", cfg.to_str().unwrap()),
+            ("PROG", prog.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        out.stderr.contains("dial failed for lack of local resources"),
+        "fds did run out\n{}",
+        out.dump()
+    );
+    assert!(!out.stderr.contains("marked DOWN"), "{}", out.dump());
+    assert!(out.stdout.contains(&format!("final: {BODY}")), "{}", out.dump());
+}
+
 // ------------------------------------------------ sudo mode (CentOS 7) --
 
 /// A stand-in for sudo. Installed setuid in a user namespace where we are

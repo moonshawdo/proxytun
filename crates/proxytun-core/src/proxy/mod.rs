@@ -321,6 +321,10 @@ pub async fn dial_group(
                 tracing::debug!(proxy = %node.name, "proxy could not connect, trying another: {e:#}");
                 last_err = e;
             }
+            Err(e) if is_local_shortage(&e) => {
+                tracing::warn!(proxy = %node.name, "dial failed for lack of local resources: {e:#}");
+                return Err(e);
+            }
             Err(e) => {
                 node.record_failure(fail_threshold);
                 tracing::warn!(proxy = %node.name, "dial failed: {e:#}");
@@ -331,9 +335,29 @@ pub async fn dial_group(
     Err(last_err)
 }
 
+/// Did `e` happen for lack of our own resources (fds, buffers, memory)?
+/// That is not the proxy's fault: it must not count against its health, and
+/// every other proxy would fail the same way.
+pub fn is_local_shortage(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .and_then(|io| io.raw_os_error())
+            .is_some_and(|n| matches!(n, libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_out_of_our_own_fds_is_not_the_proxys_fault() {
+        let io = |n| anyhow::Error::new(std::io::Error::from_raw_os_error(n)).context("connect to the proxy");
+        assert!(is_local_shortage(&io(libc::EMFILE)));
+        assert!(is_local_shortage(&io(libc::ENFILE)));
+        assert!(!is_local_shortage(&io(libc::ECONNREFUSED)));
+        assert!(!is_local_shortage(&io(libc::ETIMEDOUT)));
+    }
     use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::io::duplex;
 

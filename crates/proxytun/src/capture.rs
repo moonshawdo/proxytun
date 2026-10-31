@@ -112,6 +112,22 @@ pub struct Shared {
     pub last_stats: Mutex<Snapshot>,
     /// Last connection id handed out (TUN-captured and host-port alike).
     pub last_id: AtomicU64,
+    /// When the full address-rewriting table was last reported.
+    pub table_full_logged: Mutex<Option<Instant>>,
+}
+
+/// How often a full address-rewriting table is reported: every retried SYN
+/// lands there, on the TUN thread (`dropped_table_full` counts them all).
+const TABLE_FULL_EVERY: Duration = Duration::from_secs(10);
+
+/// Is a report due, `every` after the last one? Records it if so.
+fn due(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
+    let mut l = last.lock().unwrap_or_else(|e| e.into_inner());
+    if l.is_some_and(|t| now.saturating_duration_since(t) < every) {
+        return false;
+    }
+    *l = Some(now);
+    true
 }
 
 impl Shared {
@@ -184,7 +200,13 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
         if p.is_syn() {
             match port {
                 Some(port) => tracing::trace!(src = %p.src, dst = %p.dst, nat_port = port, "syn"),
-                None => tracing::error!(src = %p.src, dst = %p.dst, "address-rewriting table full, dropping a SYN"),
+                None if due(&sh.table_full_logged, Instant::now(), TABLE_FULL_EVERY) => tracing::error!(
+                    src = %p.src, dst = %p.dst,
+                    "address-rewriting table full, dropping new connections (see dropped_table_full; \
+                     reported every {}s)",
+                    TABLE_FULL_EVERY.as_secs()
+                ),
+                None => {}
             }
         }
         port.map(|port| (SocketAddrV4::new(sh.addrs.nat, port), sh.listen))
@@ -410,7 +432,19 @@ mod tests {
             traffic: Traffic::default(),
             last_stats: Mutex::new(Snapshot::zero()),
             last_id: AtomicU64::new(0),
+            table_full_logged: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn a_full_table_is_reported_now_and_then_not_per_syn() {
+        let last = Mutex::new(None);
+        let t = Instant::now();
+        assert!(due(&last, t, TABLE_FULL_EVERY), "the first time");
+        assert!(!due(&last, t + Duration::from_secs(1), TABLE_FULL_EVERY));
+        assert!(!due(&last, t + Duration::from_secs(9), TABLE_FULL_EVERY));
+        assert!(due(&last, t + TABLE_FULL_EVERY, TABLE_FULL_EVERY));
+        assert!(!due(&last, t + TABLE_FULL_EVERY, TABLE_FULL_EVERY));
     }
 
     async fn relay_from(l: &TcpListener, sh: &Shared, from: SocketAddrV4) -> (TcpStream, Result<()>) {

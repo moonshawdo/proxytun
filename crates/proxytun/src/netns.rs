@@ -207,7 +207,6 @@ pub struct Handover {
     pub report: String,
 }
 
-/// Read the setup's answer on `ctl`. `pid` is reaped on failure.
 /// One message from `ctl` into `buf`, with the fds it carries (close-on-exec,
 /// at most the 253 the kernel passes at once). A message or fd list that did
 /// not fit is an error, not something to act on in part.
@@ -229,6 +228,7 @@ pub fn recv_with_fds(ctl: &OwnedFd, buf: &mut [u8]) -> Result<(usize, Vec<OwnedF
     Ok((msg.bytes, fds))
 }
 
+/// Read the setup's answer on `ctl`. `pid` is reaped on failure.
 pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<Handover> {
     let mut buf = vec![0u8; 16 * 1024];
     let (n, fds) = recv_with_fds(ctl, &mut buf).context("waiting for the namespace setup")?;

@@ -161,6 +161,7 @@ pub fn run(args: Args) -> Result<i32> {
         }
         r => r?,
     };
+    raise_fd_limit();
     let netns::Handover {
         tun,
         listener,
@@ -188,6 +189,7 @@ pub fn run(args: Args) -> Result<i32> {
         traffic: Traffic::default(),
         last_stats: Mutex::new(Snapshot::zero()),
         last_id: AtomicU64::new(0),
+        table_full_logged: Mutex::new(None),
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -303,6 +305,26 @@ fn exit_signal_fd(sigs: &[libc::c_int]) -> Option<OwnedFd> {
         }
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         Some(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+/// Every relayed connection holds two fds, and the usual soft limit is 1024.
+/// Raised to the hard limit only now: the program already has the original
+/// (inherited, or in sudo mode read from us by the helper).
+fn raise_fd_limit() {
+    let mut l = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain syscalls on a local struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) == 0 && l.rlim_cur < l.rlim_max {
+            let from = l.rlim_cur;
+            l.rlim_cur = l.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &l) == 0 {
+                tracing::debug!(from, to = l.rlim_max, "raised our open-file limit");
+            }
+        }
     }
 }
 

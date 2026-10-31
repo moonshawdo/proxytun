@@ -202,7 +202,7 @@ conn{id=1 target=Domain("example.com", 443)}: closed ms=812 dial_ms=35 via=clash
 | 慢 | `closed` 行:`dial_ms` 大是连代理慢;`dial_ms` 小而 `ms` 大、字节数不多,是代理或目标传得慢 |
 | 吞吐上不去 | SIGUSR1 的速率行;`top -H -p <pid>` 里名为 `tun` 的线程接近 100% 时,是到了 proxytun 本身的上限(本机约 1 GB/s),否则瓶颈在代理 |
 | 域名解析不了 / 很慢 | `-v` 的 `dns:` 行;统计里的 `dns_forward_failed`(上游第一次不应答时会 warn) |
-| 连接卡住 | 统计里的丢包计数:`dropped_no_flow`(找不到连接的 TCP 包)、`dropped_table_full`(地址改写表满)、`dropped_unparsed`(IPv6、分片)、`dropped_other_proto`(ICMP 等) |
+| 连接卡住 | 统计里的丢包计数:`dropped_no_flow`(找不到连接的 TCP 包)、`dropped_table_full`(地址改写表满,error 日志每 10 秒最多一条)、`dropped_unparsed`(IPv6、分片)、`dropped_other_proto`(ICMP 等) |
 
 ## 限制
 

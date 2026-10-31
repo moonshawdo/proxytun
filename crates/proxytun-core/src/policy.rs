@@ -105,21 +105,22 @@ impl Policy {
     /// go through ip-cidr rules. No match and no `final` => proxy (the safe
     /// default for a proxifier: never silently go direct).
     pub fn decide(&self, t: &Target) -> Decision {
+        // Lowercased once, not per rule (rule values are lowercased at load).
+        let domain = match t {
+            Target::Domain(d, _) => d.to_ascii_lowercase(),
+            _ => String::new(),
+        };
         // The program's own proxy hostname must be reachable without recursion.
-        if let Target::Domain(d, p) = t {
-            let d = d.to_ascii_lowercase();
-            if self.env.domains.iter().any(|(h, hp)| *h == d && hp == p) {
+        if let Target::Domain(_, p) = t {
+            if self.env.domains.iter().any(|(h, hp)| *h == domain && hp == p) {
                 return Decision::Direct;
             }
         }
         for r in &self.rules {
             let hit = match (r.kind, t) {
-                (RuleKind::DomainSuffix, Target::Domain(d, _)) => {
-                    let d = d.to_ascii_lowercase();
-                    d == r.value || d.ends_with(&format!(".{}", r.value))
-                }
-                (RuleKind::DomainKeyword, Target::Domain(d, _)) => d.to_ascii_lowercase().contains(&r.value),
-                (RuleKind::Domain, Target::Domain(d, _)) => d.eq_ignore_ascii_case(&r.value),
+                (RuleKind::DomainSuffix, Target::Domain(..)) => is_subdomain(&domain, &r.value),
+                (RuleKind::DomainKeyword, Target::Domain(..)) => domain.contains(&r.value),
+                (RuleKind::Domain, Target::Domain(..)) => domain == r.value,
                 (RuleKind::IpCidr, Target::V4(ip, _)) => r.net.is_some_and(|n| n.contains(&IpAddr::V4(*ip))),
                 (RuleKind::IpCidr, Target::V6(ip, _)) => r.net.is_some_and(|n| n.contains(&unmap(IpAddr::V6(*ip)))),
                 (RuleKind::Final, _) => true,
@@ -168,9 +169,24 @@ pub fn unmap(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Is `name` `suffix` itself or a name under it? Both lowercase; no
+/// allocation (this runs per rule, per connection).
+pub fn is_subdomain(name: &str, suffix: &str) -> bool {
+    name.strip_suffix(suffix)
+        .is_some_and(|head| head.is_empty() || head.ends_with('.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_rules_match_whole_labels_only() {
+        assert!(is_subdomain("example.com", "example.com"));
+        assert!(is_subdomain("a.b.example.com", "example.com"));
+        assert!(!is_subdomain("badexample.com", "example.com"), "not a label boundary");
+        assert!(!is_subdomain("com", "example.com"));
+    }
     use crate::config::{env_proxies, EnvProxies};
     use std::net::{Ipv4Addr, Ipv6Addr};
 

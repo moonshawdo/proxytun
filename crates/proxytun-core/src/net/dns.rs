@@ -21,14 +21,32 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
-/// What the DNS side has done, for the stats.
-#[derive(Default)]
+/// What the DNS side has done, for the stats, and how much it may do at once.
 pub struct DnsStats {
     pub queries: AtomicU64,
     /// Queries sent to the upstream resolver and answered by it.
     pub forwarded: AtomicU64,
     /// Queries the upstream resolver did not answer (in time).
     pub forward_failed: AtomicU64,
+    /// Forwards in flight: each holds a socket and a buffer for up to
+    /// `FORWARD_TIMEOUT`, and a program retrying lookups against a silent
+    /// upstream must not pile them up without bound.
+    pub upstream_slots: tokio::sync::Semaphore,
+}
+
+/// At most this many queries are forwarded at once; more are dropped (the
+/// program's resolver retries).
+pub const MAX_FORWARDS: usize = 256;
+
+impl Default for DnsStats {
+    fn default() -> Self {
+        DnsStats {
+            queries: AtomicU64::new(0),
+            forwarded: AtomicU64::new(0),
+            forward_failed: AtomicU64::new(0),
+            upstream_slots: tokio::sync::Semaphore::new(MAX_FORWARDS),
+        }
+    }
 }
 
 /// Fake answers live this long in the program's resolver cache.
@@ -171,6 +189,10 @@ pub async fn respond(
     match answer(raw, pool)? {
         Answer::Reply(r) => Some(r),
         Answer::Forward => {
+            let Ok(_slot) = stats.upstream_slots.try_acquire() else {
+                tracing::debug!(%upstream, "dns: {MAX_FORWARDS} queries already forwarded and waiting, dropping one");
+                return None;
+            };
             let t0 = Instant::now();
             let r = match via {
                 Transport::Udp => forward_udp(raw, upstream).await,
@@ -262,14 +284,17 @@ async fn forward_udp(raw: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
     sock.connect(upstream).await.ok()?;
     sock.send(raw).await.ok()?;
     let deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
-    let mut buf = vec![0u8; 65535];
+    // Room for the largest datagram, not zero-filled: recv_buf writes into the
+    // spare capacity.
+    let mut buf = Vec::with_capacity(65535);
     loop {
-        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf))
+        buf.clear();
+        tokio::time::timeout_at(deadline, sock.recv_buf(&mut buf))
             .await
             .ok()?
             .ok()?;
-        if is_reply_to(raw, &buf[..n]) {
-            return Some(buf[..n].to_vec());
+        if is_reply_to(raw, &buf) {
+            return Some(buf);
         }
         tracing::debug!(%upstream, "dns: ignoring a datagram that does not answer our query");
     }
@@ -490,6 +515,30 @@ mod tests {
         let mut r = q.to_vec();
         r[2] |= 0x80;
         r
+    }
+
+    #[tokio::test]
+    async fn forwards_in_flight_are_capped() {
+        // An upstream that never answers: every forward waits out its timeout
+        // holding a socket. Past the cap, queries are dropped at once.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let stats = std::sync::Arc::new(DnsStats::default());
+        let q = std::sync::Arc::new(query("example.com.", RecordType::MX, DNSClass::IN));
+        let pool = pool();
+        let tasks: Vec<_> = (0..MAX_FORWARDS + 5)
+            .map(|_| {
+                let (stats, q, pool) = (stats.clone(), q.clone(), pool.clone());
+                tokio::spawn(async move { respond(&q, &pool, silent_addr, Transport::Udp, &stats).await })
+            })
+            .collect();
+        for t in tasks {
+            assert!(t.await.unwrap().is_none());
+        }
+        // Those that went upstream timed out; the rest never went.
+        assert_eq!(stats.forward_failed.load(Ordering::Relaxed), MAX_FORWARDS as u64);
+        assert_eq!(stats.queries.load(Ordering::Relaxed), MAX_FORWARDS as u64 + 5);
+        drop(silent);
     }
 
     #[tokio::test]

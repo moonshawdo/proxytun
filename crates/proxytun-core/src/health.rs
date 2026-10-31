@@ -44,6 +44,9 @@ pub async fn probe_and_record(node: &Node, cfg: &HealthCfg) {
                 tracing::info!(proxy = %node.name, "proxy is healthy again");
             }
         }
+        Err(e) if crate::proxy::is_local_shortage(&e) => {
+            tracing::debug!(proxy = %node.name, "probe skipped for lack of local resources: {e:#}");
+        }
         Err(e) => {
             let was_up = node.is_healthy();
             node.record_failure(cfg.fail_threshold);

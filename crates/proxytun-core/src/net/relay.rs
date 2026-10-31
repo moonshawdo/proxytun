@@ -46,7 +46,7 @@ impl Default for SniffCfg {
 
 impl SniffCfg {
     fn skips(&self, name: &str) -> bool {
-        self.skip.iter().any(|s| name == s || name.ends_with(&format!(".{s}")))
+        self.skip.iter().any(|s| crate::policy::is_subdomain(name, s))
     }
 }
 
