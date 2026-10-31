@@ -111,7 +111,7 @@ pub fn scan(exclude: &[u16]) -> Vec<SocketAddr> {
 
 /// Relay connections to the namespace's `addr` to the host's `addr`.
 pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
-    let mut warned = None;
+    let (mut warned, mut busy_warned) = (None, None);
     loop {
         let (mut inbound, _) = match listener.accept().await {
             Ok(v) => v,
@@ -124,11 +124,16 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 continue;
             }
         };
+        let Ok(slot) = sh.relay_slots.clone().try_acquire_owned() else {
+            crate::capture::refuse_busy(&sh, inbound, &mut busy_warned);
+            continue;
+        };
         let id = sh.next_conn_id();
         let span = tracing::error_span!("conn", id, target = %addr);
         let sh = sh.clone();
         tokio::spawn(
             async move {
+                let _slot = slot;
                 sh.stats.connections.fetch_add(1, Ordering::Relaxed);
                 sh.stats.active.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("routing to the host's own port");

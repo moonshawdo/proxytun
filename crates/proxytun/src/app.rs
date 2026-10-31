@@ -196,6 +196,7 @@ pub fn run(args: Args) -> Result<i32> {
         last_stats: Mutex::new(Snapshot::zero()),
         last_id: AtomicU64::new(0),
         table_full_logged: Mutex::new(None),
+        relay_slots: Arc::new(tokio::sync::Semaphore::new(capture::MAX_RELAYS)),
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

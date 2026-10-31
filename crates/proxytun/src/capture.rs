@@ -46,7 +46,14 @@ pub struct Stats {
     pub drop_no_flow: AtomicU64,
     /// A SYN that found the address-rewriting table full.
     pub drop_table_full: AtomicU64,
+    /// Connections reset because `MAX_RELAYS` were being relayed already.
+    pub relays_refused: AtomicU64,
 }
+
+/// At most this many connections are relayed at once (captured and host-port
+/// alike): each holds two 64 KiB buffers, and the fd limit no longer stops
+/// them short of the address-rewriting table. 1 GiB of buffers at most.
+pub const MAX_RELAYS: usize = 8192;
 
 /// The counters `log_stats` turns into rates.
 #[derive(Clone, Copy)]
@@ -115,6 +122,22 @@ pub struct Shared {
     pub last_id: AtomicU64,
     /// When the full address-rewriting table was last reported.
     pub table_full_logged: Mutex<Option<Instant>>,
+    /// One per connection being relayed, `MAX_RELAYS` in all.
+    pub relay_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// A connection over `MAX_RELAYS`: reset at once, so the program fails fast
+/// instead of waiting on a connection nobody serves.
+pub fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream, warned: &mut Option<Instant>) {
+    count(&sh.stats.relays_refused, 1);
+    if throttle::due(warned, Instant::now(), throttle::EVERY) {
+        tracing::warn!(
+            "{MAX_RELAYS} connections are being relayed: refusing new ones (relays_refused; repeats \
+             within {}s not logged)",
+            throttle::EVERY.as_secs()
+        );
+    }
+    let _ = stream.set_zero_linger();
 }
 
 /// Report a full address-rewriting table now and then: every retried SYN
@@ -258,7 +281,7 @@ fn write_packet(tun: &OwnedFd, sh: &Shared, b: &[u8]) {
 
 /// Accept captured connections and relay each one.
 pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
-    let mut warned = None;
+    let (mut warned, mut busy_warned) = (None, None);
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -275,6 +298,17 @@ pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
                 continue;
             }
         };
+        let Ok(slot) = sh.relay_slots.clone().try_acquire_owned() else {
+            // Its entry ends here too, or it would wait for an accept forever.
+            if let SocketAddr::V4(p) = peer {
+                let mut nat = sh.nat();
+                if nat.accept(p.port()).is_some() {
+                    nat.close(p.port(), Instant::now());
+                }
+            }
+            refuse_busy(&sh, stream, &mut busy_warned);
+            continue;
+        };
         let id = sh.next_conn_id();
         // Every line about this connection names it. Error level: present
         // whenever anything is logged, so a proxy failing at warn names it too.
@@ -282,6 +316,7 @@ pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
         let sh = sh.clone();
         tokio::spawn(
             async move {
+                let _slot = slot;
                 if let Err(e) = relay_one(&sh, stream, peer).await {
                     tracing::debug!("relay conn error: {e:#}");
                 }
@@ -394,6 +429,7 @@ pub fn log_stats(sh: &Shared) {
         dropped_other_proto = n(&s.drop_other_proto),
         dropped_no_flow = n(&s.drop_no_flow),
         dropped_table_full = n(&s.drop_table_full),
+        relays_refused = n(&s.relays_refused),
         "stats"
     );
     let prev = std::mem::replace(&mut *sh.last_stats.lock().unwrap_or_else(|e| e.into_inner()), now);
@@ -445,6 +481,7 @@ mod tests {
             last_stats: Mutex::new(Snapshot::zero()),
             last_id: AtomicU64::new(0),
             table_full_logged: Mutex::new(None),
+            relay_slots: Arc::new(tokio::sync::Semaphore::new(MAX_RELAYS)),
         }
     }
 
@@ -527,6 +564,46 @@ mod tests {
         assert_eq!(sh.nat().accept(port), None, "closed once the relay is done");
         assert_eq!(sh.stats.connections.load(Ordering::Relaxed), 1);
         assert_eq!(sh.stats.active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn over_the_relay_cap_a_connection_is_reset_at_once() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(listen) = l.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut sh = shared(listen);
+        sh.relay_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let sh = Arc::new(sh);
+        tokio::spawn(run_relay(l, sh.clone()));
+        let connect = |port: u16| {
+            let sock = TcpSocket::new_v4().unwrap();
+            sock.set_reuseaddr(true).unwrap();
+            sock.bind(SocketAddr::V4(SocketAddrV4::new(sh.addrs.nat, port)))
+                .unwrap();
+            sock.connect(SocketAddr::V4(listen))
+        };
+        let entry = |program: &str| {
+            sh.nat()
+                .outbound(sa(program), sa("9.9.9.9:53"), true, Instant::now())
+                .unwrap()
+        };
+        // One connection (DNS over TCP, held open) takes the only slot.
+        let first = entry("198.19.255.1:5001");
+        let _held = connect(first).await.unwrap();
+        while sh.stats.active.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The next one is reset, not left waiting, and its entry ends.
+        let second = entry("198.19.255.1:5002");
+        let mut c = connect(second).await.unwrap();
+        let mut b = [0u8; 1];
+        let r = tokio::time::timeout(Duration::from_secs(2), tokio::io::AsyncReadExt::read(&mut c, &mut b))
+            .await
+            .expect("answered at once");
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::ConnectionReset);
+        assert_eq!(sh.stats.relays_refused.load(Ordering::Relaxed), 1);
+        assert_eq!(sh.nat().accept(second), None, "its entry is closed");
     }
 
     /// A pipe stands in for the TUN device: what we write comes out of the
