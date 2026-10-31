@@ -5,8 +5,9 @@
 //! live connection count and an EWMA of handshake latency.
 
 use crate::config::{Config, ProxyCfg, Strategy};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -129,7 +130,7 @@ pub struct Group {
 }
 
 impl Group {
-    pub fn new(name: &str, strategy: Strategy, nodes: Vec<Arc<Node>>) -> Group {
+    pub fn new(name: &str, strategy: Strategy, nodes: Vec<Arc<Node>>) -> Result<Group> {
         // Interleave rather than repeat in blocks so weight 2/1 yields a,b,a
         // style spreading instead of a,a,b bursts.
         let max_w = nodes.iter().map(|n| n.weight).max().unwrap_or(1);
@@ -141,14 +142,20 @@ impl Group {
                 }
             }
         }
-        Group {
+        // Every start and reload draws its own sequence, seeded by the
+        // kernel's CSPRNG; never a guessable fallback. Only `random` uses it.
+        let seed = match strategy {
+            Strategy::Random => urandom_u64().context("seeding the random strategy from /dev/urandom")?,
+            _ => 0,
+        };
+        Ok(Group {
             name: name.to_string(),
             strategy,
             nodes,
             rr: AtomicUsize::new(0),
-            rng: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+            rng: AtomicU64::new(seed),
             schedule,
-        }
+        })
     }
 
     fn next_rr(&self) -> usize {
@@ -156,8 +163,9 @@ impl Group {
     }
 
     fn next_rand(&self) -> u64 {
-        // splitmix64 over an atomic counter: cheap, lock-free, good enough
-        // for spreading load (not for anything security related).
+        // splitmix64 over an atomic counter from the seed: cheap, lock-free,
+        // good enough for spreading load. Its outputs give each other away,
+        // so it is not for anything that must stay secret.
         let mut z = self.rng.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -220,6 +228,12 @@ impl Group {
     }
 }
 
+fn urandom_u64() -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(u64::from_ne_bytes(b))
+}
+
 fn fnv1a(key: &str, salt: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key.bytes().chain(std::iter::once(0xff)).chain(salt.bytes()) {
@@ -251,7 +265,7 @@ impl Registry {
                 .iter()
                 .map(|m| by_name.get(m).cloned().ok_or_else(|| anyhow!("unknown proxy {m}")))
                 .collect::<Result<Vec<_>>>()?;
-            groups.insert(g.name.clone(), Arc::new(Group::new(&g.name, g.strategy, members)));
+            groups.insert(g.name.clone(), Arc::new(Group::new(&g.name, g.strategy, members)?));
         }
         Ok(Registry { nodes, groups })
     }
@@ -279,7 +293,7 @@ mod tests {
     }
 
     fn group(strategy: Strategy, names: &[(&str, u32)]) -> Group {
-        Group::new("g", strategy, names.iter().map(|(n, w)| node(n, *w)).collect())
+        Group::new("g", strategy, names.iter().map(|(n, w)| node(n, *w)).collect()).unwrap()
     }
 
     fn picks(g: &Group, n: usize) -> Vec<usize> {
@@ -324,6 +338,18 @@ mod tests {
             seen[0] > 100 && seen[1] > 100,
             "both healthy nodes get traffic: {seen:?}"
         );
+    }
+
+    #[test]
+    fn random_differs_from_one_start_to_the_next() {
+        // Each start (and reload) builds its groups afresh: with a fixed seed
+        // every short run would send its first connections to the same
+        // members. Equal by chance: 8^-32.
+        let names: Vec<(String, u32)> = (0..8).map(|i| (format!("n{i}"), 1)).collect();
+        let names: Vec<(&str, u32)> = names.iter().map(|(n, w)| (n.as_str(), *w)).collect();
+        let a = group(Strategy::Random, &names);
+        let b = group(Strategy::Random, &names);
+        assert_ne!(picks(&a, 32), picks(&b, 32));
     }
 
     #[test]

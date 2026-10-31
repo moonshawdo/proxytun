@@ -860,7 +860,8 @@ mod tests {
                 "g",
                 Strategy::RoundRobin,
                 vec![node_at("a", a, kind), node_at("b", b, kind)],
-            );
+            )
+            .unwrap();
             for _ in 0..5 {
                 assert!(dial_group(&g, &dom("dead.example", 443), 2, 3).await.is_err());
             }
@@ -890,7 +891,8 @@ mod tests {
                 "g",
                 Strategy::RoundRobin,
                 vec![node_at("a", a, kind), node_at("b", b, kind)],
-            );
+            )
+            .unwrap();
             let e = dial_group(&g, &dom("black.hole", 443), 2, 1)
                 .await
                 .err()
@@ -914,7 +916,7 @@ mod tests {
         // A proxy that does not even greet is at fault.
         let mute = async {
             let (m, _) = scripted_proxy(Reply::Mute).await;
-            let g = Group::new("g", Strategy::RoundRobin, vec![node_at("m", m, ProxyKind::Socks5)]);
+            let g = Group::new("g", Strategy::RoundRobin, vec![node_at("m", m, ProxyKind::Socks5)]).unwrap();
             assert!(dial_group(&g, &dom("x.example", 443), 0, 1).await.is_err());
             assert!(!g.nodes[0].is_healthy(), "a silent proxy is marked down");
         };
@@ -933,7 +935,8 @@ mod tests {
             "g",
             Strategy::RoundRobin,
             vec![node_at("a", a, ProxyKind::Socks5), node_at("b", b, ProxyKind::Socks5)],
-        );
+        )
+        .unwrap();
         for _ in 0..6 {
             dial_group(&g, &dom("x.example", 443), 2, 1).await.unwrap();
         }
@@ -943,7 +946,7 @@ mod tests {
         assert_eq!(b_hits.load(Ordering::SeqCst), 6, "and b got every one");
         // All members hang up: it fails, still blaming none.
         let (c, _) = scripted_proxy(Reply::SocksHangsUp).await;
-        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("c", c, ProxyKind::Socks5)]);
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("c", c, ProxyKind::Socks5)]).unwrap();
         for _ in 0..3 {
             assert!(dial_group(&g, &dom("x.example", 443), 2, 1).await.is_err());
         }
@@ -953,7 +956,7 @@ mod tests {
     #[tokio::test]
     async fn a_destination_no_proxy_can_be_asked_for_costs_no_connection() {
         let (a, hits) = scripted_proxy(Reply::Socks(0)).await;
-        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]);
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]).unwrap();
         for d in ["", &"x".repeat(256)] {
             let e = dial_group(&g, &dom(d, 80), 2, 1).await.err().expect("must fail");
             assert!(
@@ -971,7 +974,7 @@ mod tests {
         // 8 s to greet, then 3 s for the destination: 11 s in all, more than
         // one HANDSHAKE_TIMEOUT, but each phase is within its own.
         let (a, _) = scripted_proxy(Reply::SlowGreeting).await;
-        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]);
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]).unwrap();
         assert!(dial_group(&g, &dom("slow.example", 443), 0, 1).await.is_ok());
     }
 
@@ -987,7 +990,8 @@ mod tests {
                 node_at("bad", bad, ProxyKind::Http),
                 node_at("good", good, ProxyKind::Http),
             ],
-        );
+        )
+        .unwrap();
         for _ in 0..3 {
             dial_group(&g, &dom("ok.example", 443), 2, 3).await.unwrap();
         }
@@ -997,7 +1001,7 @@ mod tests {
         // Nothing listening: also a proxy failure.
         let dead = crate::testutil::refused();
         let n = node_at("dead", dead.addr, ProxyKind::Socks5);
-        let g = Group::new("g", Strategy::RoundRobin, vec![n]);
+        let g = Group::new("g", Strategy::RoundRobin, vec![n]).unwrap();
         assert!(dial_group(&g, &dom("x.example", 443), 0, 1).await.is_err());
         assert!(!g.nodes[0].is_healthy());
     }
@@ -1025,7 +1029,8 @@ mod tests {
                 "g",
                 Strategy::RoundRobin,
                 vec![node_at("a", a, kind), node_at("b", b, kind)],
-            );
+            )
+            .unwrap();
             for _ in 0..6 {
                 dial_group(&g, &dom("x.example", 443), 2, 1)
                     .await
@@ -1056,7 +1061,8 @@ mod tests {
                 "g",
                 Strategy::RoundRobin,
                 vec![node_at("a", a, kind), node_at("b", b, kind)],
-            );
+            )
+            .unwrap();
             for _ in 0..3 {
                 dial_group(&g, &dom("x.example", 443), 2, 1).await.unwrap();
             }
@@ -1068,7 +1074,7 @@ mod tests {
     #[tokio::test]
     async fn successful_connections_do_not_feed_the_latency_estimate() {
         let (a, _) = scripted_proxy(Reply::Socks(0)).await;
-        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]);
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]).unwrap();
         dial_group(&g, &dom("x.example", 443), 0, 3).await.unwrap();
         assert_eq!(g.nodes[0].latency_us(), 0, "only health probes measure the proxy hop");
         assert_eq!(g.nodes[0].stats().ok_total, 1);

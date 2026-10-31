@@ -205,7 +205,7 @@ members = ["hk", "jp"]
 | 策略 | 行为 |
 |---|---|
 | `round-robin` | 依次轮流(默认) |
-| `random` | 伪随机(种子固定，每次启动的序列相同) |
+| `random` | 随机(种子取自 `/dev/urandom`,每次启动和热加载都不同) |
 | `least-conn` | 当前活跃连接最少的;平局时轮转 |
 | `least-latency` | 到代理的探测延迟(EWMA)最低的;还没有样本时先轮转 |
 | `weighted-round-robin` | 按 `weight` 比例轮流 |

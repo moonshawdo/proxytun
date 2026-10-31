@@ -284,7 +284,7 @@ members = ["hk", "jp"]
 | `strategy` | 行为 | 适用场景 |
 |---|---|---|
 | `round-robin` | 依次轮流 | 默认;各代理能力相近 |
-| `random` | 伪随机：种子固定，每次启动(和每次热加载)后的选择序列相同 | 一次运行里连接很多、想打乱顺序时;不能在多次短时运行之间分散负载(每次运行的头几条连接总落在同样的成员上) |
+| `random` | 随机：每次启动和热加载时从 `/dev/urandom` 取种子 | 频繁短时运行(每次只有几条连接):`round-robin` 每次启动都从第一个成员开始,`random` 能把负载分散开 |
 | `least-conn` | 当前经它转发的活跃连接最少的;数量相同时轮流 | 长连接多、连接时长差异大 |
 | `least-latency` | 健康检查测得的延迟(加权平均)最低的;还没有测量结果时轮流 | 代理位置不同，想选最快的。SOCKS5 与 HTTP 混在一组时偏向 HTTP(SOCKS5 的探测多一个问候往返) |
 | `weighted-round-robin` | 按 `weight` 的比例轮流 | 代理带宽不同 |
@@ -516,3 +516,4 @@ addr = "127.0.0.1:7890"
 | `unsupported proxy scheme …` | `--proxy` / `PROXYTUN_PROXY` 的 scheme 不是 `socks5`、`socks5h`、`http` |
 | `proxy url "…" needs a scheme (socks5:// or http://)` | `--proxy` / `PROXYTUN_PROXY` 没写 `socks5://` 或 `http://` |
 | `bad percent-escape in proxy url credentials` | 代理 URL 里用户名或密码的 `%XX` 转义写错 |
+| `seeding the random strategy from /dev/urandom` | 有 `random` 策略的组，但读不到 `/dev/urandom`(没有 `/dev`、fd 用尽):拒绝启动或这次重载，不退回固定种子 |
