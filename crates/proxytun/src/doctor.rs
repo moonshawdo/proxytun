@@ -128,6 +128,11 @@ fn check_mode(cfg: &Config, no_sudo: bool) -> Vec<Check> {
         forwards: Vec::new(),
     };
     let root = nix::unistd::geteuid().is_root();
+    // A caller that ignores SIGCHLD would have the kernel reap the trial
+    // program unasked: waitpid would fail and leave a status of 0, a failed
+    // trial passing for a good one. (The trial is `true`: nothing to keep.)
+    // SAFETY: plain syscall.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     match netns::spawn(&setup).and_then(|(child, _ns)| {
         child.go()?;
         let mut status = 0;

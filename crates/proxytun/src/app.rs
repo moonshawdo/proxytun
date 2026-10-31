@@ -174,6 +174,8 @@ pub fn run(args: Args) -> Result<i32> {
         forwards,
         ..
     } = ns;
+    // Shared with the sweeper, which writes resets to the programs.
+    let tun = Arc::new(tun);
     if !forwards.is_empty() {
         let list: Vec<String> = forwards.iter().map(|(a, _)| a.to_string()).collect();
         tracing::info!("host ports reachable inside: {}", list.join(", "));
@@ -200,20 +202,22 @@ pub fn run(args: Args) -> Result<i32> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Blocking work is resolving host names for direct rules
-        // (getaddrinfo, seconds on a slow resolver). Each thread counts
-        // against the user's process limit, which the program shares; the
-        // default would allow 512.
+        // (getaddrinfo, seconds on a slow resolver; at most
+        // relay::MAX_LOOKUPS at once). Each thread counts against the user's
+        // process limit, which the program shares; the default would allow
+        // 512.
         .max_blocking_threads(64)
         .build()
         .context("build tokio runtime")?;
     let health_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     {
-        let (sh, main_pid, health_task, cfg_path, proxy_override) = (
+        let (sh, main_pid, health_task, cfg_path, proxy_override, sweep_tun) = (
             sh.clone(),
             main_pid.clone(),
             health_task.clone(),
             args.config.clone(),
             proxy_override.clone(),
+            tun.clone(),
         );
         let health_cfg = cfg.health.clone();
         rt.block_on(async move {
@@ -228,7 +232,7 @@ pub fn run(args: Args) -> Result<i32> {
                     sh.clone(),
                 ));
             }
-            tokio::spawn(capture::run_sweeper(sh.clone()));
+            tokio::spawn(capture::run_sweeper(sweep_tun, sh.clone()));
             *health_task.lock().unwrap() = Some(health::spawn(live.registry.nodes.clone(), health_cfg));
             spawn_signal_handlers(sh, cfg_path, proxy_override, health_task);
             if let Some(fd) = exit_fd {

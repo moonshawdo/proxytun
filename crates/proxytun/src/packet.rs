@@ -192,17 +192,20 @@ pub fn tcp_seq(buf: &[u8], p: &Packet) -> u32 {
     u32::from_be_bytes(buf[p.ihl + 4..p.ihl + 8].try_into().expect("4 bytes"))
 }
 
-/// A TCP reset from `src` to `dst` acknowledging `ack`: the answer to a SYN
-/// (ack = its sequence number + 1) that the kernel turns into ECONNREFUSED.
-pub fn build_tcp_reset(src: SocketAddrV4, dst: SocketAddrV4, ack: u32) -> Vec<u8> {
+/// A TCP reset from `src` to `dst`. Answering a SYN it acknowledges it
+/// (`ack` = its sequence number + 1, `seq` 0): ECONNREFUSED. On an
+/// established connection it carries exactly the sequence number the other
+/// side expects next, and no ACK: ECONNRESET.
+pub fn build_tcp_reset(src: SocketAddrV4, dst: SocketAddrV4, seq: u32, ack: Option<u32>) -> Vec<u8> {
     let mut buf = vec![0u8; 40];
     ip_header(&mut buf, 40, PROTO_TCP, *src.ip(), *dst.ip());
     let tcp = &mut buf[20..];
     tcp[0..2].copy_from_slice(&src.port().to_be_bytes());
     tcp[2..4].copy_from_slice(&dst.port().to_be_bytes());
-    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.unwrap_or(0).to_be_bytes());
     tcp[12] = 5 << 4; // data offset: no options
-    tcp[13] = TCP_RST | TCP_ACK;
+    tcp[13] = if ack.is_some() { TCP_RST | TCP_ACK } else { TCP_RST };
     let c = l4_checksum(*src.ip(), *dst.ip(), PROTO_TCP, tcp);
     tcp[16..18].copy_from_slice(&c.to_be_bytes());
     buf

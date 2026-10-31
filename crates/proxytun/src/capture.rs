@@ -170,8 +170,7 @@ fn count(c: &AtomicU64, n: usize) {
 /// (named "tun", easy to find in `top -H`): the namespace's TCP processing
 /// happens in our writes, so this is where the CPU goes. `rt` runs the DNS
 /// lookups, which may take seconds.
-pub fn run_tun(tun: OwnedFd, sh: Arc<Shared>, rt: Handle) -> Result<()> {
-    let tun = Arc::new(tun);
+pub fn run_tun(tun: Arc<OwnedFd>, sh: Arc<Shared>, rt: Handle) -> Result<()> {
     let mut buf = vec![0u8; 65536];
     loop {
         // SAFETY: read into our own buffer from a blocking fd.
@@ -207,17 +206,23 @@ fn on_packet(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &mut [u8]) 
 }
 
 fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
+    let rst = p.flags & TCP_RST != 0;
     let rewritten = if p.src == sh.listen {
         // The listener answering: back to the program, from where it dialed.
         let mut nat = sh.nat();
-        let (syn_ack, rst) = (
-            p.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK,
-            p.flags & TCP_RST != 0,
-        );
-        nat.listener_sent(p.dst, syn_ack, rst, Instant::now());
+        let syn_ack = (p.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK).then(|| packet::tcp_seq(pkt, p));
+        // Only these change an entry's state: no second lookup per data packet.
+        if syn_ack.is_some() || rst {
+            nat.listener_sent(p.dst, syn_ack, rst, Instant::now());
+        }
         nat.inbound(p.dst)
     } else {
-        let nat = sh.nat().outbound(p.src, p.dst, p.is_syn(), Instant::now());
+        let mut table = sh.nat();
+        let nat = table.outbound(p.src, p.dst, p.is_syn(), Instant::now());
+        if rst {
+            table.program_reset(p.src, p.dst, Instant::now());
+        }
+        drop(table);
         if p.is_syn() {
             match nat {
                 Some(nat) => tracing::trace!(src = %p.src, dst = %p.dst, %nat, "syn"),
@@ -225,7 +230,7 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
                     // Refused at once: the program gets ECONNREFUSED now
                     // rather than retrying its SYN for two minutes.
                     let ack = packet::tcp_seq(pkt, p).wrapping_add(1);
-                    write_packet(tun, sh, &packet::build_tcp_reset(p.dst, p.src, ack));
+                    write_packet(tun, sh, &packet::build_tcp_reset(p.dst, p.src, 0, Some(ack)));
                     if table_full_due(sh) {
                         tracing::error!(
                             src = %p.src, dst = %p.dst,
@@ -387,14 +392,27 @@ fn to_target(dst: SocketAddrV4, pool: &FakePool) -> (Target, Option<FakeGuard>) 
 }
 
 /// Drop table entries whose connection is long gone.
-pub async fn run_sweeper(sh: Arc<Shared>) {
+pub async fn run_sweeper(tun: Arc<OwnedFd>, sh: Arc<Shared>) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
-        let n = sh.nat().sweep(Instant::now());
-        if n > 0 {
-            tracing::debug!(expired = n, "swept address-rewriting entries");
-        }
+        sweep(&tun, &sh, Instant::now());
+    }
+}
+
+/// Expire address-rewriting entries, and reset the programs left holding a
+/// connection that was never accepted.
+fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
+    let (n, resets) = {
+        let mut nat = sh.nat();
+        (nat.sweep(now), nat.take_resets())
+    };
+    if n > 0 {
+        tracing::debug!(expired = n, reset = resets.len(), "swept address-rewriting entries");
+    }
+    for r in resets {
+        tracing::debug!(program = %r.to, dst = %r.from, "never accepted: resetting the program's connection");
+        write_packet(tun, sh, &packet::build_tcp_reset(r.from, r.to, r.seq, None));
     }
 }
 
@@ -504,10 +522,44 @@ mod tests {
         let mut syn_ack = crate::packet::tests::tcp(sh.listen, nat, TCP_SYN | TCP_ACK, b"");
         let p = packet::parse(&syn_ack).unwrap();
         on_tcp(&tun, &sh, &mut syn_ack, &p);
-        // accept stalls (out of fds) past EMBRYONIC: the entry must still be
+        // accept stalls for a while (out of fds): the entry must still be
         // there for the relay to find.
-        sh.nat().sweep(Instant::now() + 2 * crate::nat::EMBRYONIC);
+        sh.nat().sweep(Instant::now() + crate::nat::QUEUED / 2);
         assert_eq!(sh.nat().accept(nat), Some(dst));
+
+        // Another, never accepted: once its time is up, the program is reset
+        // through the TUN device, at the sequence number it expects.
+        use std::io::Read;
+        let (tun, mut out) = fake_tun();
+        let other = crate::packet::tests::sa("198.19.255.1:40001");
+        let mut syn = crate::packet::tests::tcp(other, dst, TCP_SYN, b"");
+        let p = packet::parse(&syn).unwrap();
+        on_tcp(&tun, &sh, &mut syn, &p);
+        let nat = sh.nat().outbound(other, dst, false, Instant::now()).unwrap();
+        let mut syn_ack = crate::packet::tests::tcp(sh.listen, nat, TCP_SYN | TCP_ACK, b"");
+        let p = packet::parse(&syn_ack).unwrap();
+        on_tcp(&tun, &sh, &mut syn_ack, &p);
+        let mut written = vec![0u8; 4096];
+        let got = out.read(&mut written).unwrap(); // the rewritten SYN and SYN-ACK
+        assert_eq!(got, syn.len() + syn_ack.len());
+        sweep(&tun, &sh, Instant::now() + crate::nat::QUEUED);
+        let got = out.read(&mut written).unwrap();
+        let r = packet::parse(&written[..got]).unwrap();
+        assert!(crate::packet::tests::checksums_ok(&written[..got]));
+        assert_eq!((r.src, r.dst, r.flags), (dst, other, TCP_RST));
+        // The test SYN-ACK's sequence number is 0x01020304.
+        assert_eq!(packet::tcp_seq(&written[..got], &r), 0x0102_0305);
+
+        // A third, reset by the program before accept (it gave up): over.
+        let third = crate::packet::tests::sa("198.19.255.1:40002");
+        let mut syn = crate::packet::tests::tcp(third, dst, TCP_SYN, b"");
+        let p = packet::parse(&syn).unwrap();
+        on_tcp(&tun, &sh, &mut syn, &p);
+        let nat = sh.nat().outbound(third, dst, false, Instant::now()).unwrap();
+        let mut rst = crate::packet::tests::tcp(third, dst, TCP_RST, b"");
+        let p = packet::parse(&rst).unwrap();
+        on_tcp(&tun, &sh, &mut rst, &p);
+        assert_eq!(sh.nat().accept(nat), None, "the program's reset ended it");
     }
 
     #[test]

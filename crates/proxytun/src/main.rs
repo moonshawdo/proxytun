@@ -180,12 +180,14 @@ fn main() -> Result<()> {
         cli.log_file.as_deref(),
     )?;
     // A panic (a thread the kernel would not give us, say) belongs in the log
-    // file too, not only on stderr.
-    let report = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        tracing::error!("panic: {info}");
-        report(info);
-    }));
+    // file too; without one, the usual report on stderr is enough.
+    if cli.log_file.is_some() {
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!("panic: {info}");
+            report(info);
+        }));
+    }
 
     if cli.doctor {
         let proxy = cli.proxy.clone().or_else(|| std::env::var("PROXYTUN_PROXY").ok());

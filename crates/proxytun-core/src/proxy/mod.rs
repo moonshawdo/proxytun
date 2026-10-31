@@ -24,10 +24,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// unreachable, forbidden), and another member would only repeat it. Otherwise
 /// (SOCKS5 "general failure", HTTP 500/503: the proxy's own upstream may be
 /// what failed) another member is tried.
+/// `answered`: the proxy said so. When it said nothing (the destination
+/// never answered it) or was never asked, its health is left as it was.
 #[derive(Debug)]
 pub struct TargetRefused {
     pub msg: String,
     pub about_target: bool,
+    pub answered: bool,
 }
 
 impl std::fmt::Display for TargetRefused {
@@ -168,6 +171,7 @@ where
             0x02..=0x06 => Err(TargetRefused {
                 msg,
                 about_target: true,
+                answered: true,
             }
             .into()),
             // Command / address type not supported: this proxy cannot do it.
@@ -176,6 +180,7 @@ where
             _ => Err(TargetRefused {
                 msg,
                 about_target: false,
+                answered: true,
             }
             .into()),
         };
@@ -248,12 +253,14 @@ where
         Some(403 | 502 | 504) => Err(TargetRefused {
             msg: format!("http connect failed: {status_line}"),
             about_target: true,
+            answered: true,
         }
         .into()),
         // 500, 503, ...: maybe the destination, maybe the proxy's upstream.
         Some(_) => Err(TargetRefused {
             msg: format!("http connect failed: {status_line}"),
             about_target: false,
+            answered: true,
         }
         .into()),
         None => bail!("http connect: malformed status line {status_line:?}"),
@@ -300,6 +307,7 @@ pub async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
             socks5_connect_request(t).map_err(|e| TargetRefused {
                 msg: format!("{e:#}"),
                 about_target: true,
+                answered: false,
             })?,
         )),
         ProxyKind::Http => None,
@@ -309,7 +317,6 @@ pub async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
         .map_err(|_| anyhow!("connect to proxy {} timed out", node.name))?
         .with_context(|| format!("connect to proxy {} ({})", node.name, node.addr))?;
     s.set_nodelay(true).ok();
-    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let unanswered = || -> anyhow::Error {
         TargetRefused {
             msg: format!(
@@ -318,19 +325,22 @@ pub async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
                 HANDSHAKE_TIMEOUT.as_secs()
             ),
             about_target: true,
+            answered: false,
         }
         .into()
     };
     match socks {
         Some((creds, req)) => {
-            tokio::time::timeout_at(deadline, socks5_greet(&mut s, creds))
+            // Each phase its own time: a slow greeting is the proxy's, and must
+            // not shorten the wait for the destination.
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, socks5_greet(&mut s, creds))
                 .await
                 .map_err(|_| anyhow!("socks5 greeting of proxy {} timed out", node.name))??;
-            tokio::time::timeout_at(deadline, socks5_request(&mut s, &req))
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, socks5_request(&mut s, &req))
                 .await
                 .map_err(|_| unanswered())??;
         }
-        None => tokio::time::timeout_at(deadline, http_handshake(&mut s, t, user, pass))
+        None => tokio::time::timeout(HANDSHAKE_TIMEOUT, http_handshake(&mut s, t, user, pass))
             .await
             .map_err(|_| unanswered())??,
     }
@@ -362,12 +372,20 @@ pub async fn dial_group(
                 return Ok((s, node.acquire(), node.name.clone()));
             }
             Err(e) if e.downcast_ref::<TargetRefused>().is_some() => {
-                node.record_ok();
+                if e.downcast_ref::<TargetRefused>().is_some_and(|r| r.answered) {
+                    node.record_ok();
+                }
                 if e.downcast_ref::<TargetRefused>().is_some_and(|r| r.about_target) {
                     tracing::debug!(proxy = %node.name, "destination refused by the proxy: {e:#}");
                     return Err(e);
                 }
                 tracing::debug!(proxy = %node.name, "proxy could not connect, trying another: {e:#}");
+                last_err = e;
+            }
+            // Local ports run out per destination: another proxy may still
+            // have plenty. Nobody's fault either way.
+            Err(e) if is_errno(&e, libc::EADDRNOTAVAIL) => {
+                tracing::warn!(proxy = %node.name, "no local port left towards this proxy, trying another: {e:#}");
                 last_err = e;
             }
             Err(e) if is_local_shortage(&e) => {
@@ -384,10 +402,16 @@ pub async fn dial_group(
     Err(last_err)
 }
 
+/// Is `errno` anywhere in `e`'s chain?
+fn is_errno(e: &anyhow::Error, errno: i32) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<std::io::Error>().and_then(|io| io.raw_os_error()) == Some(errno))
+}
+
 /// Did `e` happen for lack of our own resources (fds, buffers, memory,
-/// local ports)?
-/// That is not the proxy's fault: it must not count against its health, and
-/// every other proxy would fail the same way.
+/// local ports)? That is not the proxy's fault: it must not count against
+/// its health. Short of fds or memory, every other proxy would fail the same
+/// way; short of local ports, maybe not (they are counted per destination).
 pub fn is_local_shortage(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
@@ -411,6 +435,8 @@ mod tests {
         assert!(is_local_shortage(&io(libc::EMFILE)));
         assert!(is_local_shortage(&io(libc::ENFILE)));
         assert!(is_local_shortage(&io(libc::EADDRNOTAVAIL)), "local ports used up");
+        assert!(is_errno(&io(libc::EADDRNOTAVAIL), libc::EADDRNOTAVAIL));
+        assert!(!is_errno(&io(libc::EMFILE), libc::EADDRNOTAVAIL));
         assert!(!is_local_shortage(&io(libc::ECONNREFUSED)));
         assert!(!is_local_shortage(&io(libc::ETIMEDOUT)));
     }
@@ -699,6 +725,8 @@ mod tests {
         HttpUnanswered,
         /// Accepts the TCP connection, never greets.
         Mute,
+        /// Greets after 8 s, then gets through 3 s after the request.
+        SlowGreeting,
     }
 
     /// A proxy that always gives the same answer; counts connections.
@@ -738,6 +766,18 @@ mod tests {
                             // Hold on, silent, until the client gives up.
                             let mut sink = [0u8; 64];
                             while c.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                        }
+                        Reply::SlowGreeting => {
+                            let mut g = [0u8; 3];
+                            c.read_exact(&mut g).await.ok();
+                            tokio::time::sleep(Duration::from_secs(8)).await;
+                            c.write_all(&[5, 0]).await.ok();
+                            let mut h = [0u8; 5];
+                            c.read_exact(&mut h).await.ok();
+                            let mut rest = vec![0u8; h[4] as usize + 2];
+                            c.read_exact(&mut rest).await.ok();
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.ok();
                         }
                         Reply::HttpUnanswered | Reply::Mute => {
                             let mut sink = [0u8; 64];
@@ -821,6 +861,11 @@ mod tests {
                 "{e:#}"
             );
             assert!(g.nodes.iter().all(|n| n.is_healthy()), "{kind:?}: nodes must stay UP");
+            // Nor up on its account: it never said the destination was fine.
+            assert!(
+                g.nodes.iter().all(|n| n.stats().ok_total == 0),
+                "{kind:?}: no success recorded"
+            );
             assert_eq!(
                 hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
                 1,
@@ -850,7 +895,17 @@ mod tests {
             );
         }
         assert!(g.nodes[0].is_healthy());
+        assert_eq!(g.nodes[0].stats().ok_total, 0, "nor counted a success");
         assert_eq!(hits.load(Ordering::SeqCst), 0, "found out before connecting");
+    }
+
+    #[tokio::test]
+    async fn a_slow_greeting_does_not_shorten_the_wait_for_the_destination() {
+        // 8 s to greet, then 3 s for the destination: 11 s in all, more than
+        // one HANDSHAKE_TIMEOUT, but each phase is within its own.
+        let (a, _) = scripted_proxy(Reply::SlowGreeting).await;
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]);
+        assert!(dial_group(&g, &dom("slow.example", 443), 0, 1).await.is_ok());
     }
 
     #[tokio::test]

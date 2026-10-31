@@ -2614,6 +2614,24 @@ fn doctor_reports_rootless_mode_and_each_proxy() {
 }
 
 #[test]
+fn doctor_is_not_fooled_by_a_caller_that_ignores_sigchld() {
+    require!("python3");
+    let dir = tmp_dir("doctor-sigchld");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // The trial program cannot even start (no `true` on PATH): the doctor must
+    // say so, even with the kernel reaping its children unasked.
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c").arg(
+        "import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); \
+         os.execve(sys.argv[1], sys.argv[1:], {'PATH': '/nonexistent'})",
+    );
+    cmd.args([BIN, "-c", cfg.to_str().unwrap(), "--doctor"]);
+    let out = run_cmd(cmd, &[]);
+    assert!(out.stdout.contains("[FAIL] namespace"), "{}", out.dump());
+    assert!(out.stdout.contains("did not run"), "{}", out.dump());
+}
+
+#[test]
 fn doctor_reports_the_sudo_mode_without_running_sudo() {
     require_centos7!();
     let mock = start_mock_proxy(1);

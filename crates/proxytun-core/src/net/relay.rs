@@ -288,12 +288,48 @@ impl AsyncWrite for Counted<'_> {
     }
 }
 
+/// Host-name lookups for direct rules run on blocking threads (getaddrinfo,
+/// seconds on a slow resolver): at most this many at once, fewer than the
+/// runtime's 64 blocking threads. So a lookup never waits in that pool's
+/// queue, where one given up at its timeout would still run later and hold
+/// up those behind it; past the limit a connection fails at once instead.
+pub const MAX_LOOKUPS: usize = 32;
+static LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_LOOKUPS);
+
+async fn lookup(
+    slots: &'static tokio::sync::Semaphore,
+    host: &str,
+    port: u16,
+) -> io::Result<Vec<std::net::SocketAddr>> {
+    let Ok(slot) = slots.try_acquire() else {
+        static WARNED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        let mut last = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::throttle::due(&mut last, Instant::now(), crate::throttle::EVERY) {
+            tracing::warn!(
+                "{MAX_LOOKUPS} host name lookups for direct rules under way (a slow resolver?): failing \
+                 new direct connections to names (repeats within {}s not logged)",
+                crate::throttle::EVERY.as_secs()
+            );
+        }
+        return Err(io::Error::other(format!(
+            "{MAX_LOOKUPS} host name lookups already under way"
+        )));
+    };
+    let host = host.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot; // held until getaddrinfo is done, however long
+        std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port)).map(Iterator::collect)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 /// Direct connect. For a domain we must resolve it ourselves now, because the
 /// program was handed a *fake* IP; the real one was never resolved on its side.
 async fn dial_direct(t: &Target) -> Result<TcpStream> {
     let fut = async {
         match t {
-            Target::Domain(d, p) => TcpStream::connect((d.as_str(), *p)).await,
+            Target::Domain(d, p) => TcpStream::connect(&lookup(&LOOKUPS, d, *p).await?[..]).await,
             Target::V4(ip, p) => TcpStream::connect((*ip, *p)).await,
             Target::V6(ip, p) => TcpStream::connect((*ip, *p)).await,
         }
@@ -921,5 +957,18 @@ mod tests {
         let (moved, r, _) = r.expect("the pump must end after a reset").unwrap();
         assert!(r.is_err(), "a reset is an error");
         assert_eq!(moved.up, 1000, "bytes moved before the error are counted");
+    }
+
+    #[tokio::test]
+    async fn direct_lookups_beyond_the_limit_fail_at_once() {
+        let slots: &'static tokio::sync::Semaphore = Box::leak(Box::new(tokio::sync::Semaphore::new(1)));
+        let addrs = lookup(slots, "localhost", 80).await.unwrap();
+        assert!(addrs.iter().any(|a| a.ip().is_loopback()), "{addrs:?}");
+        // The only slot taken (a lookup still waiting on a slow resolver).
+        let _busy = slots.try_acquire().unwrap();
+        let t0 = Instant::now();
+        let e = lookup(slots, "localhost", 80).await.unwrap_err();
+        assert!(e.to_string().contains("lookups already under way"), "{e}");
+        assert!(t0.elapsed() < Duration::from_millis(100), "not queued");
     }
 }

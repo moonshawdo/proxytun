@@ -11,8 +11,11 @@
 //! Lifecycle of an entry:
 //!   * created by the program's SYN;
 //!   * answered by the listener (its SYN-ACK): the connection now waits in
-//!     the accept queue, however long accept takes (out of fds, say); a
-//!     reset from the listener before then ends it;
+//!     the accept queue, for `QUEUED` at most (accept stalled, out of fds;
+//!     or the listener's kernel dropped it unannounced, its accept queue
+//!     full): then the program, whose side is established, gets a reset
+//!     rather than a connection nobody will ever serve or close. A reset
+//!     from either side before then ends it;
 //!   * `accept`ed by the relay (an entry the listener never answered is
 //!     dropped after `EMBRYONIC`: SYN lost, program gave up);
 //!   * `close`d when the relay is done with it, then kept for `LINGER` so the
@@ -29,8 +32,10 @@ use std::time::{Duration, Instant};
 /// 60 s TIME_WAIT of either kernel, so a NAT port is never reused while the
 /// listener side may still hold the old connection.
 pub const LINGER: Duration = Duration::from_secs(75);
-/// How long a SYN may wait for the relay to accept its connection.
+/// How long a SYN may wait for the listener to answer it.
 pub const EMBRYONIC: Duration = Duration::from_secs(60);
+/// How long a connection the listener answered may wait to be accepted.
+pub const QUEUED: Duration = Duration::from_secs(30);
 /// Ports handed out on each NAT address.
 pub const PORTS: std::ops::RangeInclusive<u16> = 1024..=65535;
 /// NAT addresses, from `Addrs::nat` on: about a million entries in all (some
@@ -40,9 +45,13 @@ pub const NAT_ADDRS: u8 = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Embryonic(Instant),
-    /// Answered by the listener, waiting to be accepted: dropping it would
-    /// leave the program a connection nobody ever closes.
-    Queued,
+    /// Answered by the listener, waiting to be accepted. `server_next`: the
+    /// sequence number the program expects next from it, which a reset must
+    /// carry to be taken.
+    Queued {
+        since: Instant,
+        server_next: u32,
+    },
     Accepted,
     Closed(Instant),
 }
@@ -57,6 +66,14 @@ struct Entry {
 /// A NAT address and port, packed: address index << 16 | port.
 type Key = u32;
 
+/// A reset to send the program: from `from` (where it dialed) to `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reset {
+    pub from: SocketAddrV4,
+    pub to: SocketAddrV4,
+    pub seq: u32,
+}
+
 pub struct Nat {
     first: u32,
     addrs: u32,
@@ -69,10 +86,11 @@ pub struct Nat {
     /// Entries to look at when they may have expired, in deadline order (each
     /// kind has one fixed timeout): a sweep costs what expires, not what the
     /// table holds, which at a million entries would stall the TUN thread.
-    /// An item only ends an entry whose own time is up, so items left over
-    /// from an entry since replaced or moved on do no harm.
     embryonic: VecDeque<(Instant, Key)>,
+    queued: VecDeque<(Instant, Key)>,
     closed: VecDeque<(Instant, Key)>,
+    /// Resets due to programs, for `take_resets`.
+    resets: Vec<Reset>,
 }
 
 impl Nat {
@@ -89,7 +107,9 @@ impl Nat {
                 .flat_map(|p| (0..addrs as u32).map(move |i| i << 16 | p as u32))
                 .collect(),
             embryonic: VecDeque::new(),
+            queued: VecDeque::new(),
             closed: VecDeque::new(),
+            resets: Vec::new(),
         }
     }
 
@@ -116,7 +136,10 @@ impl Nat {
             if !(syn && closed) {
                 return Some(self.addr(key));
             }
-            self.remove(key);
+            // A new connection on the same flow: a fresh key. The old one
+            // lingers on for its own late packets; reused at once, the
+            // listener could still hold the old connection on it.
+            self.by_flow.remove(&(src, dst));
         }
         if !syn {
             return None;
@@ -141,18 +164,43 @@ impl Nat {
         self.by_key.get(&self.key(nat)?).map(|e| (e.dst, e.src))
     }
 
-    /// The listener sent a packet with these flags to `nat`.
-    pub fn listener_sent(&mut self, nat: SocketAddrV4, syn_ack: bool, rst: bool, now: Instant) {
+    /// The listener sent `nat` a SYN-ACK (its sequence number) or a reset.
+    pub fn listener_sent(&mut self, nat: SocketAddrV4, syn_ack: Option<u32>, rst: bool, now: Instant) {
         let Some(key) = self.key(nat) else { return };
         let Some(e) = self.by_key.get_mut(&key) else { return };
-        match e.state {
-            State::Embryonic(_) | State::Queued if rst => {
+        match (e.state, syn_ack) {
+            (State::Embryonic(_) | State::Queued { .. }, _) if rst => {
                 e.state = State::Closed(now);
                 self.closed.push_back((now + LINGER, key));
             }
-            State::Embryonic(_) if syn_ack => e.state = State::Queued,
+            (State::Embryonic(_), Some(seq)) => {
+                e.state = State::Queued {
+                    since: now,
+                    server_next: seq.wrapping_add(1),
+                };
+                self.queued.push_back((now + QUEUED, key));
+            }
             _ => {}
         }
+    }
+
+    /// The program reset its flow `src -> dst`. Before accept the listener's
+    /// kernel drops such a half-made connection silently, so only this says
+    /// it is gone.
+    pub fn program_reset(&mut self, src: SocketAddrV4, dst: SocketAddrV4, now: Instant) {
+        let Some(&key) = self.by_flow.get(&(src, dst)) else {
+            return;
+        };
+        let e = self.by_key.get_mut(&key).expect("flows map to entries");
+        if matches!(e.state, State::Embryonic(_) | State::Queued { .. }) {
+            e.state = State::Closed(now);
+            self.closed.push_back((now + LINGER, key));
+        }
+    }
+
+    /// Resets the last sweeps owe programs, to write to the TUN device.
+    pub fn take_resets(&mut self) -> Vec<Reset> {
+        std::mem::take(&mut self.resets)
     }
 
     /// The relay accepted the connection from `nat`: where was the program
@@ -175,39 +223,44 @@ impl Nat {
         }
     }
 
-    /// Drop closed entries past `LINGER` and unaccepted ones past `EMBRYONIC`.
-    /// Returns how many went.
+    /// Drop entries past their time: unanswered ones after `EMBRYONIC`,
+    /// unaccepted ones after `QUEUED` (owing the program a reset, see
+    /// `take_resets`), closed ones after `LINGER`. Returns how many went.
     pub fn sweep(&mut self, now: Instant) -> usize {
+        let up = |since: Instant, limit: Duration| now.saturating_duration_since(since) >= limit;
         let mut gone = 0;
-        while let Some(&(due, key)) = self.embryonic.front() {
-            if due > now {
-                break;
-            }
-            self.embryonic.pop_front();
-            let expired = self.by_key.get(&key).is_some_and(
-                |e| matches!(e.state, State::Embryonic(t) if now.saturating_duration_since(t) >= EMBRYONIC),
-            );
-            if expired {
+        for key in due(&mut self.embryonic, now) {
+            if matches!(self.state(key), Some(State::Embryonic(t)) if up(t, EMBRYONIC)) {
                 self.remove(key);
                 gone += 1;
             }
         }
-        while let Some(&(due, key)) = self.closed.front() {
-            if due > now {
-                break;
+        for key in due(&mut self.queued, now) {
+            if let Some(State::Queued { since, server_next }) = self.state(key) {
+                if up(since, QUEUED) {
+                    let e = &self.by_key[&key];
+                    self.resets.push(Reset {
+                        from: e.dst,
+                        to: e.src,
+                        seq: server_next,
+                    });
+                    self.remove(key);
+                    gone += 1;
+                }
             }
-            self.closed.pop_front();
-            // Closed again later (a second close): its own, later item ends it.
-            let expired = self
-                .by_key
-                .get(&key)
-                .is_some_and(|e| matches!(e.state, State::Closed(t) if now.saturating_duration_since(t) >= LINGER));
-            if expired {
+        }
+        // Closed again later (a second close): its own, later item ends it.
+        for key in due(&mut self.closed, now) {
+            if matches!(self.state(key), Some(State::Closed(t)) if up(t, LINGER)) {
                 self.remove(key);
                 gone += 1;
             }
         }
         gone
+    }
+
+    fn state(&self, key: Key) -> Option<State> {
+        self.by_key.get(&key).map(|e| e.state)
     }
 
     pub fn len(&self) -> usize {
@@ -216,10 +269,28 @@ impl Nat {
 
     fn remove(&mut self, key: Key) {
         if let Some(e) = self.by_key.remove(&key) {
-            self.by_flow.remove(&(e.src, e.dst));
+            // The flow may have moved on to a newer key since.
+            if self.by_flow.get(&(e.src, e.dst)) == Some(&key) {
+                self.by_flow.remove(&(e.src, e.dst));
+            }
             self.free.push_back(key);
         }
     }
+}
+
+/// The keys of `queue` due by `now`, taken off it. An item only ends an entry
+/// still in the state it was queued for with its time up: one replaced or
+/// moved on since is left alone.
+fn due(queue: &mut VecDeque<(Instant, Key)>, now: Instant) -> Vec<Key> {
+    let mut keys = Vec::new();
+    while let Some(&(t, key)) = queue.front() {
+        if t > now {
+            break;
+        }
+        queue.pop_front();
+        keys.push(key);
+    }
+    keys
 }
 
 #[cfg(test)]
@@ -291,37 +362,84 @@ mod tests {
         assert_eq!((n.outbound(src, dst, false, t), n.inbound(port)), (None, None));
 
         // The program reuses the same 4-tuple for a new connection while the
-        // old entry lingers: a fresh port, not the closed one.
+        // old entry lingers: a fresh port, not the closed one, which lingers
+        // on for its own late packets (the listener may still hold it).
         let p1 = n.outbound(src, dst, true, t).unwrap();
         n.accept(p1);
         n.close(p1, t);
         let p2 = n.outbound(src, dst, true, t).unwrap();
         assert_ne!(p1, p2);
         assert_eq!(n.accept(p2), Some(dst));
-        assert_eq!(n.len(), 1, "the closed entry was replaced");
+        assert_eq!(n.len(), 2);
+        assert_eq!(n.inbound(p1), Some((dst, src)), "still translated");
+        assert_eq!(n.sweep(t + LINGER), 1);
+        assert_eq!(n.inbound(p1), None);
+        assert_eq!(n.outbound(src, dst, false, t), Some(p2), "the flow is the new one's");
     }
 
     #[test]
-    fn a_connection_the_listener_answered_waits_for_accept_however_long() {
+    fn a_connection_the_listener_answered_waits_a_while_then_the_program_is_reset() {
         let mut n = one();
         let t = Instant::now();
         let (src, dst) = flow();
-        let port = n.outbound(src, dst, true, t).unwrap();
-        n.listener_sent(port, true, false, t);
-        // accept failing for minutes (no fd left): the program's side is
-        // established, so the entry must stay for the relay to find.
-        n.sweep(t + 10 * EMBRYONIC);
-        assert_eq!(n.accept(port), Some(dst));
+        let nat = n.outbound(src, dst, true, t).unwrap();
+        n.listener_sent(nat, Some(5000), false, t);
+        // accept stalls for a while (no fd left): the entry waits for it.
+        assert_eq!(n.sweep(t + QUEUED - Duration::from_secs(1)), 0);
+        assert_eq!(n.accept(nat), Some(dst));
+
+        // Never accepted (accept stalled for good, or the listener's kernel
+        // dropped it unannounced): after QUEUED it goes, and the program,
+        // established on its side, is owed a reset it will take.
+        let other = sa("198.19.255.1:40001");
+        let nat = n.outbound(other, dst, true, t).unwrap();
+        n.listener_sent(nat, Some(u32::MAX), false, t);
+        assert_eq!(n.sweep(t + QUEUED - Duration::from_secs(1)), 0, "not yet");
+        assert!(n.take_resets().is_empty());
+        assert_eq!(n.sweep(t + QUEUED), 1);
+        assert_eq!(
+            n.take_resets(),
+            [Reset {
+                from: dst,
+                to: other,
+                seq: 0
+            }],
+            "from where it dialed, at the SYN-ACK's sequence number + 1"
+        );
+        assert_eq!(n.inbound(nat), None);
 
         // Reset by the listener before accept (it gave up on the handshake):
-        // ended, and gone after LINGER.
-        let other = sa("198.19.255.1:40001");
-        let port = n.outbound(other, dst, true, t).unwrap();
-        n.listener_sent(port, true, false, t);
-        n.listener_sent(port, false, true, t);
-        assert_eq!(n.accept(port), None);
+        // ended, and gone after LINGER, owing nothing.
+        let third = sa("198.19.255.1:40002");
+        let nat = n.outbound(third, dst, true, t).unwrap();
+        n.listener_sent(nat, Some(1), false, t);
+        n.listener_sent(nat, None, true, t);
+        assert_eq!(n.accept(nat), None);
         n.sweep(t + LINGER);
-        assert_eq!(n.inbound(port), None);
+        assert_eq!(n.inbound(nat), None);
+        assert!(n.take_resets().is_empty());
+    }
+
+    #[test]
+    fn a_program_that_resets_a_waiting_connection_ends_it() {
+        // Closed before the handshake was done (a connect timeout, a killed
+        // program): the listener's kernel drops the half-made connection
+        // without a word, so the program's reset is all there is to go by.
+        let mut n = one();
+        let t = Instant::now();
+        let (src, dst) = flow();
+        let nat = n.outbound(src, dst, true, t).unwrap();
+        n.listener_sent(nat, Some(1), false, t);
+        n.program_reset(src, dst, t);
+        assert_eq!(n.accept(nat), None);
+        assert_eq!(n.sweep(t + LINGER), 1);
+        assert!(n.take_resets().is_empty(), "it knows already");
+        // A live connection is the relay's to end.
+        let nat = n.outbound(src, dst, true, t).unwrap();
+        n.accept(nat);
+        n.program_reset(src, dst, t);
+        assert_eq!(n.inbound(nat), Some((dst, src)));
+        assert_eq!(n.sweep(t + 10 * LINGER), 0);
     }
 
     #[test]
@@ -371,13 +489,16 @@ mod tests {
             let port = n.outbound(program(i), dst, true, t).unwrap();
             n.accept(port);
         }
-        // One port left, reused by a flow that keeps reconnecting: each SYN
-        // is on the TUN thread, holding the table, so it must not scan the
-        // whole range for the one free port.
+        // One port left, reused by a flow that keeps reconnecting (each time
+        // after the old connection's LINGER): each SYN is on the TUN thread,
+        // holding the table, so it must not scan the whole range for the one
+        // free port.
         let (src, start) = (sa("9.9.9.9:9"), Instant::now());
-        for _ in 0..2000 {
-            let port = n.outbound(src, dst, true, t).unwrap();
-            n.close(port, t);
+        for i in 0..2000 {
+            let at = t + i * LINGER;
+            let nat = n.outbound(src, dst, true, at).unwrap();
+            n.close(nat, at);
+            n.sweep(at + LINGER);
         }
         assert!(
             start.elapsed() < Duration::from_millis(500),
