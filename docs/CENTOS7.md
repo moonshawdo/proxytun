@@ -121,6 +121,6 @@ ls -ld /tmp/proxytun-* 2>/dev/null # 预期没有输出
 
 ## 出问题时请附上
 
-- 加 `-vv --log-file /tmp/proxytun.log` 重跑那一步,发回日志;
+- 加 `-vv --log-file ~/proxytun.log` 重跑那一步,发回日志;
 - SELinux 为 Enforcing 时:`sudo ausearch -m avc -ts recent`;
 - 如果报 `sudo: sorry, you must have a tty to run sudo`:说明 sudoers 有 `requiretty`,请从交互终端运行(不要经 cron 或无 tty 的 ssh)。

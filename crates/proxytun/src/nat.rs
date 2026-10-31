@@ -14,7 +14,7 @@
 //!
 //! Live connections never expire, however long they stay idle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,10 @@ struct Entry {
 pub struct Nat {
     by_flow: HashMap<(SocketAddrV4, SocketAddrV4), u16>,
     by_port: HashMap<u16, Entry>,
-    next: u16,
+    /// Unused ports, oldest freed first: a just-closed port is the last to be
+    /// reused, and finding one costs the same however full the table is (it
+    /// runs on the TUN thread, under the lock).
+    free: VecDeque<u16>,
 }
 
 impl Default for Nat {
@@ -52,7 +55,7 @@ impl Default for Nat {
         Nat {
             by_flow: HashMap::new(),
             by_port: HashMap::new(),
-            next: *PORTS.start(),
+            free: PORTS.collect(),
         }
     }
 }
@@ -71,7 +74,7 @@ impl Nat {
         if !syn {
             return None;
         }
-        let port = self.free_port()?;
+        let port = self.free.pop_front()?;
         self.by_flow.insert((src, dst), port);
         self.by_port.insert(
             port,
@@ -134,21 +137,8 @@ impl Nat {
     fn remove(&mut self, port: u16) {
         if let Some(e) = self.by_port.remove(&port) {
             self.by_flow.remove(&(e.src, e.dst));
+            self.free.push_back(port);
         }
-    }
-
-    /// Round-robin over the range, so a just-closed port is the last to be
-    /// reused.
-    fn free_port(&mut self) -> Option<u16> {
-        let span = PORTS.len();
-        for _ in 0..span {
-            let p = self.next;
-            self.next = if p == *PORTS.end() { *PORTS.start() } else { p + 1 };
-            if !self.by_port.contains_key(&p) {
-                return Some(p);
-            }
-        }
-        None
     }
 }
 
@@ -250,5 +240,30 @@ mod tests {
         n.close(some, t);
         n.sweep(t + LINGER);
         assert_eq!(n.outbound(sa("9.9.9.9:9"), dst, true, t), Some(some));
+    }
+
+    #[test]
+    fn a_nearly_full_table_still_hands_out_ports_at_once() {
+        let mut n = Nat::default();
+        let t = Instant::now();
+        let dst = sa("1.1.1.1:80");
+        for i in 0..PORTS.len() - 1 {
+            let src = SocketAddrV4::new([198, 19, (i >> 16) as u8, (i >> 8) as u8].into(), i as u16);
+            let port = n.outbound(src, dst, true, t).unwrap();
+            n.accept(port);
+        }
+        // One port left, reused by a flow that keeps reconnecting: each SYN
+        // is on the TUN thread, holding the table, so it must not scan the
+        // whole range for the one free port.
+        let (src, start) = (sa("9.9.9.9:9"), Instant::now());
+        for _ in 0..2000 {
+            let port = n.outbound(src, dst, true, t).unwrap();
+            n.close(port, t);
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "took {:?}",
+            start.elapsed()
+        );
     }
 }

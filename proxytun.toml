@@ -1,6 +1,7 @@
 # proxytun config. Only [[proxies]] is required; everything else is shown
 # commented out with its default. A proxyhook.toml works as is: keys proxytun
-# has no use for are reported at start-up and ignored.
+# has no use for are reported at start-up and ignored. The one exception is a
+# fake_ip_range narrower than /22 (see below).
 # Top-level keys must come before any [table] in TOML, so they are all here.
 
 # --- fake-ip DNS ---------------------------------------------------------

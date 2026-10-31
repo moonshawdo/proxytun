@@ -7,8 +7,20 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::CStr;
 use std::io::Error;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+/// Context for a step the host itself refuses (a device or file we may not
+/// use), as opposed to a capability the user namespace lacks: sudo must not
+/// be asked to get around it.
+#[derive(Debug)]
+pub struct HostRefused(pub &'static str);
+
+impl std::fmt::Display for HostRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
 
 /// `_IOW('T', 202, int)`; not exported by the libc crate.
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
@@ -61,7 +73,7 @@ pub fn create_tun(name: &CStr) -> Result<OwnedFd> {
     // SAFETY: plain syscall on a constant path; the fd is owned right away.
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
-        return Err(anyhow::Error::new(Error::last_os_error()).context("open /dev/net/tun"));
+        return Err(anyhow::Error::new(Error::last_os_error()).context(HostRefused("open /dev/net/tun")));
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut r = ifreq(name);
@@ -113,9 +125,10 @@ pub fn default_route(dev: &CStr) -> Result<()> {
     )
 }
 
-/// A TCP listener on `addr`, with a backlog large enough for bursts of
-/// connections arriving through the TUN device (std listens with 128).
-pub fn listen(addr: SocketAddrV4) -> Result<TcpListener> {
+/// A TCP listener on `addr` (IPv4 or IPv6), with a backlog large enough for
+/// bursts of connections arriving through the TUN device (std listens with
+/// 128).
+pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
     let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
     // Calling listen() again on a listening socket only resizes its backlog.
     // SAFETY: plain syscall on a socket we own.
@@ -123,19 +136,4 @@ pub fn listen(addr: SocketAddrV4) -> Result<TcpListener> {
         bail!("listen {addr}: {}", Error::last_os_error());
     }
     Ok(l)
-}
-
-/// A TCP listener on `addr` (IPv4 or IPv6), with the same backlog as `listen`.
-pub fn listen_any(addr: std::net::SocketAddr) -> Result<TcpListener> {
-    match addr {
-        std::net::SocketAddr::V4(a) => listen(a),
-        std::net::SocketAddr::V6(_) => {
-            let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
-            // SAFETY: plain syscall on a socket we own.
-            if unsafe { libc::listen(l.as_raw_fd(), 4096) } < 0 {
-                bail!("listen {addr}: {}", Error::last_os_error());
-            }
-            Ok(l)
-        }
-    }
 }

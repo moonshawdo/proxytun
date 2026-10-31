@@ -28,13 +28,13 @@ use crate::netns::{self, Child, Handover, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ipnet::Ipv4Net;
 use nix::sys::socket::{
-    accept4, bind, connect, getsockopt, listen, recvmsg, sendmsg, socket, sockopt, AddressFamily, Backlog,
-    ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr,
+    accept4, bind, connect, getsockopt, listen, sendmsg, socket, sockopt, AddressFamily, Backlog, ControlMessage,
+    MsgFlags, SockFlag, SockType, UnixAddr,
 };
 use std::ffi::{CString, OsString};
-use std::io::{IoSlice, IoSliceMut};
+use std::io::IoSlice;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::time::Duration;
 
@@ -420,20 +420,7 @@ fn helper(args: &[String]) -> Result<()> {
     let caller_pgrp = crate::witness::pgrp_of(cred.pid()).unwrap_or(-1);
 
     let mut buf = vec![0u8; 1 << 20];
-    let mut cmsg = nix::cmsg_space!([RawFd; 4]);
-    let (n, fds) = {
-        let mut iov = [IoSliceMut::new(&mut buf)];
-        let msg = recvmsg::<()>(ctl.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)
-            .context("read the request")?;
-        let mut fds = Vec::new();
-        for c in msg.cmsgs().context("reading passed fds")? {
-            if let ControlMessageOwned::ScmRights(r) = c {
-                // SAFETY: the kernel just installed these fds for us.
-                fds.extend(r.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
-            }
-        }
-        (msg.bytes, fds)
-    };
+    let (n, fds) = netns::recv_with_fds(&ctl, &mut buf).context("read the request")?;
     let Some(req) = Request::decode(&buf[..n]) else {
         return refuse(&ctl, anyhow!("malformed request"));
     };

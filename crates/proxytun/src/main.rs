@@ -14,12 +14,12 @@ mod packet;
 mod sudo;
 mod witness;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use app::Args;
 use clap::{ArgAction, Parser, ValueEnum};
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
@@ -132,12 +132,21 @@ fn init_logging(filter: &str, file: Option<&Path>) -> Result<()> {
         // Only our own writer moves: stderr stays as it was, and std opens the
         // file close-on-exec, so the program inherits neither.
         Some(path) => {
+            // Not through a link, and only into a file of our own: in /tmp,
+            // someone else may have created it first, readable by them.
             let f = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(path)
                 .with_context(|| format!("open log file {}", path.display()))?;
+            let meta = f.metadata()?;
+            ensure!(
+                meta.is_file() && meta.uid() == nix::unistd::geteuid().as_raw(),
+                "log file {} is not a regular file of yours",
+                path.display()
+            );
             fmt.with_ansi(false).with_writer(Arc::new(f)).init();
         }
         None => {

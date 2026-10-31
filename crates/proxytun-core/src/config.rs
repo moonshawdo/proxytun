@@ -419,7 +419,8 @@ impl Config {
         // The last /24 of the range holds proxytun's own namespace addresses.
         if net.prefix_len() < 8 || net.prefix_len() > 22 {
             bail!(
-                "fake_ip_range prefix must be between /8 and /22, got /{}",
+                "fake_ip_range prefix must be between /8 and /22, got /{} (proxytun keeps the last /24 \
+                 for itself, so a proxyhook range narrower than /22 needs widening)",
                 net.prefix_len()
             );
         }
@@ -790,6 +791,9 @@ mod tests {
         ] {
             assert!(Config::parse(&bad).is_err(), "should reject:\n{bad}");
         }
+        // A proxyhook config's range: say why it no longer fits.
+        let e = Config::parse(&format!("fake_ip_range = \"198.18.0.0/24\"\n{MINIMAL}")).unwrap_err();
+        assert!(format!("{e:#}").contains("proxyhook range narrower than /22"), "{e:#}");
     }
 
     #[test]

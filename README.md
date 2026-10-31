@@ -110,12 +110,12 @@ proxytun 的退出码就是程序的退出码(信号终止为 `128+信号`)。�
 | `--no-host-ports` | 不把主机的回环监听端口转发进命名空间 |
 | `--doctor` | 自检后退出;有 FAIL 时退出码为 1 |
 | `-q` / `-v` / `-vv` / `--log-level <LEVEL>` | 日志级别:error / debug / trace / 指定。只能用其中一个 |
-| `--log-file <PATH>` | 日志追加写入该文件(新建时权限 600),不再写 stderr;程序自己的输出不受影响 |
+| `--log-file <PATH>` | 日志追加写入该文件(新建时权限 600),不再写 stderr;程序自己的输出不受影响。不跟随符号链接,已存在的文件必须是你自己的普通文件 |
 
 ### 配置文件
 
 格式与 proxyhook 相同,`proxyhook.toml` 可以直接用:proxytun 用不到的键(`verify_peer_uid`、`block_quic`、`dns_udp_unconnected`、`splice`)
-和拼错的键会给出警告并忽略。示例 [proxytun.toml](proxytun.toml) 只有必填的 `[[proxies]]`,其余以注释给出默认值;
+和拼错的键会给出警告并忽略。唯一的例外是 `fake_ip_range`:proxytun 要占用最后一个 /24,前缀只能是 /8–/22,proxyhook 里比 /22 更窄的段要放宽。示例 [proxytun.toml](proxytun.toml) 只有必填的 `[[proxies]]`,其余以注释给出默认值;
 各键的含义与 proxyhook 仓库的 `docs/CONFIG.md` 一致。proxytun 特有或含义不同的键:
 
 | 键 | 说明 |

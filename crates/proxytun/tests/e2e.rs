@@ -2150,6 +2150,66 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
 }
 
 #[test]
+fn a_refused_tun_device_is_reported_not_handed_to_sudo() {
+    require_centos7!();
+    let dir = shared_dir("tun-refused");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    let sudo_dir = fake_sudo_dir().unwrap();
+    let mut cmd = Command::new("unshare");
+    cmd.stdin(Stdio::null());
+    // User namespaces work here; only the device is off-limits to the user,
+    // as with an admin's mode 0600 or a container's device cgroup. Root
+    // must not be asked to open it instead.
+    cmd.args(["--user", "--map-auto", "--map-root-user", "--mount", "--", "sh", "-c"]);
+    cmd.arg(
+        "touch \"$D/no-tun\" && chmod 600 \"$D/no-tun\" && mount --bind \"$D/no-tun\" /dev/net/tun && \
+         PATH=\"$SUDO_DIR:$PATH\" exec setpriv --reuid=1000 --regid=1000 --groups=1000 -- \
+         \"$BIN\" -c \"$D/cfg.toml\" -- true",
+    );
+    let out = run_cmd(
+        cmd,
+        &[
+            ("BIN", BIN),
+            ("D", dir.to_str().unwrap()),
+            ("SUDO_DIR", sudo_dir.to_str().unwrap()),
+        ],
+    );
+    assert_ne!(out.code, 0, "{}", out.dump());
+    assert!(
+        out.stderr.contains("open /dev/net/tun: Permission denied"),
+        "{}",
+        out.dump()
+    );
+    assert!(!out.stderr.contains("asking sudo"), "{}", out.dump());
+}
+
+#[test]
+fn the_log_file_is_never_someone_elses_nor_a_link() {
+    require_centos7!();
+    let dir = shared_dir("log-file");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // Another user got there first, with a file anyone may write and they
+    // may read; or a link to wherever.
+    // (A copy of proxytun: the user cannot reach our build directory.)
+    let root = "touch \"$D/theirs\" && chmod 666 \"$D/theirs\" && cp \"$BIN\" \"$D/pt\"";
+    let user = "ln -s \"$D/own\" \"$D/link\"; \
+        \"$D/pt\" -v -c \"$D/cfg.toml\" --log-file \"$D/theirs\" -- true; echo theirs=$?; \
+        \"$D/pt\" -v -c \"$D/cfg.toml\" --log-file \"$D/link\" -- true; echo link=$?";
+    let out = sh_like_centos7(&dir, root, user);
+    let codes: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(codes, ["theirs=1", "link=1"], "{}", out.dump());
+    assert!(out.stderr.contains("is not a regular file of yours"), "{}", out.dump());
+    // ELOOP, worded differently by glibc and musl.
+    assert!(out.stderr.contains("(os error 40)"), "{}", out.dump());
+    assert_eq!(
+        std::fs::metadata(dir.join("theirs")).unwrap().len(),
+        0,
+        "nothing logged to them"
+    );
+    assert!(!dir.join("own").exists(), "nothing created through the link");
+}
+
+#[test]
 fn as_root_the_namespace_files_never_go_to_tmpdir() {
     require_centos7!();
     let dir = shared_dir("root-tmpdir");

@@ -37,6 +37,8 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 | 之后 | 相同:fd 交给 proxytun,整棵树里没有 root 进程 | 同左 |
 
 - 能用 user namespace 就用;不能用时自动走 sudo,先打印一行说明原因;`--no-sudo` 禁止调用 sudo(直接报错)。
+  只有 user namespace 本身的问题(建不了,或其中的能力被 LSM 收走,表现为 EPERM/EACCES)才回退;主机明确拒绝的步骤
+  (打开 `/dev/net/tun` 失败、写不了临时的 `resolv.conf`)直接报错:那是管理员的设置,不能让 root 替用户绕过。
 - **准备进程是重新 exec 的 proxytun**(M1 实现时确定):proxytun 启动即设为 non-dumpable(保护代理凭据),fork 出的子进程会继承,
   其 `/proc/self/uid_map` 等文件因此归 root、写不进去;而让子进程恢复 dumpable 又会暴露从父进程复制来的内存(含凭据)。
   所以子进程 fork 后立即 `execv("/proc/self/exe", ["proxytun", "__proxytun_setup", ...])`:新映像里没有凭据,也恢复为 dumpable。
@@ -140,7 +142,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 
 ## 6. 日志与监控
 
-- 沿用 proxyhook:级别 off/error/warn/info/debug/trace,`-q`、`-v`/`-vv`、`--log-level`、`--log-file`(追加、600、无颜色),环境变量 `PROXYTUN_LOG`。
+- 沿用 proxyhook:级别 off/error/warn/info/debug/trace,`-q`、`-v`/`-vv`、`--log-level`、`--log-file`(追加、600、无颜色;`O_NOFOLLOW`,已存在的文件必须属于自己,防止别人在 `/tmp` 里预先建好可读的文件),环境变量 `PROXYTUN_LOG`。
 - 每条连接一个递增编号,span 为 `conn{id=… target=…}`;info 级别一行选路结果;trace 级别可从 TUN 收到 SYN 一直跟到代理握手。
   **不查发起连接的进程 pid**(TUN 上看不到,查 `/proc` 代价高)。
 - **连接结束汇总**(2026-10-31 加,info 级别):`closed ms dial_ms via up down`,失败写原因,被拦下写 `blocked by a rule`。
@@ -158,7 +160,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 - 命令行与 proxyhook 一致:`proxytun [选项] 程序 参数...`(`--` 可选),`-c`(默认 `proxytun.toml`)、`--proxy`、`-q`、`-v`/`-vv`、
   `--log-level`、`--log-file`、`--doctor`;新增 `--no-sudo`、`--no-host-ports`。环境变量 `PROXYTUN_PROXY`、`PROXYTUN_LOG`。
 - 配置文件格式与 `proxyhook.toml` 相同,可直接拿来用;proxytun 用不到的键(`verify_peer_uid`、`block_quic`、`dns_udp_unconnected`、`splice`)
-  和拼错的键,启动时 warn 并忽略。示例 `proxytun.toml` 只有必填的 `[[proxies]]`,其余以注释给出默认值。
+  和拼错的键,启动时 warn 并忽略。不兼容的只有 `fake_ip_range`:最后一个 /24 留给命名空间自己的地址,前缀限 /8–/22(proxyhook 允许到 /30),报错时说明原因。示例 `proxytun.toml` 只有必填的 `[[proxies]]`,其余以注释给出默认值。
 - `--doctor`:报告将使用哪种模式(userns / sudo / root)。不靠猜 sysctl,而是按真实运行的路径建一次命名空间、以 `true` 为程序跑完;
   userns 不可用时说明原因并列出相关 sysctl(`max_user_namespaces`、`unprivileged_userns_clone`、AppArmor 限制),
   检查 PATH 里有没有 `sudo` 但不调用;另查 `/dev/net/tun`、Yama(`gdb -p` 的范围)、将转发的主机端口、每个代理(SOCKS5/HTTP 探测)。

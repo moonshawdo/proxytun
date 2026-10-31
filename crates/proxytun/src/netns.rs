@@ -12,7 +12,7 @@
 //! its uid is not 0.
 
 use crate::netcfg;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use ipnet::Ipv4Net;
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::socket::{
@@ -205,22 +205,30 @@ pub struct Handover {
 }
 
 /// Read the setup's answer on `ctl`. `pid` is reaped on failure.
+/// One message from `ctl` into `buf`, with the fds it carries (close-on-exec,
+/// at most the 253 the kernel passes at once). A message or fd list that did
+/// not fit is an error, not something to act on in part.
+pub fn recv_with_fds(ctl: &OwnedFd, buf: &mut [u8]) -> Result<(usize, Vec<OwnedFd>)> {
+    let mut cmsg = nix::cmsg_space!([RawFd; 253]);
+    let mut iov = [IoSliceMut::new(buf)];
+    let msg = recvmsg::<()>(ctl.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)?;
+    let mut fds = Vec::new();
+    for c in msg.cmsgs().context("reading passed fds")? {
+        if let ControlMessageOwned::ScmRights(r) = c {
+            // SAFETY: the kernel just installed these fds for us.
+            fds.extend(r.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
+    }
+    ensure!(
+        !msg.flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC),
+        "message truncated"
+    );
+    Ok((msg.bytes, fds))
+}
+
 pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<Handover> {
     let mut buf = vec![0u8; 16 * 1024];
-    let mut cmsg = nix::cmsg_space!([RawFd; 253]);
-    let (n, fds) = {
-        let mut iov = [IoSliceMut::new(&mut buf)];
-        let msg = recvmsg::<()>(ctl.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)
-            .context("waiting for the namespace setup")?;
-        let mut fds = Vec::new();
-        for c in msg.cmsgs().context("reading passed fds")? {
-            if let ControlMessageOwned::ScmRights(r) = c {
-                // SAFETY: the kernel just installed these fds for us.
-                fds.extend(r.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
-            }
-        }
-        (msg.bytes, fds)
-    };
+    let (n, fds) = recv_with_fds(ctl, &mut buf).context("waiting for the namespace setup")?;
     let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
     let ok = reply.strip_prefix("OK ").and_then(|rest| {
         let mut forwards = None;
@@ -387,15 +395,17 @@ pub struct SetupError {
     pub err: anyhow::Error,
 }
 
-/// EPERM / EACCES anywhere in the chain: a missing capability.
-fn is_permission(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        let code = c
-            .downcast_ref::<std::io::Error>()
-            .and_then(|io| io.raw_os_error())
-            .or_else(|| c.downcast_ref::<nix::errno::Errno>().map(|e| *e as i32));
-        matches!(code, Some(libc::EPERM | libc::EACCES))
-    })
+/// EPERM / EACCES anywhere in the chain: a capability the user namespace
+/// lacks, unless the host refused the step outright.
+fn blames_userns(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<netcfg::HostRefused>().is_none()
+        && e.chain().any(|c| {
+            let code = c
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.raw_os_error())
+                .or_else(|| c.downcast_ref::<nix::errno::Errno>().map(|e| *e as i32));
+            matches!(code, Some(libc::EPERM | libc::EACCES))
+        })
 }
 
 /// A namespace ready to serve, as created by the setup process.
@@ -423,14 +433,14 @@ pub fn setup_namespace(
     // A user namespace whose capabilities an LSM withholds (Ubuntu's AppArmor
     // restriction) fails here instead, with EPERM.
     let (tun, listener) = configure(range).map_err(|err| SetupError {
-        userns: userns && is_permission(&err),
+        userns: userns && blames_userns(&err),
         err,
     })?;
     // Bound now, while we may (ports below 1024 too). One that cannot be bound
     // (no IPv6 inside) is left out; proxytun lists what was.
     let forwards = forwards
         .iter()
-        .filter_map(|a| Some((*a, netcfg::listen_any(*a).ok()?)))
+        .filter_map(|a| Some((*a, netcfg::listen(*a).ok()?)))
         .collect();
     Ok(Namespace {
         tun,
@@ -462,7 +472,7 @@ fn configure(range: Ipv4Net) -> Result<(OwnedFd, TcpListener)> {
     netcfg::set_addr(TUN_NAME, addrs.tun, Addrs::PREFIX, MTU).context("configure tun0")?;
     netcfg::link_up(TUN_NAME)?;
     netcfg::default_route(TUN_NAME)?;
-    let listener = netcfg::listen(SocketAddrV4::new(addrs.tun, 0))?;
+    let listener = netcfg::listen(SocketAddrV4::new(addrs.tun, 0).into())?;
     Ok((tun, listener))
 }
 
@@ -596,5 +606,22 @@ mod tests {
                 "domain corp.example"
             ]
         );
+    }
+
+    #[test]
+    fn only_a_capability_the_user_namespace_lacks_sends_us_to_sudo() {
+        let io = |code| anyhow::Error::new(std::io::Error::from_raw_os_error(code));
+        // Refused inside the user namespace (Ubuntu's AppArmor restriction).
+        assert!(blames_userns(&io(libc::EPERM).context("TUNSETIFF")));
+        assert!(blames_userns(
+            &anyhow::Error::new(nix::errno::Errno::EPERM).context("mount")
+        ));
+        // The host's own refusals, however deep: sudo must not get around them.
+        assert!(!blames_userns(
+            &io(libc::EACCES)
+                .context(netcfg::HostRefused("open /dev/net/tun"))
+                .context("configure")
+        ));
+        assert!(!blames_userns(&io(libc::ENOENT).context("TUNSETIFF")));
     }
 }
