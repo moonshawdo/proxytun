@@ -2016,8 +2016,12 @@ const PY_FD_PRESSURE: &str = r#"
 import socket, struct, sys, time, urllib.request
 held = []
 for i in range(int(sys.argv[1])):
-    s = socket.create_connection(("203.0.113.1", 80), timeout=10)
-    held.append(s)
+    # Past the relay cap proxytun resets a connection as soon as it is
+    # accepted, which may land before connect() has returned.
+    try:
+        held.append(socket.create_connection(("203.0.113.1", 80), timeout=10))
+    except ConnectionResetError:
+        pass
 # Just before they dial out (5 s of sniffing): TXT lookups, forwarded
 # upstream, which answers each after a second. Each forward holds an fd.
 time.sleep(4.6)
