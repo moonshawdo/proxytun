@@ -149,12 +149,20 @@ fn init_logging(filter: &str, file: Option<&Path>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    match std::env::args_os().nth(1) {
-        // We are the process that sets up the namespace and becomes the program.
-        Some(a) if a == netns::SETUP_ARG => netns::setup_main(&std::env::args().collect::<Vec<_>>()),
-        // We are the root helper, run through sudo.
-        Some(a) if a == sudo::HELPER_ARG => sudo::helper_main(&std::env::args().collect::<Vec<_>>()),
-        _ => {}
+    let mode = std::env::args_os().nth(1);
+    if mode.as_deref() == Some(std::ffi::OsStr::new(sudo::HELPER_ARG)) {
+        // The root helper, run through sudo (it checks that itself).
+        sudo::helper_main(&std::env::args().collect::<Vec<_>>());
+    }
+    // Everything else, the namespace setup included, must not run as root
+    // through sudo or setuid.
+    if let Some(why) = sudo::root_refusal_here() {
+        eprintln!("proxytun: {why}");
+        std::process::exit(2);
+    }
+    if mode.as_deref() == Some(std::ffi::OsStr::new(netns::SETUP_ARG)) {
+        // The process that sets up the namespace and becomes the program.
+        netns::setup_main(&std::env::args().collect::<Vec<_>>());
     }
     let cli = Cli::parse();
     init_logging(

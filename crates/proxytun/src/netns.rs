@@ -75,7 +75,11 @@ pub struct TempDir(PathBuf);
 
 impl TempDir {
     pub fn new() -> Result<Self> {
-        let template = std::env::temp_dir().join("proxytun-XXXXXX");
+        Self::new_in(&std::env::temp_dir())
+    }
+
+    pub fn new_in(base: &Path) -> Result<Self> {
+        let template = base.join("proxytun-XXXXXX");
         let mut raw = CString::new(template.as_os_str().as_encoded_bytes())?.into_bytes_with_nul();
         // SAFETY: a writable NUL-terminated template, as mkdtemp requires.
         if unsafe { libc::mkdtemp(raw.as_mut_ptr() as *mut libc::c_char) }.is_null() {
@@ -468,11 +472,30 @@ fn configure(range: Ipv4Net) -> Result<(OwnedFd, TcpListener)> {
 /// back to the host, hence MS_PRIVATE first.
 fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
     use nix::mount::{mount, MsFlags};
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let host = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    let dir = TempDir::new()?;
+    // As root, never under $TMPDIR: a directory the user controls would let
+    // them swap ours for a link to /etc between our creating and writing it.
+    // In the sticky /tmp nobody but us can rename our directory.
+    let base = if nix::unistd::geteuid().is_root() {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = TempDir::new_in(&base)?;
     let file = dir.path().join("resolv.conf");
-    std::fs::write(&file, resolv_conf(&host, dns)).context("write resolv.conf")?;
-    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o644)
+        .open(&file)
+        .context("create resolv.conf")?;
+    f.write_all(resolv_conf(&host, dns).as_bytes())
+        .context("write resolv.conf")?;
+    // Through the fd, whatever the umask: readable by the program.
+    f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
     mount(
         None::<&str>,
         "/",

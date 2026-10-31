@@ -1891,10 +1891,12 @@ fn the_helper_serves_only_the_user_sudo_was_run_by() {
     let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
     let marker = dir.join("ran");
     let touch = format!("touch {}", marker.display());
-    // sudo claims another caller than the owner of proxytun's socket.
+    // sudo claims another caller than the owner of proxytun's socket. The
+    // helper reaches the socket with that caller's file permissions, so it
+    // cannot even connect to proxytun's private directory.
     let out = run_like_centos7(&cfg, &[], &["sh", "-c", &touch], true, &[("FAKE_SUDO_UID", "1234")]);
     assert_ne!(out.code, 0, "{}", out.dump());
-    assert!(out.stderr.contains("sudo was run by uid 1234"), "{}", out.dump());
+    assert!(out.stderr.contains("connect to proxytun: EACCES"), "{}", out.dump());
     assert!(!marker.exists(), "the program must not run");
 }
 
@@ -1947,6 +1949,216 @@ fn the_program_joins_proxytuns_process_group_whatever_sudo_does() {
     let out = run_like_centos7(&cfg, &[], &["true"], true, &[("FAKE_SUDO_SETSID", "1")]);
     assert_eq!(out.code, 0, "{}", out.dump());
     assert!(out.stderr.contains("session of its own"), "{}", out.dump());
+}
+
+/// Run `root` as root, then `user` as uid 1000 (groups 1000, 1001), each with
+/// `sh -c`, in the CentOS-7-like world: `$BIN` is proxytun, `$D` is `dir`,
+/// and our fake sudo is on PATH.
+fn sh_like_centos7(dir: &Path, root: &str, user: &str) -> Out {
+    let sudo_dir = fake_sudo_dir().expect("fake sudo builds");
+    let mut cmd = Command::new("unshare");
+    // Not whatever the test runner's stdin is: a socket there would answer
+    // a mistaken setup entry and keep it waiting.
+    cmd.stdin(Stdio::null());
+    cmd.args(["--user", "--map-auto", "--map-root-user", "--", "sh", "-c"]);
+    cmd.arg(format!(
+        "echo 0 > /proc/sys/user/max_user_namespaces && PATH=\"$SUDO_DIR:$PATH\" && {root} && \
+         exec setpriv --reuid=1000 --regid=1000 --groups=1000,1001 -- sh -c \"$USER_SCRIPT\""
+    ));
+    run_cmd(
+        cmd,
+        &[
+            ("BIN", BIN),
+            ("D", dir.to_str().unwrap()),
+            ("SUDO_DIR", sudo_dir.to_str().unwrap()),
+            ("USER_SCRIPT", user),
+        ],
+    )
+}
+
+#[test]
+fn proxytun_refuses_root_through_sudo_or_a_setuid_copy() {
+    require_centos7!();
+    let dir = shared_dir("refuse-root");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // A copy installed setuid root, as an admin might to spare users sudo.
+    let root = "cp \"$BIN\" \"$D/suid\" && chmod 4755 \"$D/suid\"";
+    // With a sudoers rule for proxytun, any of these would give the user a
+    // root program: the normal command line, the namespace setup entry
+    // (fd 0 named as its socket), a setuid copy, and that copy
+    // playing helper with a SUDO_UID of the user's choosing.
+    let user = "\
+        sudo -- \"$BIN\" -c \"$D/cfg.toml\" -- touch \"$D/ran\"; echo sudo=$?; \
+        sudo -- \"$BIN\" __proxytun_setup 0 198.18.0.0/15 - -- touch \"$D/ran\"; echo setup=$?; \
+        \"$D/suid\" -c \"$D/cfg.toml\" -- touch \"$D/ran\"; echo suid=$?; \
+        SUDO_UID=1000 SUDO_GID=1000 \"$D/suid\" __proxytun_root_setup \"$D/ctl\"; echo suid-helper=$?";
+    let out = sh_like_centos7(&dir, root, user);
+    let codes: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(
+        codes,
+        ["sudo=2", "setup=2", "suid=2", "suid-helper=1"],
+        "{}",
+        out.dump()
+    );
+    assert_eq!(
+        out.stderr.matches("refuses to run as root through sudo").count(),
+        2,
+        "{}",
+        out.dump()
+    );
+    assert!(
+        out.stderr.contains("must not be installed setuid root"),
+        "{}",
+        out.dump()
+    );
+    assert!(
+        out.stderr.contains("the helper must be started by sudo"),
+        "{}",
+        out.dump()
+    );
+    assert!(!dir.join("ran").exists(), "nothing may run");
+}
+
+#[test]
+fn under_sudo_a_setuid_program_cannot_regain_root() {
+    require_centos7!();
+    let dir = shared_dir("sudo-nnp");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // The network in there is the user's; our fake sudo, setuid root, stands
+    // for any setuid program that would trust it.
+    let script = "sudo -- \"$(command -v id)\" -u || echo refused";
+    let out = run_like_centos7(&cfg, &[], &["sh", "-c", script], true, &[]);
+    assert_eq!(out.code, 0, "{}", out.dump());
+    assert_eq!(out.stdout.trim(), "refused", "{}", out.dump());
+}
+
+/// A client of the root helper that is not proxytun: it runs sudo itself
+/// and then misbehaves, or is merely slow, as `case` says.
+const PY_HELPER_CLIENT: &str = r#"
+import os, socket, subprocess, sys, time
+binary, d, case = sys.argv[1:4]
+path = os.path.join(d, "ctl-" + case)
+helper = ["sudo", "--", binary, "__proxytun_root_setup", path]
+
+def listener():
+    l = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    l.bind(path)
+    l.listen(1)
+    return l
+
+if case == "stranger":
+    # The socket belongs to our child, not to the process that ran sudo.
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        l = listener()
+        os.write(w, b"x")
+        c, _ = l.accept()
+        print("got:", c.recv(4096).decode(errors="replace"), flush=True)
+        os._exit(0)
+    os.read(r, 1)
+    rc = subprocess.call(helper)
+    os.waitpid(pid, 0)
+    print(f"rc={rc}", flush=True)
+    sys.exit()
+
+l = listener()
+p = subprocess.Popen(helper)
+c, _ = l.accept()
+start = time.monotonic()
+if case == "silent":
+    rc = p.wait(timeout=30)
+    print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
+    sys.exit()
+rng, pgrp = {
+    "range": ("10.0.0.0/30", os.getpgrp()),
+    "pgrp": ("198.18.0.0/15", 1),
+    "late": ("198.18.0.0/15", os.getpgrp()),
+}[case]
+marker = os.path.join(d, "ran-" + case)
+fields = ["1", rng, str(pgrp), "-", "2", "touch", marker, "PATH=/usr/bin:/bin"]
+cwd = os.open(d, os.O_PATH)
+socket.send_fds(c, [b"".join(f.encode() + b"\0" for f in fields)], [0, 1, 2, cwd])
+print("got:", c.recv(4096)[:2].decode(errors="replace"), flush=True)
+print(f"rc={p.wait()}", flush=True)
+if case == "late":
+    # Longer than the helper waits for us: the program still waits.
+    time.sleep(12)
+    c.send(b"G")
+    for _ in range(50):
+        if os.path.exists(marker):
+            break
+        time.sleep(0.1)
+    print("ran" if os.path.exists(marker) else "did not run", flush=True)
+"#;
+
+#[test]
+fn the_helper_trusts_neither_the_socket_nor_the_request() {
+    require_centos7!("python3");
+    let dir = shared_dir("helper-client");
+    std::fs::write(dir.join("client.py"), PY_HELPER_CLIENT).unwrap();
+    let cases = ["stranger", "range", "pgrp", "silent", "late"];
+    let user = format!(
+        "for c in {}; do python3 \"$D/client.py\" \"$BIN\" \"$D\" $c > \"$D/out-$c\" 2>&1 & done; wait",
+        cases.join(" ")
+    );
+    let out = sh_like_centos7(&dir, "true", &user);
+    assert_eq!(out.code, 0, "{}", out.dump());
+    let got = |c: &str| std::fs::read_to_string(dir.join(format!("out-{c}"))).unwrap();
+    let all = || cases.map(|c| format!("--- {c} ---\n{}", got(c))).join("\n");
+    // A socket that is not the sudo caller's own: someone else's proxytun,
+    // or anything listening.
+    assert!(
+        got("stranger").contains("got: ERR sudo helper: the socket was not created by the process that ran sudo"),
+        "{}",
+        all()
+    );
+    assert!(got("stranger").ends_with("rc=1\n"), "{}", all());
+    // Requests proxytun would never send.
+    assert!(
+        got("range").contains("fake-ip range 10.0.0.0/30 out of bounds"),
+        "{}",
+        all()
+    );
+    assert!(
+        got("range").contains("got: ER\n") && got("range").ends_with("rc=1\n"),
+        "{}",
+        all()
+    );
+    assert!(got("pgrp").contains("process group 1 is not the caller's"), "{}", all());
+    assert!(
+        got("pgrp").contains("got: ER\n") && got("pgrp").ends_with("rc=1\n"),
+        "{}",
+        all()
+    );
+    // A client that never talks does not keep root waiting.
+    let silent = got("silent");
+    let secs: u64 = silent
+        .lines()
+        .last()
+        .and_then(|l| l.strip_prefix("rc=1 after "))
+        .and_then(|s| s.strip_suffix('s'))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("{}", all()));
+    assert!((5..=15).contains(&secs), "{}", all());
+    // That limit is for talking to root only: the program, the helper gone,
+    // waits for the go-ahead as long as proxytun takes.
+    assert!(got("late").ends_with("got: OK\nrc=0\nran\n"), "{}", all());
+    for c in ["range", "pgrp"] {
+        assert!(!dir.join(format!("ran-{c}")).exists(), "{c}: nothing may run");
+    }
+}
+
+#[test]
+fn as_root_the_namespace_files_never_go_to_tmpdir() {
+    require_centos7!();
+    let dir = shared_dir("root-tmpdir");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // Under a directory someone else controls, the resolv.conf root writes
+    // could be swapped for a link mid-way: root uses /tmp whatever $TMPDIR
+    // says (here: nowhere at all).
+    let out = run_like_centos7(&cfg, &[], &["true"], false, &[("TMPDIR", "/nonexistent")]);
+    assert_eq!(out.code, 0, "{}", out.dump());
 }
 
 // ------------------------------------------------ host ports and doctor --

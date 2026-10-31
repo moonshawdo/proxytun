@@ -41,13 +41,29 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   其 `/proc/self/uid_map` 等文件因此归 root、写不进去;而让子进程恢复 dumpable 又会暴露从父进程复制来的内存(含凭据)。
   所以子进程 fork 后立即 `execv("/proc/self/exe", ["proxytun", "__proxytun_setup", ...])`:新映像里没有凭据,也恢复为 dumpable。
   它完成命名空间准备、交回 fd、等待放行后 exec 目标程序(pid 不变)。sudo 模式的特权助手走同一条路径。
-- 不推荐用户直接 `sudo proxytun`:CentOS 7 默认 sudoers 有 `always_set_home`、`env_reset`、`secure_path`,程序会拿到 `HOME=/root`、被替换的 `PATH`、丢失的 `http_proxy`。
+- **拒绝 `sudo proxytun`**(安全复查后由"不推荐"改为拒绝):除特权助手外,proxytun 的任何入口(含内部的 `__proxytun_setup`)
+  在 euid 为 0 时,只要 real uid 不是 0(setuid 安装),或环境里有 `SUDO_UID` / `SUDO_USER` / `SUDO_COMMAND` / `DOAS_USER` / `PKEXEC_UID`,
+  就以退出码 2 拒绝。否则只放行 proxytun 的 sudoers 规则就等于放行任意 root 命令:`sudo proxytun -- sh`,
+  或把 fd 0 冒充控制 socket 的 `sudo proxytun __proxytun_setup 0 ... -- sh`。不提供绕过开关;root 模式只给本来就是 root 的人用(root 登录、`su -`)。
 - **特权助手的边界**:
   - 只做:建网络 + 挂载命名空间、建 TUN、bind-mount `resolv.conf`、建主机端口转发的监听 socket、fork 出程序;fd 交回后立即退出,程序由 proxytun(subreaper)收养。
   - 由 sudo 以当前可执行文件的绝对路径 + 隐藏子命令启动;sudo 会关闭 fd≥3,双方经 0700 私有目录里的 unix socket 通信。
-  - 对端凭据的 uid 必须等于 `SUDO_UID`;程序的 uid/gid/附加组取自对端进程的 `/proc` 状态(内核提供),不信任消息里自报的身份。
-  - 不读配置、不写日志、不以 root 打开用户给的任何路径;先降权,再以用户身份 `chdir`、查 PATH、`exec`。
+  - 只接受 real 与 effective uid 都为 0(sudo 的做法);setuid 启动时 real uid 是调用者,`SUDO_UID` 也由调用者设置,直接拒绝。
+  - 以 `SUDO_UID`/`SUDO_GID` 的文件权限(`setfsuid`/`setfsgid`,清空附加组)连接 socket:调用者自己进不去的目录,root 也不替他进去。
+  - 对端(socket 创建者,`SO_PEERCRED`)必须是助手往上 4 层以内的祖先(sudo、可能存在的 `use_pty` 监控进程、proxytun),
+    这同时保证它还活着、pid 没有被复用,`/proc/<pid>` 读到的就是它;其 uid 必须等于 `SUDO_UID`。程序的 uid/gid/附加组取自它的 `/proc` 状态,
+    不信任消息里自报的身份。
+  - 任何人都能写自己的客户端,所以请求逐项重新校验:假 IP 段 /8–/22,进程组必须等于对端的进程组,转发地址只能是回环、
+    端口非 0 非 53、不重复、最多 250 个。
+  - socket 收发超时 10 秒,客户端不说话时 root 进程不会一直挂着;读完请求后清除超时,因为程序继承同一个 socket、等放行要多久都行。
+  - 不读配置、不写日志、不以 root 打开用户给的任何路径;先降权(附加组 → gid → uid,确认 `setuid(0)` 失败且 CapPrm/CapEff 为 0),
+    再设置 `PR_SET_NO_NEW_PRIVS`:命名空间里的网络(DNS、路由)完全由用户的 proxytun 控制,setuid 程序(sudo、su,或经 LDAP/Kerberos 认证的 PAM)
+    在里面拿到 root 就等于用户拿到 root。之后以用户身份 `chdir`、查 PATH、`exec`。
+  - root 进程写 `resolv.conf` 一律放在 `/tmp` 下(不看 `$TMPDIR`):在用户能控制的目录里,mkdtemp 建的目录可能在写入前被换成指向 `/etc` 的链接;
+    粘滞位的 `/tmp` 里别人改不了我们的目录名。文件用 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建,权限经 fd 设置。
   - root 模式下先把挂载传播设为 private,否则 bind-mount 的 `resolv.conf` 会传播回主机。
+  - 安装要求:sudo 以 root 执行的是 proxytun 自己的文件,必须放在只有 root 能写的位置;免密码的 sudoers 规则只放行
+    `/usr/local/bin/proxytun __proxytun_root_setup *`(多余参数会被助手拒绝)。
   - sudoers 开了 `use_pty` 时程序会落入 sudo 的伪终端会话,交互工具的终端控制会出问题:检测到时 warn。
 - 1024 以下端口:绑定检查的是"拥有该网络命名空间的 user namespace 里是否有 `CAP_NET_BIND_SERVICE`",
   建命名空间的那一步本来就有,所以转发低端口不需要额外的 root;建好的监听 socket 交给普通用户进程后 accept 不需要权限。

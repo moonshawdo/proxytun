@@ -54,9 +54,26 @@ proxytun(主机网络,普通用户)
 | 没有(CentOS 7 默认、`max_user_namespaces=0`、AppArmor 限制) | 调 `sudo` 启动特权助手 | 你自己(含附加组),能力全部清空 |
 | 以 root 运行 proxytun | 直接建(不用 user namespace) | root(完整能力) |
 
-sudo 模式的安全边界:特权助手只为 `SUDO_UID` 服务(核对 socket 对端),程序的 gid 和附加组取自你的进程在 `/proc` 里的记录,
-不读配置、不以 root 打开你给的任何路径;它先降权再进入你的工作目录、按你的 `PATH` 找程序,把 fd 交回后立即退出。
-`--no-sudo` 禁止回退到 sudo。
+sudo 模式的安全边界:
+
+- 特权助手只接受由 sudo 启动(real 与 effective uid 都是 0);以 setuid 方式启动直接拒绝(那时 `SUDO_UID` 可以伪造)。
+- 它以你的文件权限去连 socket,并且只为运行 sudo 的那个进程服务:socket 的创建者必须是它自己的祖先进程,且属于 `SUDO_UID`;
+  程序的 gid 和附加组取自你的进程在 `/proc` 里的记录,不信任请求里自报的身份。
+- 请求的每个字段都重新校验(假 IP 段 /8–/22、进程组必须是调用者自己的、只转发回环地址且不超过 250 个),10 秒内收不到请求就退出。
+- 不读配置、不以 root 打开你给的任何路径。程序先完全降权并设置 `no_new_privs`(命名空间里的网络由你控制,不能让 `sudo`、`su`
+  这类 setuid 程序在里面重新拿到 root),再进入你的工作目录、按你的 `PATH` 找程序;助手把 fd 交回后立即退出。
+
+proxytun 拒绝经 sudo、doas、pkexec 或 setuid 以 root 身份运行(只有特权助手例外),内部的命名空间准备入口也一样:
+即使 sudoers 只放行了 proxytun,也拿不到一个 root 程序。需要 root 模式,请以 root 登录(或 `su -`)后运行。`--no-sudo` 禁止回退到 sudo。
+
+sudo 以 root 身份执行 proxytun 自己的可执行文件,所以要放在只有 root 能写的位置(普通用户能改它,就等于能以 root 执行任意代码)。
+想免密码时,只放行特权助手:
+
+```bash
+sudo install -o root -g root -m 0755 dist/proxytun-x86_64-linux-musl /usr/local/bin/proxytun
+# visudo -f /etc/sudoers.d/proxytun
+alice ALL=(root) NOPASSWD: /usr/local/bin/proxytun __proxytun_root_setup *
+```
 
 ## 编译
 
@@ -189,7 +206,8 @@ conn{id=1 target=Domain("example.com", 443)}: closed ms=812 dial_ms=35 via=clash
 - **ICMP**:丢弃,ping 不通。
 - **绕过假 DNS 的解析**:经 systemd-resolved / nscd 的 unix socket 解析(`nsswitch.conf` 里的 `resolve`)会拿到真 IP,只能靠 SNI/Host 嗅探兜底;`/etc/hosts` 照常生效。
 - **抽象 unix socket** 按网络命名空间隔离(X11 会回落到 `/tmp/.X11-unix` 路径,通常不受影响);文件路径型 unix socket 不受影响。
-- **非 root 模式**(user namespace)下:root 拥有的文件显示为 `nobody`,`sudo`、`ping` 等 setuid 程序在里面不能用。sudo 模式下没有这个限制。
+- **setuid 程序**:`sudo`、`su`、`ping` 等在里面都不能提权。非 root 模式(user namespace)下,root 拥有的文件还会显示为 `nobody`;
+  sudo 模式下程序带着 `no_new_privs`(见"运行模式")。
 - **sudo 的 `use_pty`**:如果 sudoers 开了它,程序会落在 sudo 的伪终端会话里,终端的 Ctrl+C 到不了程序(proxytun 会警告)。CentOS 7 默认没开。
 - **地址改写表**:同时存在的 TCP 连接(含关闭后保留 75 秒的)最多约 6.4 万条。
 - **CentOS 7 真机**(3.10 内核、真实 sudo 1.8.23、SELinux)尚未验证,只在开发机上模拟过;验证步骤见 [docs/CENTOS7.md](docs/CENTOS7.md)。

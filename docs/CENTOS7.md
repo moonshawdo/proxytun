@@ -16,9 +16,9 @@
 ```bash
 # 开发机上构建静态版本,拷到 el7
 ./scripts/build-static.sh
-scp dist/proxytun-x86_64-linux-musl el7:~/proxytun
-# el7 上
-chmod +x ~/proxytun
+scp dist/proxytun-x86_64-linux-musl el7:/tmp/proxytun
+# el7 上:sudo 会以 root 执行这个文件,所以装到只有 root 能写的位置(不要从家目录运行)
+sudo install -o root -g root -m 0755 /tmp/proxytun /usr/local/bin/proxytun && rm /tmp/proxytun
 ```
 
 ## 1. 环境信息
@@ -34,7 +34,7 @@ getenforce 2>/dev/null
 ## 2. 自检
 
 ```bash
-~/proxytun --doctor --proxy socks5://HOST:PORT
+proxytun --doctor --proxy socks5://HOST:PORT
 ```
 
 预期:报告将使用 **sudo** 模式,并说明 user namespace 为什么不可用;代理连通性 OK。
@@ -42,7 +42,7 @@ getenforce 2>/dev/null
 ## 3. 基本代理
 
 ```bash
-~/proxytun --proxy socks5://HOST:PORT -- curl -sI https://example.com
+proxytun --proxy socks5://HOST:PORT -- curl -sI https://example.com
 ```
 
 预期:
@@ -53,7 +53,7 @@ getenforce 2>/dev/null
 ## 4. 程序的身份与看到的网络
 
 ```bash
-~/proxytun --proxy socks5://HOST:PORT -- sh -c 'id; grep -E "^Cap(Prm|Eff)" /proc/self/status; cat /etc/resolv.conf; getent hosts example.com; ip -br addr; ip route'
+proxytun --proxy socks5://HOST:PORT -- sh -c 'id; grep -E "^Cap(Prm|Eff)" /proc/self/status; cat /etc/resolv.conf; getent hosts example.com; ip -br addr; ip route'
 ```
 
 预期:
@@ -62,12 +62,25 @@ getenforce 2>/dev/null
 - `nameserver 198.19.255.53`;`example.com` 解析为 `198.18.x.x`;
 - 只有 `lo` 和 `tun0`(`198.19.255.1/24`),默认路由走 `tun0`。
 
+## 4a. 不能借 proxytun 提权
+
+```bash
+sudo /usr/local/bin/proxytun --proxy socks5://HOST:PORT -- id; echo "exit=$?"   # 绝对路径:secure_path 里没有 /usr/local/bin
+proxytun --proxy socks5://HOST:PORT -- sudo -n true; echo "exit=$?"
+proxytun --proxy socks5://HOST:PORT -- grep NoNewPrivs /proc/self/status
+```
+
+预期:
+- 第一条输出 `proxytun refuses to run as root through sudo ...`,`exit=2`,`id` 没有运行;
+- 第二条里 sudo 报 `The "no new privileges" flag is set ...` 一类的错误,退出码非 0(程序里的 setuid 程序不能提权);
+- 第三条输出 `NoNewPrivs:	1`。
+
 ## 5. 运行期间没有 root 进程
 
 一个终端:
 
 ```bash
-~/proxytun --proxy socks5://HOST:PORT -- sleep 60
+proxytun --proxy socks5://HOST:PORT -- sleep 60
 ```
 
 另一个终端:
@@ -82,8 +95,8 @@ ps -o user,pid,ppid,pgid,sid,cmd --ppid $(pgrep -f 'proxytun --proxy' | head -1)
 ## 6. 调试工具
 
 ```bash
-~/proxytun --proxy socks5://HOST:PORT -- strace -f -e trace=connect curl -s -o /dev/null https://example.com
-~/proxytun --proxy socks5://HOST:PORT -- gdb -batch -nx -ex 'break connect' -ex run -ex 'bt 1' -ex delete -ex continue \
+proxytun --proxy socks5://HOST:PORT -- strace -f -e trace=connect curl -s -o /dev/null https://example.com
+proxytun --proxy socks5://HOST:PORT -- gdb -batch -nx -ex 'break connect' -ex run -ex 'bt 1' -ex delete -ex continue \
     --args curl -s -o /dev/null -w '%{http_code}\n' https://example.com
 ```
 
@@ -92,9 +105,9 @@ ps -o user,pid,ppid,pgid,sid,cmd --ppid $(pgrep -f 'proxytun --proxy' | head -1)
 ## 7. 信号
 
 ```bash
-~/proxytun --proxy socks5://HOST:PORT -- sleep 100      # 按 Ctrl+C
+proxytun --proxy socks5://HOST:PORT -- sleep 100      # 按 Ctrl+C
 echo "exit=$?"                                           # 预期 130,立即退出
-~/proxytun --proxy socks5://HOST:PORT -- sleep 100 &
+proxytun --proxy socks5://HOST:PORT -- sleep 100 &
 sleep 3; kill %1; wait; echo "exit=$?"                   # 预期 143(sleep 被 SIGTERM 终止)
 ```
 

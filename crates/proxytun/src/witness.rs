@@ -126,15 +126,33 @@ unsafe fn witness_loop(ctl: libc::c_int, back: libc::c_int, set: &libc::sigset_t
     libc::_exit(0)
 }
 
-/// The process group of `pid`, from /proc/<pid>/stat.
-pub fn pgrp_of(pid: libc::pid_t) -> Option<libc::pid_t> {
-    parse_pgrp(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+/// The fields of /proc/<pid>/stat proxytun looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcStat {
+    pub ppid: libc::pid_t,
+    pub pgrp: libc::pid_t,
+    pub session: libc::pid_t,
 }
 
-/// "pid (comm) state ppid pgrp ...": comm may hold spaces and parentheses.
-fn parse_pgrp(stat: &str) -> Option<libc::pid_t> {
-    let rest = stat.get(stat.rfind(')')? + 2..)?;
-    rest.split_whitespace().nth(2)?.parse().ok()
+pub fn proc_stat(pid: libc::pid_t) -> Option<ProcStat> {
+    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The process group of `pid`.
+pub fn pgrp_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    proc_stat(pid).map(|s| s.pgrp)
+}
+
+/// "pid (comm) state ppid pgrp session ...": comm may hold spaces and
+/// parentheses, so fields are counted from the last ')'.
+fn parse_stat(stat: &str) -> Option<ProcStat> {
+    let mut f = stat.get(stat.rfind(')')? + 2..)?.split_whitespace().skip(1);
+    let mut next = || f.next()?.parse().ok();
+    Some(ProcStat {
+        ppid: next()?,
+        pgrp: next()?,
+        session: next()?,
+    })
 }
 
 #[cfg(test)]
@@ -203,8 +221,15 @@ mod tests {
 
     #[test]
     fn pgrp_is_read_past_a_command_name_with_spaces_and_parens() {
-        assert_eq!(parse_pgrp("4242 (my (odd) prog) S 1 777 777 0 -1 4194560"), Some(777));
-        assert_eq!(parse_pgrp("garbage"), None);
+        assert_eq!(
+            parse_stat("4242 (my (odd) prog) S 1 777 778 0 -1 4194560"),
+            Some(ProcStat {
+                ppid: 1,
+                pgrp: 777,
+                session: 778
+            })
+        );
+        assert_eq!(parse_stat("garbage"), None);
         let me = std::process::id() as libc::pid_t;
         assert_eq!(pgrp_of(me), Some(unsafe { libc::getpgrp() }));
     }

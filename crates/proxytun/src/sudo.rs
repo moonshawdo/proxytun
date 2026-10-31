@@ -5,15 +5,22 @@
 //! proxytun listens on a unix socket in a private (0700) directory and runs
 //! `sudo -- <proxytun> HELPER_ARG <socket>` (sudo closes inherited fds, hence
 //! the socket path). The helper, as root:
-//!   * serves only the user sudo was run by: the socket's owner must be
-//!     SUDO_UID, and the program's gid and groups are read from that process
-//!     in /proc (kernel-provided), never from the request;
+//!   * runs only when started by sudo (real and effective uid 0), never setuid;
+//!   * reaches the socket with the caller's file permissions, and serves only
+//!     the process that ran sudo: the socket's creator must be one of its own
+//!     ancestors (alive, so its pid cannot have been reused) and belong to
+//!     SUDO_UID; the program's gid and groups are read from that process in
+//!     /proc (kernel-provided), never from the request;
 //!   * reads no config and opens no path the user chose: the request carries
 //!     only the fake-ip range, the argv, the environment and four fds (stdin,
-//!     stdout, stderr, working directory);
+//!     stdout, stderr, working directory), and is checked again here, since
+//!     anyone may write their own client;
+//!   * gives up after `HELPER_TIMEOUT` on a client that does not talk;
 //!   * forks the program, puts it in proxytun's process group, and has it drop
-//!     to the user (groups, gid, uid; no capability may survive), take the
-//!     user's stdio, directory and environment, and wait for the go-ahead;
+//!     to the user (groups, gid, uid; no capability may survive) and set
+//!     no_new_privs, so no setuid program can regain root in a network the
+//!     user controls; then take the user's stdio, directory and environment,
+//!     and wait for the go-ahead;
 //!   * hands the TUN device and listener back and exits: from then on no
 //!     process of ours runs as root.
 
@@ -104,11 +111,7 @@ struct Identity {
 /// The program's identity: the user sudo was run by, who must also own the
 /// socket we were called on (`peer_uid`, `peer_gid`: SO_PEERCRED), with the
 /// supplementary groups of that process (`peer_status`: its /proc status).
-fn identity(sudo_uid: Option<&str>, peer_uid: u32, peer_gid: u32, peer_status: &str) -> Result<Identity> {
-    let sudo_uid: u32 = sudo_uid
-        .ok_or_else(|| anyhow!("SUDO_UID is not set: run proxytun as a normal user, it calls sudo itself"))?
-        .parse()
-        .context("SUDO_UID is not a number")?;
+fn identity(sudo_uid: u32, peer_uid: u32, peer_gid: u32, peer_status: &str) -> Result<Identity> {
     ensure!(
         peer_uid == sudo_uid,
         "the socket belongs to uid {peer_uid}, but sudo was run by uid {sudo_uid}"
@@ -131,6 +134,130 @@ fn identity(sudo_uid: Option<&str>, peer_uid: u32, peer_gid: u32, peer_status: &
         gid: peer_gid,
         groups,
     })
+}
+
+/// Environment variables that say root was reached from another user.
+const ELEVATION_MARKERS: [&str; 5] = ["SUDO_UID", "SUDO_USER", "SUDO_COMMAND", "DOAS_USER", "PKEXEC_UID"];
+
+/// Why this process must not run proxytun as root, if it must not. Reached
+/// through sudo, doas, pkexec or a setuid copy, root mode (the program keeps
+/// root) would hand a user who may run only proxytun a root program, a
+/// root-read config and a root-written log file. Only the helper (checked
+/// separately) runs under sudo.
+pub fn root_refusal(ruid: libc::uid_t, euid: libc::uid_t, elevated_env: bool) -> Option<String> {
+    if euid != 0 {
+        return None;
+    }
+    if ruid != euid {
+        return Some("proxytun must not be installed setuid root".into());
+    }
+    if elevated_env {
+        return Some(
+            "proxytun refuses to run as root through sudo, doas or pkexec: run it as yourself, \
+             it asks sudo only for its namespace helper (see the README)"
+                .into(),
+        );
+    }
+    None
+}
+
+/// `root_refusal` for this process.
+pub fn root_refusal_here() -> Option<String> {
+    let elevated = ELEVATION_MARKERS.iter().any(|v| std::env::var_os(v).is_some());
+    // SAFETY: plain syscalls.
+    root_refusal(unsafe { libc::getuid() }, unsafe { libc::geteuid() }, elevated)
+}
+
+/// How long the helper waits for its client.
+const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The request, checked again by the helper: the client may not be proxytun.
+fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
+    let p = req.fake_range.prefix_len();
+    ensure!((8..=22).contains(&p), "fake-ip range {} out of bounds", req.fake_range);
+    ensure!(
+        req.forwards.len() <= crate::hostports::MAX_FORWARDS,
+        "too many host ports ({})",
+        req.forwards.len()
+    );
+    let mut seen = std::collections::HashSet::new();
+    for a in &req.forwards {
+        ensure!(
+            a.ip().is_loopback() && a.port() != 0 && a.port() != 53 && seen.insert(a),
+            "host port {a} not allowed"
+        );
+    }
+    ensure!(
+        req.pgrp == caller_pgrp,
+        "process group {} is not the caller's",
+        req.pgrp
+    );
+    Ok(())
+}
+
+/// Is `target` among the first `hops` ancestors, starting from `parent`?
+fn ancestor_within(
+    parent: libc::pid_t,
+    target: libc::pid_t,
+    hops: usize,
+    ppid_of: impl Fn(libc::pid_t) -> Option<libc::pid_t>,
+) -> bool {
+    let mut p = parent;
+    for _ in 0..hops {
+        if p == target {
+            return true;
+        }
+        match ppid_of(p) {
+            Some(next) if next > 0 => p = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Run `f` with the file permissions of `uid`/`gid` and no supplementary
+/// groups: what the caller cannot reach, root does not reach for it either.
+/// fsuid != 0 also drops the file capabilities for the duration.
+fn as_caller<T>(uid: libc::uid_t, gid: libc::gid_t, f: impl FnOnce() -> T) -> Result<T> {
+    // SAFETY: plain syscalls on our own credentials.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            bail!("setgroups: {}", std::io::Error::last_os_error());
+        }
+        libc::setfsgid(gid);
+        libc::setfsuid(uid);
+        // setfsuid reports the previous value; asking again confirms it took.
+        let (fu, fg) = (libc::setfsuid(u32::MAX), libc::setfsgid(u32::MAX));
+        ensure!(
+            fu as u32 == uid && fg as u32 == gid,
+            "could not take the caller's file permissions"
+        );
+        let r = f();
+        libc::setfsuid(0);
+        libc::setfsgid(0);
+        Ok(r)
+    }
+}
+
+fn set_timeouts(fd: &OwnedFd, t: Duration) -> Result<()> {
+    let tv = libc::timeval {
+        tv_sec: t.as_secs() as libc::time_t,
+        tv_usec: 0,
+    };
+    for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: a timeval for a socket we own.
+        let r = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                opt,
+                &tv as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&tv) as libc::socklen_t,
+            )
+        };
+        ensure!(r == 0, "setsockopt timeout: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn seqpacket(flags: SockFlag) -> Result<OwnedFd> {
@@ -241,38 +368,56 @@ pub fn helper_main(args: &[String]) -> ! {
     std::process::exit(code)
 }
 
+/// Tell the client why, then fail.
+fn refuse(ctl: &OwnedFd, e: anyhow::Error) -> Result<()> {
+    netns::send_error(
+        ctl,
+        &netns::SetupError {
+            userns: false,
+            err: anyhow!("sudo helper: {e:#}"),
+        },
+    );
+    Err(e)
+}
+
 fn helper(args: &[String]) -> Result<()> {
     let [_, mode, path] = args else {
         bail!("{HELPER_ARG} is internal to proxytun");
     };
     ensure!(mode == HELPER_ARG, "{HELPER_ARG} is internal to proxytun");
+    // sudo makes both the real and the effective uid 0. A setuid copy would
+    // leave the real uid the caller's, and SUDO_UID would be theirs to set.
     ensure!(
-        nix::unistd::geteuid().is_root(),
-        "the helper must run as root (through sudo)"
+        nix::unistd::getuid().is_root() && nix::unistd::geteuid().is_root(),
+        "the helper must be started by sudo"
     );
-    let ctl = seqpacket(SockFlag::empty())?;
-    connect(ctl.as_raw_fd(), &UnixAddr::new(path.as_str())?).context("connect to proxytun")?;
-    let cred = getsockopt(&ctl, sockopt::PeerCredentials).context("SO_PEERCRED")?;
-    let status = std::fs::read_to_string(format!("/proc/{}/status", cred.pid())).unwrap_or_default();
-    let who = identity(
-        std::env::var("SUDO_UID").ok().as_deref(),
-        cred.uid(),
-        cred.gid(),
-        &status,
-    );
-    let who = match who {
-        Ok(w) => w,
-        Err(e) => {
-            netns::send_error(
-                &ctl,
-                &netns::SetupError {
-                    userns: false,
-                    err: anyhow!("sudo helper: {e:#}"),
-                },
-            );
-            return Err(e);
-        }
+    let id = |v: &str| -> Result<u32> {
+        std::env::var(v)
+            .with_context(|| format!("{v} is not set: run proxytun as yourself, it calls sudo itself"))?
+            .parse()
+            .with_context(|| format!("{v} is not a number"))
     };
+    let (sudo_uid, sudo_gid) = (id("SUDO_UID")?, id("SUDO_GID")?);
+
+    let ctl = seqpacket(SockFlag::empty())?;
+    set_timeouts(&ctl, HELPER_TIMEOUT)?;
+    let addr = UnixAddr::new(path.as_str())?;
+    as_caller(sudo_uid, sudo_gid, || connect(ctl.as_raw_fd(), &addr))?.context("connect to proxytun")?;
+    let cred = getsockopt(&ctl, sockopt::PeerCredentials).context("SO_PEERCRED")?;
+    // The socket's creator must be the process that ran sudo: one of our
+    // ancestors (sudo, sudo's pty monitor in between), alive, so its pid has
+    // not been reused and its /proc entries are its own.
+    // SAFETY: plain syscall.
+    let parent = unsafe { libc::getppid() };
+    if !ancestor_within(parent, cred.pid(), 4, |p| crate::witness::proc_stat(p).map(|s| s.ppid)) {
+        return refuse(&ctl, anyhow!("the socket was not created by the process that ran sudo"));
+    }
+    let status = std::fs::read_to_string(format!("/proc/{}/status", cred.pid())).unwrap_or_default();
+    let who = match identity(sudo_uid, cred.uid(), cred.gid(), &status) {
+        Ok(w) => w,
+        Err(e) => return refuse(&ctl, e),
+    };
+    let caller_pgrp = crate::witness::pgrp_of(cred.pid()).unwrap_or(-1);
 
     let mut buf = vec![0u8; 1 << 20];
     let mut cmsg = nix::cmsg_space!([RawFd; 4]);
@@ -289,8 +434,18 @@ fn helper(args: &[String]) -> Result<()> {
         }
         (msg.bytes, fds)
     };
-    let req = Request::decode(&buf[..n]).ok_or_else(|| anyhow!("malformed request"))?;
-    let [stdin, stdout, stderr, cwd]: [OwnedFd; 4] = fds.try_into().map_err(|_| anyhow!("expected 4 fds"))?;
+    let Some(req) = Request::decode(&buf[..n]) else {
+        return refuse(&ctl, anyhow!("malformed request"));
+    };
+    if let Err(e) = validate(&req, caller_pgrp) {
+        return refuse(&ctl, e);
+    }
+    let Ok([stdin, stdout, stderr, cwd]) = <[OwnedFd; 4]>::try_from(fds) else {
+        return refuse(&ctl, anyhow!("expected 4 fds"));
+    };
+    // The program shares this socket and waits on it for the go-ahead for as
+    // long as proxytun needs.
+    set_timeouts(&ctl, Duration::ZERO)?;
 
     let ns = match netns::setup_namespace(req.fake_range, false, &req.forwards) {
         Ok(v) => v,
@@ -368,6 +523,14 @@ impl Prepared {
             }) {
                 return "capabilities survived the drop to the user".into();
             }
+            // The network in here is the user's: a setuid program (sudo, su,
+            // anything PAM authenticates over the network) must not regain
+            // root in it.
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1
+            {
+                return format!("setting no_new_privs: {}", std::io::Error::last_os_error());
+            }
             for (i, fd) in stdio.iter().enumerate() {
                 libc::dup2(fd.as_raw_fd(), i as libc::c_int);
             }
@@ -431,7 +594,7 @@ mod tests {
     #[test]
     fn the_program_runs_as_the_user_sudo_was_run_by_with_their_groups() {
         assert_eq!(
-            identity(Some("1000"), 1000, 1000, STATUS).unwrap(),
+            identity(1000, 1000, 1000, STATUS).unwrap(),
             Identity {
                 uid: 1000,
                 gid: 1000,
@@ -440,7 +603,7 @@ mod tests {
         );
         let no_groups = STATUS.replace("Groups:\t4 27 1000 ", "Groups:\t");
         assert_eq!(
-            identity(Some("1000"), 1000, 1000, &no_groups).unwrap().groups,
+            identity(1000, 1000, 1000, &no_groups).unwrap().groups,
             Vec::<u32>::new()
         );
     }
@@ -448,17 +611,63 @@ mod tests {
     #[test]
     fn the_helper_refuses_anyone_but_the_sudo_caller() {
         let err = |r: Result<Identity>| r.unwrap_err().to_string();
-        assert!(err(identity(None, 1000, 1000, STATUS)).contains("SUDO_UID"));
-        assert!(err(identity(Some("1001"), 1000, 1000, STATUS)).contains("sudo was run by uid 1001"));
-        assert!(err(identity(Some("0"), 0, 0, &STATUS.replace("1000", "0"))).contains("root"));
+        assert!(err(identity(1001, 1000, 1000, STATUS)).contains("sudo was run by uid 1001"));
+        assert!(err(identity(0, 0, 0, &STATUS.replace("1000", "0"))).contains("root"));
         // The pid behind the socket now belongs to someone else (or nobody).
-        assert!(err(identity(
-            Some("1000"),
-            1000,
-            1000,
-            &STATUS.replace("Uid:\t1000", "Uid:\t1001")
-        ))
-        .contains("gone"));
-        assert!(err(identity(Some("1000"), 1000, 1000, "")).contains("gone"));
+        assert!(err(identity(1000, 1000, 1000, &STATUS.replace("Uid:\t1000", "Uid:\t1001"))).contains("gone"));
+        assert!(err(identity(1000, 1000, 1000, "")).contains("gone"));
+    }
+
+    #[test]
+    fn root_mode_is_refused_through_sudo_or_setuid() {
+        assert_eq!(root_refusal(1000, 1000, true), None, "not root: nothing to refuse");
+        assert_eq!(root_refusal(0, 0, false), None, "root itself");
+        assert!(root_refusal(1000, 0, false).unwrap().contains("setuid"));
+        assert!(root_refusal(0, 0, true).unwrap().contains("through sudo"));
+    }
+
+    fn req(range: &str, pgrp: libc::pid_t, forwards: &[&str]) -> Request {
+        Request {
+            fake_range: range.parse().unwrap(),
+            pgrp,
+            forwards: forwards.iter().map(|a| a.parse().unwrap()).collect(),
+            argv: vec!["true".into()],
+            env: vec![],
+        }
+    }
+
+    #[test]
+    fn the_helper_rechecks_every_request_field() {
+        assert!(validate(&req("198.18.0.0/15", 7, &["127.0.0.1:5432", "[::1]:80"]), 7).is_ok());
+        for (bad, why) in [
+            (req("198.18.0.0/24", 7, &[]), "range too small"),
+            (req("10.0.0.0/4", 7, &[]), "range too large"),
+            (req("198.18.0.0/15", 7, &["10.0.0.1:22"]), "not loopback"),
+            (req("198.18.0.0/15", 7, &["127.0.0.53:53"]), "port 53"),
+            (req("198.18.0.0/15", 7, &["127.0.0.1:0"]), "port 0"),
+            (req("198.18.0.0/15", 7, &["127.0.0.1:80", "127.0.0.1:80"]), "duplicate"),
+            (req("198.18.0.0/15", 8, &[]), "someone else's process group"),
+        ] {
+            assert!(validate(&bad, 7).is_err(), "{why}");
+        }
+        let many: Vec<String> = (1..=crate::hostports::MAX_FORWARDS as u16 + 1)
+            .map(|p| format!("127.0.0.1:{}", 1000 + p))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(validate(&req("198.18.0.0/15", 7, &many), 7).is_err(), "too many");
+    }
+
+    #[test]
+    fn only_an_ancestor_within_reach_counts() {
+        // 50 -> 40 -> 30 -> 20 -> 10 -> 1
+        let ppid = |p: libc::pid_t| Some(if p > 10 { p - 10 } else { 1 });
+        assert!(ancestor_within(50, 50, 4, ppid));
+        assert!(ancestor_within(50, 20, 4, ppid));
+        assert!(!ancestor_within(50, 10, 4, ppid), "too far up");
+        assert!(!ancestor_within(50, 60, 4, ppid), "not an ancestor at all");
+        assert!(
+            !ancestor_within(50, 20, 4, |_| None),
+            "a vanished process ends the walk"
+        );
     }
 }
