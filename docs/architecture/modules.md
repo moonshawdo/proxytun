@@ -19,7 +19,7 @@ flowchart LR
         MAIN --> SIG["signals.rs<br/>退出, 信号转发"]
         APP --> SIG
         APP --> NETNS["netns.rs<br/>准备进程"]
-        APP --> SUDO["sudo.rs<br/>特权助手"]
+        APP --> SUDO["sudo/<br/>特权助手<br/>client.rs, helper.rs, program.rs"]
         APP --> CAP["capture.rs<br/>TUN 循环, 清扫"]
         APP --> ACC["accept.rs<br/>中继 accept, 槽位"]
         APP --> HP["hostports.rs<br/>主机端口"]
@@ -101,7 +101,7 @@ flowchart LR
 | `netns.rs` | proxytun 自己的地址(`Addrs`:假 IP 范围最后一个 /24,假 IP 池不分配);准备进程：fork 后重新 exec 自己，建 user / 网络 / 挂载命名空间，写 `resolv.conf` 并 bind mount,建 TUN 与捕获监听，经 socketpair 交回 fd,等放行后 exec 程序;exec 前恢复信号屏蔽和调用方的 SIGPIPE 处置 |
 | `ctl.rs` | proxytun 与建命名空间的一方(准备进程;sudo 模式下是特权助手及其 fork 出的程序一侧)之间的控制通道：一个 SOCK_SEQPACKET socket 上带 fd(SCM_RIGHTS)的消息、`OK` / `ERR` 应答(`recv_setup`,读到失败应答时回收准备进程)、放行(`Child::go` / `wait_go`)、列表编码 |
 | `netcfg.rs` | 用 ioctl 配网(不依赖 `ip` 命令和 netlink):建 TUN、地址与 MTU、链路 up、默认路由、绑定监听 |
-| `sudo.rs` | sudo 模式：proxytun 一侧(私有目录里的 unix socket、调 sudo、发请求)与 root 助手一侧(校验调用者、建命名空间、让降权后的程序接收请求和 fd) |
+| `sudo/` | sudo 模式，按进程身份分文件(见 [5.2](privilege.md#52-sudo-模式的流程)):`mod.rs`:请求的编码与解码、程序的身份 `Identity`、几方共用的常量与 socket 设置、拒绝经 sudo / setuid 以 root 运行(`root_refusal`);`client.rs`:proxytun 一侧，以用户身份运行(私有目录里的 unix socket、调 sudo、发请求和 fd);`helper.rs`:root 助手(校验调用者、安全上下文与资源限制，建空的命名空间并 fork 出程序一侧，重新校验请求，配置命名空间并交回);`program.rs`:fork 出的程序一侧(从 root 降为用户，再接收请求和 fd、转交助手，放行后 exec 程序) |
 | `capture.rs` | tun 线程的包循环(TCP 按方向改写：捕获监听回给程序的包、程序发出的包;UDP 53 派给假 DNS、其他 UDP 回 ICMP),改写表清扫 |
 | `accept.rs` | 捕获监听 accept 之后：accept 循环与中继槽位(主机端口转发共用,超出上限立即 RST)、按改写表找回目标、假 IP 反查并钉住、TCP DNS 分派、交给 `relay::route`;中继中的连接(捕获的与主机端口的)各有一个守卫 `Relaying`,无论怎样结束都退出 `active` 计数、关闭改写表条目 |
 | `state.rs` | 共享状态 `Shared`(见 [4.4](#44-共享状态与线程))、同时中继的上限 `MAX_RELAYS`、统计计数(`Stats`),SIGUSR1 时打印总数与速率 |
