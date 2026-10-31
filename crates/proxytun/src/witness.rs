@@ -104,6 +104,10 @@ impl Witness {
                 events: libc::POLLIN,
                 revents: 0,
             };
+            // An answer that came after we gave up on it would be taken for
+            // the answer to this question, and every later one be one behind.
+            let mut stale = [0u8; 64];
+            while libc::poll(&mut p, 1, 0) == 1 && libc::read(from.as_raw_fd(), stale.as_mut_ptr().cast(), 64) > 0 {}
             libc::write(to.as_raw_fd(), b"q".as_ptr().cast(), 1) == 1
                 && libc::poll(&mut p, 1, 1000) == 1
                 && libc::read(from.as_raw_fd(), mask.as_mut_ptr().cast(), 8) == 8
@@ -291,6 +295,16 @@ mod tests {
         let cmdline = String::from_utf8_lossy(&cmdline);
         assert!(cmdline.starts_with(WITNESS_NAME), "{cmdline:?}");
         assert!(!cmdline.contains("proxytun"), "{cmdline:?}");
+
+        // An answer that comes too late (the witness held up, say by a
+        // loaded machine) is not taken for the next one.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        assert!(!w.saw(libc::SIGTERM), "no answer within the second");
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        std::thread::sleep(std::time::Duration::from_millis(200)); // it answers, late
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert!(w.saw(libc::SIGTERM), "the late answer was taken for this one");
+        w.clear();
 
         // Told to stop (the program is gone), it quits; asked after, nothing.
         w.stop();

@@ -472,20 +472,25 @@ fn on_exit_signal(sig: libc::c_int, code: i32, program_running: bool, terms: u32
 }
 
 /// Where to pass on a signal we got, if anywhere (a pid, or minus a process
-/// group). Sent to our whole group (by the terminal, or the witness has it),
-/// the program has it too if it is still in that group. If it left to lead
-/// a group of its own (sudo's `use_pty` gave it a session of its own), that
-/// whole group gets it, as ours did: a pipeline or a child is no less
-/// interrupted by Ctrl+C there. Sent to proxytun alone: the program.
+/// group). Sent to our whole group (`to_group`: by the terminal, or the
+/// witness has it), the program has it too if it is still in that group.
+/// From the terminal (`terminal`: Ctrl+C) while the program leads a group of
+/// its own (sudo's `use_pty` gave it a session of its own), that whole group
+/// gets it, as the terminal would have done: a pipeline or a child is no
+/// less interrupted there. A group signal from a process may have reached
+/// every process already (systemd signals each one of a service): the
+/// program alone gets the copy we pass on. Sent to proxytun alone: the
+/// program.
 fn forward_to(
     to_group: bool,
+    terminal: bool,
     program: libc::pid_t,
     program_pgrp: Option<libc::pid_t>,
     our_pgrp: libc::pid_t,
 ) -> Option<libc::pid_t> {
     match program_pgrp {
         Some(p) if to_group && p == our_pgrp => None,
-        Some(p) if to_group && p == program => Some(-p),
+        Some(p) if terminal && p == program => Some(-p),
         _ => Some(program),
     }
 }
@@ -530,10 +535,19 @@ fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option
                 if main_pid.load(Ordering::SeqCst) != pid {
                     return;
                 }
-                let group = action == ExitSignal::Terminal || witness.as_ref().is_some_and(|w| w.saw(sig));
+                let terminal = action == ExitSignal::Terminal;
+                // Asking the witness blocks (a second at most): not on a
+                // runtime worker.
+                let saw = match (&witness, terminal) {
+                    (Some(w), false) => {
+                        let w = w.clone();
+                        tokio::task::spawn_blocking(move || w.saw(sig)).await.unwrap_or(false)
+                    }
+                    _ => false,
+                };
                 // SAFETY: plain syscall.
                 let ours = unsafe { libc::getpgrp() };
-                if let Some(to) = forward_to(group, pid, witness::pgrp_of(pid), ours) {
+                if let Some(to) = forward_to(terminal || saw, terminal, pid, witness::pgrp_of(pid), ours) {
                     tracing::debug!(sig, to, "forwarding the signal to the program");
                     unsafe { libc::kill(to, sig) };
                 }
@@ -612,20 +626,24 @@ mod tests {
 
     #[test]
     fn a_signal_is_only_held_back_when_the_program_shares_our_group() {
-        // Program 50; our group 7.
+        // Program 50; our group 7. (to_group, terminal, ...)
         // Sent to the group, and the program is in it: it has its own copy.
-        assert_eq!(forward_to(true, 50, Some(7), 7), None);
+        assert_eq!(forward_to(true, false, 50, Some(7), 7), None);
+        assert_eq!(forward_to(true, true, 50, Some(7), 7), None);
         // Sent to proxytun alone.
-        assert_eq!(forward_to(false, 50, Some(7), 7), Some(50));
-        // Sent to our group, but the program leads one of its own (sudo's
-        // use_pty, setsid): that whole group gets it, its pipeline too.
-        assert_eq!(forward_to(true, 50, Some(50), 7), Some(-50));
-        // ... or moved into someone else's: the program alone.
-        assert_eq!(forward_to(true, 50, Some(9), 7), Some(50));
+        assert_eq!(forward_to(false, false, 50, Some(7), 7), Some(50));
+        // Ctrl+C, the program leading a group of its own (sudo's use_pty):
+        // that whole group gets it, its pipeline too.
+        assert_eq!(forward_to(true, true, 50, Some(50), 7), Some(-50));
+        // A group signal from a process (systemd's, one to each process):
+        // the others may have theirs already; the program alone.
+        assert_eq!(forward_to(true, false, 50, Some(50), 7), Some(50));
+        // Moved into someone else's group: the program alone.
+        assert_eq!(forward_to(true, true, 50, Some(9), 7), Some(50));
         // Program already gone: nothing to hold back for.
-        assert_eq!(forward_to(true, 50, None, 7), Some(50));
+        assert_eq!(forward_to(true, false, 50, None, 7), Some(50));
         // Sent to proxytun alone, the program leading its own group: only it.
-        assert_eq!(forward_to(false, 50, Some(50), 7), Some(50));
+        assert_eq!(forward_to(false, false, 50, Some(50), 7), Some(50));
     }
 
     #[test]

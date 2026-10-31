@@ -131,12 +131,16 @@ impl Cli {
 /// each log line into a panic. A line that cannot be written at once is
 /// dropped. Pipes and terminals get a description of their own, opened
 /// non-blocking (the program shares the one on fd 2: switching that would
-/// change it for the program too); sockets (the journal) are sent to
-/// without waiting; anything else (a file) is written as it is.
+/// change it for the program too); where that open is refused (someone
+/// else's terminal, after `su`), fd 2 is written only while poll says it
+/// takes more, a pipe's atomic 4 KiB at a time; sockets (the journal) are
+/// sent to without waiting; anything else (a file) is written as it is.
 #[derive(Clone, Copy)]
 struct LogSink {
     fd: std::os::fd::RawFd,
     socket: bool,
+    /// Blocking: poll before each write.
+    gated: bool,
 }
 
 impl LogSink {
@@ -148,19 +152,22 @@ impl LogSink {
         } else {
             0
         };
+        let sink = |fd, socket, gated| LogSink { fd, socket, gated };
         if kind == libc::S_IFSOCK {
-            return LogSink { fd: 2, socket: true };
+            return sink(2, true, false);
         }
         if kind == libc::S_IFIFO || kind == libc::S_IFCHR {
             let flags = libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
             // SAFETY: plain open; the fd is ours for good (logging lasts as
             // long as the process).
             let fd = unsafe { libc::open(c"/proc/self/fd/2".as_ptr(), flags) };
-            if fd >= 0 {
-                return LogSink { fd, socket: false };
-            }
+            return if fd >= 0 {
+                sink(fd, false, false)
+            } else {
+                sink(2, false, true)
+            };
         }
-        LogSink { fd: 2, socket: false }
+        sink(2, false, false)
     }
 }
 
@@ -168,17 +175,30 @@ impl std::io::Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut rest = buf;
         while !rest.is_empty() {
+            let mut chunk = rest;
+            if self.gated {
+                let mut p = libc::pollfd {
+                    fd: self.fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: a local pollfd.
+                if unsafe { libc::poll(&mut p, 1, 0) } != 1 || p.revents & libc::POLLOUT == 0 {
+                    break; // full: the rest is dropped
+                }
+                chunk = &rest[..rest.len().min(libc::PIPE_BUF)];
+            }
             // SAFETY: plain writes of our own buffer.
             let n = unsafe {
                 if self.socket {
                     libc::send(
                         self.fd,
-                        rest.as_ptr().cast(),
-                        rest.len(),
+                        chunk.as_ptr().cast(),
+                        chunk.len(),
                         libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                     )
                 } else {
-                    libc::write(self.fd, rest.as_ptr().cast(), rest.len())
+                    libc::write(self.fd, chunk.as_ptr().cast(), chunk.len())
                 }
             };
             if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {

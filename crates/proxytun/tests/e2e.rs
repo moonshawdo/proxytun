@@ -283,23 +283,48 @@ const TMP_PREFIX: &str = "proxytun-test-";
 /// them. Leftovers of earlier runs are removed first, as far as we may.
 fn tmp_dir(name: &str) -> PathBuf {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    static MADE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     SWEPT.get_or_init(sweep_old_tmp_dirs);
     let d = std::env::temp_dir().join(format!("{TMP_PREFIX}{}-{name}", std::process::id()));
-    match std::fs::DirBuilder::new().mode(0o700).create(&d) {
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if made.contains(&d) {
+        return d; // asked for again this run (a helper's own directory)
+    }
+    let create = || std::fs::DirBuilder::new().mode(0o700).create(&d);
+    match create() {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Asked for again this run (a helper's own directory).
+            // Not made this run: an earlier one's that had our pid, with
+            // its leftovers (markers a test looks for). Ours to remove, not
+            // to reuse; someone else's is an attack.
             let m = std::fs::symlink_metadata(&d).unwrap();
             assert!(
                 m.is_dir() && m.uid() == unsafe { libc::geteuid() },
                 "{} was not made by us",
                 d.display()
             );
+            let _ = std::fs::remove_dir_all(&d);
+            create().unwrap_or_else(|e| panic!("create {} again: {e}", d.display()));
         }
         Err(e) => panic!("create {}: {e}", d.display()),
     }
+    made.push(d.clone());
     d
+}
+
+#[test]
+fn a_test_directory_left_by_an_earlier_run_with_our_pid_starts_empty() {
+    // What a run that had our pid left behind (its markers would mislead
+    // the test that uses the name now).
+    let name = "stale-check";
+    let d = std::env::temp_dir().join(format!("{TMP_PREFIX}{}-{name}", std::process::id()));
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("ran"), "").unwrap();
+    assert_eq!(tmp_dir(name), d);
+    assert!(!d.join("ran").exists(), "an earlier run's marker");
+    std::fs::write(d.join("ours"), "").unwrap();
+    assert!(tmp_dir(name).join("ours").exists(), "made this run: kept");
 }
 
 /// Remove what earlier test runs (ours, their process gone) left in
@@ -699,6 +724,36 @@ fn a_stalled_or_vanished_stderr_stops_neither_the_program_nor_proxytun() {
         assert!(out.stdout.starts_with("rc 7\n"), "{mode}\n{}", out.dump());
         assert_eq!(out.stdout.matches(BODY).count(), 40, "{mode}\n{}", out.dump());
     }
+}
+
+#[test]
+fn a_stalled_stderr_we_may_not_reopen_does_not_stop_proxytun_either() {
+    require!("python3", "curl", "unshare", "setpriv");
+    let origin = start_origin();
+    let mock = start_mock_proxy(origin);
+    let dir = shared_dir("stderr-theirs");
+    let cfg = write_cfg(&dir, mock.addr, "sniff = false", "");
+    std::fs::write(dir.join("stderr.py"), PY_STDERR).unwrap();
+    // stderr a pipe of root's (as a terminal of someone else's is, after
+    // `su - bob`): proxytun, as another user, cannot open a description of
+    // its own and writes the shared one, only as far as it takes more.
+    let prog = "for i in $(seq 40); do curl -s --max-time 5 http://log.test/ || echo fail; echo; done; exit 7";
+    let mut cmd = Command::new("unshare");
+    cmd.args(["--user", "--map-auto", "--map-root-user", "--", "python3"])
+        .arg(dir.join("stderr.py"))
+        .args([
+            "stalled",
+            "setpriv",
+            "--reuid=1000",
+            "--regid=1000",
+            "--clear-groups",
+            "--",
+        ])
+        .args([BIN, "-vv", "-c", cfg.to_str().unwrap(), "--", "sh", "-c"])
+        .arg(format!("({prog}) 2>/dev/null"));
+    let out = run_cmd(cmd, &[]);
+    assert!(out.stdout.starts_with("rc 7\n"), "{}", out.dump());
+    assert_eq!(out.stdout.matches(BODY).count(), 40, "{}", out.dump());
 }
 
 #[test]
