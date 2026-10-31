@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Result};
 use proxytun_core::net::dns::{self, DnsStats, Transport};
 use proxytun_core::net::fakeip::{FakeGuard, FakePool};
 use proxytun_core::net::relay::{self, Live, Pending, Traffic};
-use proxytun_core::throttle;
+use proxytun_core::throttle::{self, Throttle};
 use proxytun_core::types::Target;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -112,7 +112,7 @@ impl Snapshot {
         }
     }
 
-    pub fn zero() -> Self {
+    fn zero() -> Self {
         Snapshot {
             at: Instant::now(),
             connections: 0,
@@ -140,18 +140,16 @@ pub struct Shared {
     pub last_stats: Mutex<Snapshot>,
     /// Last connection id handed out (TUN-captured and host-port alike).
     pub last_id: AtomicU64,
-    /// When the full address-rewriting table was last reported.
-    pub table_full_logged: Mutex<Option<Instant>>,
+    /// The full address-rewriting table, reported once in a while.
+    table_full_logged: Throttle,
+    /// accept failing, reported once in a while for all accept loops
+    /// (captured and host ports) together.
+    accept_failed_logged: Throttle,
+    /// Connections refused over `MAX_RELAYS`, likewise.
+    relays_refused_logged: Throttle,
     /// One per connection being relayed, `MAX_RELAYS` at most (fewer when the
     /// open-file limit is low: `app::relay_capacity`).
     pub relay_slots: Arc<tokio::sync::Semaphore>,
-}
-
-/// When an accept loop last reported trouble.
-#[derive(Default)]
-pub struct AcceptLog {
-    failed: Option<Instant>,
-    busy: Option<Instant>,
 }
 
 /// The next connection on `listener` that may be relayed, with its slot.
@@ -164,13 +162,12 @@ pub async fn accept_with_slot(
     listener: &TcpListener,
     sh: &Shared,
     what: &str,
-    log: &mut AcceptLog,
 ) -> (tokio::net::TcpStream, SocketAddr, tokio::sync::OwnedSemaphorePermit) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                if throttle::due(&mut log.failed, Instant::now(), throttle::EVERY) {
+                if sh.accept_failed_logged.due() {
                     tracing::warn!(
                         "{what} accept: {e} (repeats within {}s not logged)",
                         throttle::EVERY.as_secs()
@@ -182,16 +179,16 @@ pub async fn accept_with_slot(
         };
         match sh.relay_slots.clone().try_acquire_owned() {
             Ok(slot) => return (stream, peer, slot),
-            Err(_) => refuse_busy(sh, stream, &mut log.busy),
+            Err(_) => refuse_busy(sh, stream),
         }
     }
 }
 
 /// A connection over `MAX_RELAYS`: reset at once, so the program fails fast
 /// instead of waiting on a connection nobody serves.
-fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream, warned: &mut Option<Instant>) {
+fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream) {
     count(&sh.stats.relays_refused, 1);
-    if throttle::due(warned, Instant::now(), throttle::EVERY) {
+    if sh.relays_refused_logged.due() {
         tracing::warn!(
             "as many connections as may be relayed at once are being relayed (see the open-file limit \
              at startup): refusing new ones (relays_refused; repeats within {}s not logged)",
@@ -201,14 +198,34 @@ fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream, warned: &mut Option<I
     let _ = stream.set_zero_linger();
 }
 
-/// Report a full address-rewriting table now and then: every retried SYN
-/// lands there, on the TUN thread (`dropped_table_full` counts them all).
-fn table_full_due(sh: &Shared) -> bool {
-    let mut last = sh.table_full_logged.lock().unwrap_or_else(|e| e.into_inner());
-    throttle::due(&mut last, Instant::now(), throttle::EVERY)
-}
-
 impl Shared {
+    /// `relays` connections may be relayed at once.
+    pub fn new(
+        listen: SocketAddrV4,
+        nat: Nat,
+        pool: FakePool,
+        upstream_dns: SocketAddr,
+        live: Arc<Live>,
+        relays: usize,
+    ) -> Shared {
+        Shared {
+            listen,
+            nat: Mutex::new(nat),
+            pool,
+            upstream_dns,
+            live: RwLock::new(live),
+            stats: Stats::default(),
+            dns: DnsStats::default(),
+            traffic: Traffic::default(),
+            last_stats: Mutex::new(Snapshot::zero()),
+            last_id: AtomicU64::new(0),
+            table_full_logged: Throttle::new(),
+            accept_failed_logged: Throttle::new(),
+            relays_refused_logged: Throttle::new(),
+            relay_slots: Arc::new(tokio::sync::Semaphore::new(relays)),
+        }
+    }
+
     pub fn next_conn_id(&self) -> u64 {
         self.last_id.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -291,7 +308,9 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
             match nat {
                 Some(nat) => tracing::trace!(src = %p.src, dst = %p.dst, %nat, "syn"),
                 None => {
-                    if table_full_due(sh) {
+                    // Every retried SYN lands here (`dropped_table_full`
+                    // counts them all).
+                    if sh.table_full_logged.due() {
                         tracing::error!(
                             src = %p.src, dst = %p.dst,
                             "address-rewriting table full, refusing new connections (see \
@@ -371,9 +390,8 @@ fn write_packet(tun: &OwnedFd, sh: &Shared, b: &[u8]) {
 
 /// Accept captured connections and relay each one.
 pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
-    let mut log = AcceptLog::default();
     loop {
-        let (stream, peer, slot) = accept_with_slot(&listener, &sh, "relay", &mut log).await;
+        let (stream, peer, slot) = accept_with_slot(&listener, &sh, "relay").await;
         let id = sh.next_conn_id();
         // Every line about this connection names it. Error level: present
         // whenever anything is logged, so a proxy failing at warn names it too.
@@ -560,20 +578,14 @@ pub(crate) mod tests {
 
     pub(crate) fn shared(listen: SocketAddrV4) -> Shared {
         let cfg = Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n").unwrap();
-        Shared {
+        Shared::new(
             listen,
-            nat: Mutex::new(Nat::new(NAT, 1)),
-            pool: FakePool::with_reserved_tail("198.18.0.0/15".parse().unwrap(), 0),
-            upstream_dns: "127.0.0.1:9".parse().unwrap(),
-            live: RwLock::new(Arc::new(relay::build_live(&cfg).unwrap())),
-            stats: Stats::default(),
-            dns: DnsStats::default(),
-            traffic: Traffic::default(),
-            last_stats: Mutex::new(Snapshot::zero()),
-            last_id: AtomicU64::new(0),
-            table_full_logged: Mutex::new(None),
-            relay_slots: Arc::new(tokio::sync::Semaphore::new(MAX_RELAYS)),
-        }
+            Nat::new(NAT, 1),
+            FakePool::with_reserved_tail("198.18.0.0/15".parse().unwrap(), 0),
+            "127.0.0.1:9".parse().unwrap(),
+            Arc::new(relay::build_live(&cfg).unwrap()),
+            MAX_RELAYS,
+        )
     }
 
     #[tokio::test]
@@ -730,6 +742,79 @@ pub(crate) mod tests {
         // ended here, a lost reset would leave the program waiting forever
         // instead of reset after `nat::QUEUED`.
         assert_eq!(sh.nat().accept(second), Some(sa("9.9.9.9:53")));
+    }
+
+    /// What is logged on this thread (the test's, which runs every task of a
+    /// current-thread runtime) until the guard is dropped.
+    fn logged() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let to = lines.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Lines(to.clone()))
+            .finish();
+        (lines, tracing::subscriber::set_default(sub))
+    }
+
+    fn count_in(lines: &Mutex<Vec<u8>>, what: &str) -> usize {
+        String::from_utf8_lossy(&lines.lock().unwrap()).matches(what).count()
+    }
+
+    #[tokio::test]
+    async fn refusals_are_reported_once_for_all_accept_loops_together() {
+        let (lines, _log) = logged();
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host_port = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (to_relay, to_host_port) = (relay.local_addr().unwrap(), host_port.local_addr().unwrap());
+        let SocketAddr::V4(listen) = to_relay else {
+            unreachable!()
+        };
+        let mut sh = shared(listen);
+        sh.relay_slots = Arc::new(tokio::sync::Semaphore::new(0));
+        let sh = Arc::new(sh);
+        tokio::spawn(run_relay(relay, sh.clone()));
+        tokio::spawn(crate::hostports::serve(host_port, to_host_port, sh.clone()));
+        // One connection over the cap on each loop: two refused, within the
+        // same 10 s.
+        let _a = TcpStream::connect(to_relay).await.unwrap();
+        let _b = TcpStream::connect(to_host_port).await.unwrap();
+        while sh.stats.relays_refused.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            count_in(&lines, "refusing new ones"),
+            1,
+            "one line, whichever loop refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_failures_are_reported_once_for_all_accept_loops_together() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let (lines, _log) = logged();
+        // Bound but not listening: every accept fails at once (EINVAL), as
+        // one out of fds would.
+        let failing = || {
+            let s = TcpSocket::new_v4().unwrap();
+            s.bind(sa("127.0.0.1:0").into()).unwrap();
+            TcpListener::from_std(unsafe { std::net::TcpListener::from_raw_fd(s.into_raw_fd()) }).unwrap()
+        };
+        let sh = Arc::new(shared(sa("127.0.0.1:9")));
+        tokio::spawn(run_relay(failing(), sh.clone()));
+        tokio::spawn(crate::hostports::serve(failing(), sa("127.0.0.1:9").into(), sh.clone()));
+        // Each loop fails several times over (retrying every 20 ms).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(count_in(&lines, "accept:"), 1, "one line, whichever loop failed");
     }
 
     #[tokio::test]

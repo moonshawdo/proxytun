@@ -18,7 +18,7 @@
 //! the program is gone.
 
 use anyhow::{bail, Result};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Mutex;
 
 /// The witness's name: anything but "proxytun".
@@ -44,40 +44,34 @@ impl Witness {
     /// `sigs` already blocked (the witness inherits the mask), and before we
     /// become a subreaper.
     pub fn start(sigs: &[libc::c_int]) -> Result<Witness> {
-        let mut ctl = [0; 2];
-        let mut back = [0; 2];
+        // Owned: closed on any way out, failing included.
+        let (ctl_r, ctl_w) = crate::sys::pipe()?;
+        let (back_r, back_w) = crate::sys::pipe()?;
+        let set = crate::sys::sigset(sigs);
         // SAFETY: plain syscalls; the children only use async-signal-safe
         // calls on data prepared here.
         unsafe {
-            if libc::pipe2(ctl.as_mut_ptr(), libc::O_CLOEXEC) != 0
-                || libc::pipe2(back.as_mut_ptr(), libc::O_CLOEXEC) != 0
-            {
-                bail!("pipe2: {}", std::io::Error::last_os_error());
-            }
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            for &s in sigs {
-                libc::sigaddset(&mut set, s);
-            }
             match libc::fork() {
                 -1 => bail!("fork: {}", std::io::Error::last_os_error()),
                 0 => {
-                    libc::close(ctl[1]);
-                    libc::close(back[0]);
+                    drop((ctl_w, back_r));
                     match libc::fork() {
-                        0 => witness_loop(ctl[0], back[1], &set),
+                        0 => witness_loop(ctl_r.as_raw_fd(), back_w.as_raw_fd(), &set),
                         _ => libc::_exit(0),
                     }
                 }
                 child => {
-                    libc::close(ctl[0]);
-                    libc::close(back[1]);
+                    drop((ctl_r, back_w));
                     let mut status = 0;
                     libc::waitpid(child, &mut status, 0);
                     // Blocks until the witness is ready (or EOF if it died).
                     let mut pid: libc::pid_t = 0;
-                    let n = libc::read(back[0], &mut pid as *mut _ as *mut _, std::mem::size_of_val(&pid));
-                    let pipes = (OwnedFd::from_raw_fd(ctl[1]), OwnedFd::from_raw_fd(back[0]));
+                    let n = libc::read(
+                        back_r.as_raw_fd(),
+                        &mut pid as *mut _ as *mut _,
+                        std::mem::size_of_val(&pid),
+                    );
+                    let pipes = (ctl_w, back_r);
                     if n != std::mem::size_of_val(&pid) as isize {
                         bail!("starting the signal witness failed");
                     }
@@ -217,11 +211,7 @@ mod tests {
         let watched = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
         // As in proxytun: the watched signals are blocked before the start.
         let w = unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            for s in watched {
-                libc::sigaddset(&mut set, s);
-            }
+            let set = crate::sys::sigset(&watched);
             let mut old: libc::sigset_t = std::mem::zeroed();
             libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
             let w = Witness::start(&watched);

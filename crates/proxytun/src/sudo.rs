@@ -43,11 +43,9 @@ use crate::netns::{self, Child, Handover, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ipnet::Ipv4Net;
 use nix::sys::socket::{
-    accept4, bind, connect, getsockopt, listen, sendmsg, socket, sockopt, AddressFamily, Backlog, ControlMessage,
-    MsgFlags, SockFlag, SockType, UnixAddr,
+    accept4, bind, connect, getsockopt, listen, socket, sockopt, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
 };
 use std::ffi::{CString, OsString};
-use std::io::IoSlice;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -89,18 +87,10 @@ impl Request {
         field(b"3");
         field(self.fake_range.to_string().as_bytes());
         field(self.pgrp.to_string().as_bytes());
-        field(netns::join_addrs(&self.forwards).as_bytes());
+        field(netns::join_list(&self.forwards).as_bytes());
         field(format!("{:o}", self.umask).as_bytes());
         field(if self.sigpipe_ignored { b"1" } else { b"0" });
-        let inherit: Vec<String> = self.inherit.iter().map(|n| n.to_string()).collect();
-        field(
-            if inherit.is_empty() {
-                "-".into()
-            } else {
-                inherit.join(",")
-            }
-            .as_bytes(),
-        );
+        field(netns::join_list(&self.inherit).as_bytes());
         field(self.argv.len().to_string().as_bytes());
         for a in &self.argv {
             field(a.as_bytes());
@@ -119,17 +109,14 @@ impl Request {
         }
         let fake_range = text()?.parse().ok()?;
         let pgrp = text()?.parse().ok()?;
-        let forwards = netns::split_addrs(&text()?)?;
+        let forwards = netns::split_list(&text()?)?;
         let umask = libc::mode_t::from_str_radix(&text()?, 8).ok()?;
         let sigpipe_ignored = match text()?.as_str() {
             "1" => true,
             "0" => false,
             _ => return None,
         };
-        let inherit = match text()?.as_str() {
-            "-" => Vec::new(),
-            list => list.split(',').map(|n| n.parse().ok()).collect::<Option<_>>()?,
-        };
+        let inherit = netns::split_list(&text()?)?;
         let argc: usize = text()?.parse().ok()?;
         let argv: Vec<OsString> = (0..argc)
             .map(|_| fields.next().map(|a| OsString::from_vec(a.to_vec())))
@@ -219,9 +206,9 @@ pub fn root_refusal_here() -> Option<String> {
     root_refusal(unsafe { libc::getuid() }, unsafe { libc::geteuid() }, elevated)
 }
 
-/// SCM_RIGHTS passes at most 253 fds at once; four are stdio and the
-/// working directory.
-const MAX_INHERIT: usize = 249;
+/// One SCM_RIGHTS message carries them all; four are stdio and the working
+/// directory.
+const MAX_INHERIT: usize = netns::SCM_MAX_FDS - 4;
 
 /// No fd number reaches this (the kernel's default fs.nr_open).
 const FD_CEILING: RawFd = 1 << 20;
@@ -475,14 +462,8 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
         .into_iter()
         .chain(req.inherit.iter().copied())
         .collect();
-    sendmsg::<()>(
-        ctl.as_raw_fd(),
-        &[IoSlice::new(&req.encode())],
-        &[ControlMessage::ScmRights(&fds)],
-        MsgFlags::empty(),
-        None,
-    )
-    .context("send the request to the helper (environment too large?)")?;
+    netns::send_with_fds(&ctl, &req.encode(), &fds)
+        .context("send the request to the helper (environment too large?)")?;
     let handover = netns::recv_setup(&ctl, None)?;
     let report = &handover.report;
     let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
@@ -595,12 +576,12 @@ fn helper(args: &[OsString]) -> Result<()> {
     // is still in it. The program leaves first and tells us on this pipe.
     // SAFETY: plain syscall.
     let (left, detach) = if caller.map(|s| s.session) != Some(unsafe { libc::getsid(0) }) {
-        let (r, w) = pipe()?;
+        let (r, w) = crate::sys::pipe()?;
         (Some(r), Some(w))
     } else {
         (None, None)
     };
-    let (from_program, to_parent) = pipe()?;
+    let (from_program, to_parent) = crate::sys::pipe()?;
     // SAFETY: we are single-threaded.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -652,16 +633,6 @@ fn helper(args: &[OsString]) -> Result<()> {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     served
-}
-
-/// A close-on-exec pipe: (read end, write end).
-fn pipe() -> Result<(OwnedFd, OwnedFd)> {
-    let mut p = [0; 2];
-    // SAFETY: pipe2 fills both fds, owned right away.
-    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        bail!("pipe: {}", std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) })
 }
 
 /// The longest request: the environment and argv of a program, as one

@@ -4,7 +4,7 @@
 //! The namespace is set up by a fresh proxytun process (see netns.rs) before
 //! the tokio runtime starts.
 
-use crate::capture::{self, Shared, Snapshot, Stats};
+use crate::capture::{self, Shared};
 use crate::nat::Nat;
 use crate::netns::{self, Addrs, Setup, UsernsUnusable};
 use crate::witness::Witness;
@@ -13,14 +13,13 @@ use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use proxytun_core::config::{url_has_credentials, Config};
 use proxytun_core::health;
-use proxytun_core::net::dns::DnsStats;
 use proxytun_core::net::fakeip::FakePool;
-use proxytun_core::net::relay::{build_live, Traffic};
+use proxytun_core::net::relay::build_live;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub struct Args {
     pub config: PathBuf,
@@ -191,20 +190,14 @@ pub fn run(args: Args) -> Result<Exit> {
         anyhow::bail!("the capture listener is not IPv4");
     };
 
-    let sh = Arc::new(Shared {
+    let sh = Arc::new(Shared::new(
         listen,
-        nat: Mutex::new(Nat::new(addrs.nat, crate::nat::NAT_ADDRS)),
+        Nat::new(addrs.nat, crate::nat::NAT_ADDRS),
         pool,
         upstream_dns,
-        live: RwLock::new(live.clone()),
-        stats: Stats::default(),
-        dns: DnsStats::default(),
-        traffic: Traffic::default(),
-        last_stats: Mutex::new(Snapshot::zero()),
-        last_id: AtomicU64::new(0),
-        table_full_logged: Mutex::new(None),
-        relay_slots: Arc::new(tokio::sync::Semaphore::new(relays)),
-    });
+        live.clone(),
+        relays,
+    ));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Blocking work is resolving host names for direct rules
@@ -289,9 +282,7 @@ pub fn finish(exit: Exit) -> ! {
         };
         libc::setrlimit(libc::RLIMIT_CORE, &none);
         libc::signal(sig, libc::SIG_DFL);
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, sig);
+        let set = crate::sys::sigset(&[sig]);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
         libc::raise(sig);
     }
@@ -355,11 +346,7 @@ fn exit_signal_fd(sigs: &[libc::c_int]) -> Option<OwnedFd> {
         return None;
     }
     unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for &s in sigs {
-            libc::sigaddset(&mut set, s);
-        }
+        let set = crate::sys::sigset(sigs);
         let fd = libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
         if fd < 0 {
             tracing::warn!("signalfd: {}", std::io::Error::last_os_error());

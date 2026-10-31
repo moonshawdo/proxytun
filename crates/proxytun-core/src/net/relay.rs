@@ -77,11 +77,7 @@ pub fn build_live(cfg: &Config) -> Result<Live> {
         sniff: SniffCfg {
             enabled: cfg.sniff,
             ports: cfg.sniff_ports.clone(),
-            skip: cfg
-                .sniff_skip_domains
-                .iter()
-                .map(|d| d.trim_start_matches('.').to_ascii_lowercase())
-                .collect(),
+            skip: cfg.sniff_skip_domains.clone(),
             timeout: Duration::from_millis(cfg.sniff_timeout_ms),
             override_destination: cfg.sniff_override_destination,
         },
@@ -98,16 +94,16 @@ pub struct Traffic {
 
 /// Bytes one connection moved each way.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Transfer {
-    pub up: u64,
-    pub down: u64,
+struct Transfer {
+    up: u64,
+    down: u64,
 }
 
 /// The line every relayed connection ends with: how long it lived, how long
 /// reaching its proxy (or the target itself) took, through what, the bytes
 /// each way, and how it ended. Enough to tell a slow proxy from a slow
 /// transfer, at the default log level.
-pub fn log_closed(start: Instant, dial: Duration, via: &str, moved: &Transfer, r: &Result<()>) {
+fn log_closed(start: Instant, dial: Duration, via: &str, moved: &Transfer, r: &Result<()>) {
     let (ms, dial_ms) = (start.elapsed().as_millis() as u64, dial.as_millis() as u64);
     let (up, down) = (moved.up, moved.down);
     match r {
@@ -126,7 +122,7 @@ pub struct Pending {
 /// Carry one accepted connection to its target and log how it ended.
 /// Records `target` on the caller's span, which names the connection in
 /// every log line.
-pub async fn route(live: &Live, traffic: &Traffic, mut inbound: TcpStream, pending: Pending) -> Result<()> {
+pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: Pending) -> Result<()> {
     let start = Instant::now();
     let Pending { target, guard } = pending;
     // localnet and the program's own proxies: straight out, untouched.
@@ -172,26 +168,45 @@ pub async fn route(live: &Live, traffic: &Traffic, mut inbound: TcpStream, pendi
         },
     };
     let dial = dial_start.elapsed();
-    let (via, moved, r) = match dialed {
-        // `_conn` counts the connection as active on its proxy while it lasts.
-        Ok((mut out, _conn, via)) => {
+    // `_conn` counts the connection as active on its proxy while it lasts.
+    let (out, _conn, via) = match dialed {
+        Ok((out, conn, via)) => {
             out.set_nodelay(true).ok();
             keepalive(&out);
+            (Ok(out), conn, via)
+        }
+        Err(e) => (Err(e), None, "-".to_string()),
+    };
+    finish(inbound, out, traffic, start, dial, &via).await
+}
+
+/// The end of every relayed connection, once its way out (`via`) is dialed
+/// or failed to be: copy both ways, then log how it ended. An abort reaches
+/// each side as one, a reset: a transfer cut off, or a target that could not
+/// be reached, must not look like a complete (or empty) one ending in a FIN.
+/// `start` is when the connection came in, `dial` how long dialing took.
+pub async fn finish(
+    mut inbound: TcpStream,
+    out: Result<TcpStream>,
+    traffic: &Traffic,
+    start: Instant,
+    dial: Duration,
+    via: &str,
+) -> Result<()> {
+    let (moved, r) = match out {
+        Ok(mut out) => {
             let (moved, r) = pump(&mut inbound, &mut out, traffic).await;
             if r.is_err() {
                 let _ = out.set_zero_linger();
             }
-            (via, moved, r)
+            (moved, r)
         }
-        Err(e) => ("-".to_string(), Transfer::default(), Err(e)),
+        Err(e) => (Transfer::default(), Err(e)),
     };
-    // An abort reaches each side as one, a reset: a transfer cut off, or a
-    // target that could not be reached, must not look like a complete (or
-    // empty) one ending in a FIN.
     if r.is_err() {
         let _ = inbound.set_zero_linger();
     }
-    log_closed(start, dial, &via, &moved, &r);
+    log_closed(start, dial, via, &moved, &r);
     r
 }
 
@@ -282,7 +297,7 @@ fn hex(b: &[u8]) -> String {
 /// copy, not splice(2): for connections that came in through the TUN device
 /// it measured 20-30% faster (the TUN thread is the bottleneck either way, and
 /// splice only adds to it). See docs/DESIGN.md.
-pub async fn pump(a: &mut TcpStream, b: &mut TcpStream, traffic: &Traffic) -> (Transfer, Result<()>) {
+async fn pump(a: &mut TcpStream, b: &mut TcpStream, traffic: &Traffic) -> (Transfer, Result<()>) {
     a.set_nodelay(true).ok();
     let mut a = Counted {
         s: a,
@@ -349,9 +364,8 @@ async fn lookup(
     port: u16,
 ) -> io::Result<Vec<std::net::SocketAddr>> {
     let Ok(slot) = slots.try_acquire() else {
-        static WARNED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-        let mut last = WARNED.lock().unwrap_or_else(|e| e.into_inner());
-        if crate::throttle::due(&mut last, Instant::now(), crate::throttle::EVERY) {
+        static WARNED: crate::throttle::Throttle = crate::throttle::Throttle::new();
+        if WARNED.due() {
             tracing::warn!(
                 "{MAX_LOOKUPS} host name lookups for direct rules under way (a slow resolver?): failing \
                  new direct connections to names (repeats within {}s not logged)",
@@ -943,6 +957,19 @@ mod tests {
         assert!(c.skips("x.cloudflare-ech.com"));
         assert!(!c.skips("notcloudflare-ech.com"));
         assert!(!c.skips("cloudflare.com"));
+    }
+
+    #[test]
+    fn a_skip_entry_is_written_as_a_domain_suffix_rule_value_may_be() {
+        let cfg = Config::parse(
+            "sniff_skip_domains = [\"*.Example.com\", \".ech.test\"]\n[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        let c = build_live(&cfg).unwrap().sniff;
+        for name in ["example.com", "a.example.com", "ech.test", "b.ech.test"] {
+            assert!(c.skips(name), "{name}");
+        }
+        assert!(!c.skips("badexample.com"));
     }
 
     #[tokio::test]

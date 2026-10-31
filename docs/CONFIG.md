@@ -165,7 +165,8 @@ systemd-resolved 的 unix socket 解析),proxytun 先看一眼程序发出的第
 #### `sniff_skip_domains`
 
 - 类型：字符串数组;默认 `["cloudflare-ech.com"]`;可热加载。
-- 嗅探到的名字等于其中某项或是它的子域名时，不采用这个名字，保留原 IP。比较不区分大小写，开头的 `.` 会被忽略。
+- 嗅探到的名字等于其中某项或是它的子域名时，不采用这个名字，保留原 IP。比较不区分大小写;与 `domain-suffix` 规则的 `value` 一样，
+  写成 `*.example.com` 或 `.example.com` 也可以，会被规范成 `example.com`(同时匹配 `example.com` 与它的子域名)。
 - 用途：真正启用 ECH(加密 ClientHello)的连接，明文 SNI 里只有服务商的"公共名",不是真实目的地。
 
 #### `sniff_override_destination`

@@ -12,7 +12,7 @@
 //! the user excluded, nor listeners opened after start-up.
 
 use crate::capture::Shared;
-use proxytun_core::net::relay::{self, Transfer};
+use proxytun_core::net::relay;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -21,9 +21,10 @@ use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::Instrument;
 
-/// The fds of one setup answer must fit in one SCM_RIGHTS message (the kernel
-/// takes at most 253), together with the TUN device and the capture listener.
+/// The fds of one setup answer must fit in one SCM_RIGHTS message, together
+/// with the TUN device and the capture listener.
 pub const MAX_FORWARDS: usize = 250;
+const _: () = assert!(2 + MAX_FORWARDS <= crate::netns::SCM_MAX_FDS);
 
 const LISTEN: &str = "0A";
 
@@ -110,9 +111,9 @@ pub fn scan(exclude: &[u16]) -> Vec<SocketAddr> {
 
 /// Relay connections to the namespace's `addr` to the host's `addr`.
 pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
-    let (what, mut log) = (format!("host port {addr}"), crate::capture::AcceptLog::default());
+    let what = format!("host port {addr}");
     loop {
-        let (mut inbound, _, slot) = crate::capture::accept_with_slot(&listener, &sh, &what, &mut log).await;
+        let (inbound, _, slot) = crate::capture::accept_with_slot(&listener, &sh, &what).await;
         let id = sh.next_conn_id();
         let span = tracing::error_span!("conn", id, target = %addr);
         let sh = sh.clone();
@@ -125,23 +126,10 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 let start = Instant::now();
                 let dialed = TcpStream::connect(addr).await;
                 let dial = start.elapsed();
-                let (moved, r) = match dialed {
-                    Ok(mut out) => {
-                        let (moved, r) = relay::pump(&mut inbound, &mut out, &sh.traffic).await;
-                        if r.is_err() {
-                            let _ = out.set_zero_linger();
-                        }
-                        (moved, r)
-                    }
-                    Err(e) => (Transfer::default(), Err(e.into())),
-                };
                 // As for relayed connections, an abort is a reset: a host port
                 // closed since startup looks refused, not empty.
-                if r.is_err() {
-                    let _ = inbound.set_zero_linger();
-                }
+                let _ = relay::finish(inbound, dialed.map_err(Into::into), &sh.traffic, start, dial, "host").await;
                 sh.stats.active.fetch_sub(1, Ordering::Relaxed);
-                relay::log_closed(start, dial, "host", &moved, &r);
             }
             .instrument(span),
         );

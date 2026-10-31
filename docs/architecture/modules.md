@@ -29,9 +29,13 @@ flowchart LR
         SUDO --> PFS
         NETNS --> PFS
         DOC --> PFS
+        APP --> SYS["sys.rs<br/>pipe, sigset"]
+        SUDO --> SYS
+        WIT --> SYS
+        HP --> NETNS
     end
     subgraph CORE["crates/proxytun-core"]
-        RELAY["net/relay.rs<br/>route, pump"]
+        RELAY["net/relay.rs<br/>route, finish"]
         DNS["net/dns.rs<br/>应答与转发"]
         FAKE["net/fakeip.rs<br/>假 IP 池"]
         POL["policy.rs<br/>规则"]
@@ -80,6 +84,7 @@ flowchart LR
 | `witness.rs` | 见证进程:double-fork、改名为 `signal-witness`、屏蔽 INT/QUIT/TERM,经管道回答"有哪些待处理信号" |
 | `doctor.rs` | `--doctor`:按真实路径建一次命名空间跑 `true`,报告模式、TUN、Yama、主机端口、每个代理 |
 | `procfs.rs` | 解析 `/proc/<pid>/stat` 里的父进程、进程组、会话(从最后一个 `)` 往后数，程序名含空格和括号也不错位)与内核版本号;信号转发、sudo 助手(校验调用者、加入进程组)、挂载传播方式、自检都用它 |
+| `sys.rs` | 几个模块共用的 libc 薄封装:close-on-exec 的管道(sudo 助手、见证进程)、由信号列表构造 `sigset_t`(app、见证进程) |
 
 ### 4.3 `crates/proxytun-core` 各模块
 
@@ -93,7 +98,7 @@ flowchart LR
 | `sniff.rs` | 从首包里取 TLS SNI 或 HTTP Host,纯函数 |
 | `net/fakeip.rs` | 假 IP 池:应答的 TTL(60 秒)、LRU、连接期间钉住、120 秒内不回收、最多 100 万条 |
 | `net/dns.rs` | 假 DNS 应答(A / AAAA / HTTPS / SVCB / localhost)、向上游转发(UDP、TCP)与应答校验、转发并发上限(256) |
-| `net/relay.rs` | `Pending`(捕获侧交来的连接：目标与钉住假 IP 的守卫);`route`:嗅探、规则、拨号(代理组或直连)、双向拷贝、出错时两端 RST、出站 keepalive;direct 规则的域名解析上限 |
+| `net/relay.rs` | `Pending`(捕获侧交来的连接：目标与钉住假 IP 的守卫);`route`:嗅探、规则、拨号(代理组或直连)、出站 keepalive;`finish`(`route` 与主机端口转发共用的收尾):双向拷贝、出错时两端 RST、结束汇总;direct 规则的域名解析上限 |
 | `errno.rs` | 按错误链里的 errno 判断失败原因：本机资源不足(fd、缓冲区、内存、本地端口)不算代理或上游的问题;拨号、健康探测、DNS 转发都用它 |
 | `throttle.rs` | 会按包、按查询、按 accept 频率重复的日志，限速为每 10 秒一条 |
 | `types.rs` | 捕获侧与中继侧之间传递的类型(目标、规则判定结果) |

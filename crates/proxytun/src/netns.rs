@@ -19,11 +19,13 @@ use nix::sys::socket::{
     recvmsg, sendmsg, socketpair, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
 };
 use std::ffi::{CStr, CString, OsString};
+use std::fmt::Display;
 use std::io::{IoSlice, IoSliceMut};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const TUN_NAME: &CStr = c"tun0";
@@ -127,14 +129,15 @@ pub struct Setup {
 }
 
 /// `a,b,c`, or `-` for none (an empty argument is easy to lose).
-pub fn join_addrs(a: &[SocketAddr]) -> String {
-    if a.is_empty() {
+pub fn join_list<T: Display>(items: &[T]) -> String {
+    if items.is_empty() {
         return "-".into();
     }
-    a.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
+    items.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")
 }
 
-pub fn split_addrs(s: &str) -> Option<Vec<SocketAddr>> {
+/// The items `join_list` wrote; `None` if any does not parse.
+pub fn split_list<T: FromStr>(s: &str) -> Option<Vec<T>> {
     if s == "-" {
         return Some(Vec::new());
     }
@@ -149,7 +152,7 @@ impl Setup {
             SETUP_ARG.to_string(),
             ctl.to_string(),
             self.fake_range.to_string(),
-            join_addrs(&self.forwards),
+            join_list(&self.forwards),
             "--".to_string(),
         ]
         .map(OsString::from)
@@ -168,7 +171,7 @@ impl Setup {
         let setup = Setup {
             argv: argv.to_vec(),
             fake_range: range.to_str()?.parse().ok()?,
-            forwards: split_addrs(forwards.to_str()?)?,
+            forwards: split_list(forwards.to_str()?)?,
         };
         Some((setup, ctl.to_str()?.parse().ok()?))
     }
@@ -220,11 +223,23 @@ pub struct Handover {
     pub report: String,
 }
 
+/// The most fds one SCM_RIGHTS message carries (the kernel's SCM_MAX_FD).
+pub const SCM_MAX_FDS: usize = 253;
+
+/// Send `msg` on `ctl` as one message, with `fds` (SCM_RIGHTS; none, no
+/// control message at all).
+pub fn send_with_fds(ctl: &OwnedFd, msg: &[u8], fds: &[RawFd]) -> Result<()> {
+    let rights = [ControlMessage::ScmRights(fds)];
+    let cmsgs: &[ControlMessage] = if fds.is_empty() { &[] } else { &rights };
+    sendmsg::<()>(ctl.as_raw_fd(), &[IoSlice::new(msg)], cmsgs, MsgFlags::empty(), None)?;
+    Ok(())
+}
+
 /// One message from `ctl` into `buf`, with the fds it carries (close-on-exec,
-/// at most the 253 the kernel passes at once). A message or fd list that did
-/// not fit is an error, not something to act on in part.
+/// at most `SCM_MAX_FDS`). A message or fd list that did not fit is an error,
+/// not something to act on in part.
 pub fn recv_with_fds(ctl: &OwnedFd, buf: &mut [u8]) -> Result<(usize, Vec<OwnedFd>)> {
-    let mut cmsg = nix::cmsg_space!([RawFd; 253]);
+    let mut cmsg = nix::cmsg_space!([RawFd; SCM_MAX_FDS]);
     let mut iov = [IoSliceMut::new(buf)];
     let msg = recvmsg::<()>(ctl.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)?;
     let mut fds = Vec::new();
@@ -251,7 +266,7 @@ pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<Handover> {
         let mut report = Vec::new();
         for token in rest.split(' ') {
             match token.strip_prefix("fwd=") {
-                Some(list) => forwards = Some(split_addrs(list)?),
+                Some(list) => forwards = Some(split_list(list)?),
                 None => report.push(token),
             }
         }
@@ -289,34 +304,20 @@ pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<Handover> {
 /// Report a failed setup on `ctl` (the "ERR" answer `recv_setup` reads).
 pub fn send_error(ctl: &OwnedFd, e: &SetupError) {
     let msg = format!("ERR {}{:#}", if e.userns { "userns " } else { "" }, e.err);
-    let _ = sendmsg::<()>(
-        ctl.as_raw_fd(),
-        &[IoSlice::new(msg.as_bytes())],
-        &[],
-        MsgFlags::empty(),
-        None,
-    );
+    let _ = send_with_fds(ctl, msg.as_bytes(), &[]);
 }
 
 /// Hand the namespace over on `ctl`, with `report` appended for the reader.
 pub fn send_ok(ctl: &OwnedFd, ns: &Namespace, report: &str) -> Result<()> {
     let bound: Vec<SocketAddr> = ns.forwards.iter().map(|(a, _)| *a).collect();
-    let mut msg = format!("OK fwd={}", join_addrs(&bound));
+    let mut msg = format!("OK fwd={}", join_list(&bound));
     if !report.is_empty() {
         msg.push(' ');
         msg.push_str(report);
     }
     let mut fds = vec![ns.tun.as_raw_fd(), ns.listener.as_raw_fd()];
     fds.extend(ns.forwards.iter().map(|(_, l)| l.as_raw_fd()));
-    sendmsg::<()>(
-        ctl.as_raw_fd(),
-        &[IoSlice::new(msg.as_bytes())],
-        &[ControlMessage::ScmRights(&fds)],
-        MsgFlags::empty(),
-        None,
-    )
-    .context("handing the namespace over")?;
-    Ok(())
+    send_with_fds(ctl, msg.as_bytes(), &fds).context("handing the namespace over")
 }
 
 /// Start the setup process for the program and wait for its namespace; the
@@ -700,6 +701,17 @@ mod tests {
             forwards: vec![],
         };
         assert_eq!(Setup::from_args(&odd.to_args("p", 3)), Some((odd, 3)), "not UTF-8");
+    }
+
+    #[test]
+    fn lists_are_comma_separated_or_a_dash_for_none() {
+        assert_eq!(join_list::<RawFd>(&[]), "-");
+        assert_eq!(join_list(&[3, 7, 250]), "3,7,250");
+        assert_eq!(split_list::<RawFd>("-"), Some(vec![]));
+        assert_eq!(split_list::<RawFd>("3,7,250"), Some(vec![3, 7, 250]));
+        for bad in ["", "3,", ",3", "3,,7", "3;7", "-,3"] {
+            assert_eq!(split_list::<RawFd>(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

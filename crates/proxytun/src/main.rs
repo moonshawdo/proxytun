@@ -13,6 +13,7 @@ mod netns;
 mod packet;
 mod procfs;
 mod sudo;
+mod sys;
 mod witness;
 
 use anyhow::{ensure, Context, Result};

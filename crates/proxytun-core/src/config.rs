@@ -135,6 +135,12 @@ fn join(parent: String, key: &str) -> String {
     }
 }
 
+/// A domain suffix as matching wants it: lower-case, and `*.example.com` or
+/// `.example.com` taken for `example.com`.
+fn domain_suffix(v: &str) -> String {
+    v.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase()
+}
+
 fn default_fakeip() -> String {
     "198.18.0.0/15".into()
 }
@@ -360,14 +366,13 @@ impl Config {
         }
         for r in &mut self.rules {
             if r.kind == RuleKind::DomainSuffix {
-                r.value = r
-                    .value
-                    .trim_start_matches("*.")
-                    .trim_start_matches('.')
-                    .to_ascii_lowercase();
+                r.value = domain_suffix(&r.value);
             } else if matches!(r.kind, RuleKind::Domain | RuleKind::DomainKeyword) {
                 r.value = r.value.to_ascii_lowercase();
             }
+        }
+        for d in &mut self.sniff_skip_domains {
+            *d = domain_suffix(d);
         }
     }
 

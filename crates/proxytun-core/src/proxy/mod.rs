@@ -405,9 +405,8 @@ pub async fn dial_group(
             }
             Err(e) if is_local_shortage(&e) => {
                 // Once in a while: out of fds, every connection fails so.
-                static LOGGED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-                let mut last = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-                if crate::throttle::due(&mut last, std::time::Instant::now(), crate::throttle::EVERY) {
+                static LOGGED: crate::throttle::Throttle = crate::throttle::Throttle::new();
+                if LOGGED.due() {
                     tracing::warn!(
                         proxy = %node.name,
                         "dial failed for lack of local resources: {e:#} (repeats within {}s not logged)",
