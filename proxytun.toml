@@ -30,7 +30,7 @@
 # For connections to a bare IP (DoH, hard-coded addresses, names resolved
 # through nscd / systemd-resolved), read the hostname from the TLS SNI or HTTP
 # Host of the first bytes. Fine-tuning (sniff_ports, sniff_skip_domains,
-# sniff_timeout_ms, sniff_override_destination): see the README.
+# sniff_timeout_ms, sniff_override_destination): see docs/CONFIG.md.
 # sniff = true
 
 # --- the host's own loopback services -------------------------------------

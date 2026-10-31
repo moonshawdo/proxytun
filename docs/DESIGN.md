@@ -116,7 +116,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
 
   主路径普通拷贝快 20–30%;主机端口转发慢一半，但 1.35 GB/s 对本地服务足够，为它单留 splice 不值得。
   主路径的上限约 1 GB/s(单个 TUN 收发循环),远高于真实代理的吞吐，不做多队列 TUN、校验和卸载等优化。
-  每条连接的额外开销约 0.2–0.3 ms(含假 DNS)。将来 proxyhook 改为依赖 core 时,splice 可以从 proxyhook 仓库拷回 `net/splice.rs`,
+  每条连接的额外开销约 0.5 ms(与客户端自己做 SOCKS5 握手相比，见 [PERFORMANCE.md](PERFORMANCE.md))。将来 proxyhook 改为依赖 core 时,splice 可以从 proxyhook 仓库拷回 `net/splice.rs`,
   再给 `relay::pump` 加一个选择参数。
 - 中继缓冲每方向 64 KiB(每条连接一建立就占 128 KiB)。经 TUN 下载 3 GB 实测:64 KiB 约 990 MB/s,32 KiB 约 915(−8%),
   16 KiB 约 750(−24%),8 KiB 约 545(−45%);按"吞吐下降不超过 5%"的标准不缩小。
