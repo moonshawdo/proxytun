@@ -351,7 +351,7 @@ fn as_caller<T>(uid: libc::uid_t, gid: libc::gid_t, f: impl FnOnce() -> T) -> Re
 
 fn set_timeouts(fd: &OwnedFd, t: Duration) -> Result<()> {
     let tv = libc::timeval {
-        tv_sec: t.as_secs() as libc::time_t,
+        tv_sec: t.as_secs() as _,
         tv_usec: 0,
     };
     for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
