@@ -12,6 +12,7 @@
 //! (UDP, see `respond`) or captured connections to port 53 (TCP, `serve_tcp`).
 
 use crate::net::fakeip::FakePool;
+use anyhow::{anyhow, ensure, Context, Result};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{rdata, DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -79,6 +80,9 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
 
     match q.query_type() {
+        // The root has no address; a fake one would name nothing a proxy can
+        // be asked for.
+        RecordType::A if domain.is_empty() => reply(base_response(&req, ResponseCode::NoError)),
         RecordType::A => {
             let ip = if domain == "localhost" || domain.ends_with(".localhost") {
                 Ipv4Addr::LOCALHOST
@@ -199,19 +203,31 @@ pub async fn respond(
                 Transport::Tcp => forward_tcp(raw, upstream).await,
             };
             let ms = t0.elapsed().as_millis() as u64;
-            if r.is_some() {
-                stats.forwarded.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(%upstream, ?via, ms, "dns: upstream answered");
-            } else if stats.forward_failed.fetch_add(1, Ordering::Relaxed) == 0 {
-                tracing::warn!(
-                    %upstream, ?via, ms,
-                    "dns: the upstream resolver did not answer; MX/TXT/PTR and other non-A lookups fail \
-                     (check upstream_dns). Later failures are logged at debug"
-                );
-            } else {
-                tracing::debug!(%upstream, ?via, ms, "dns: upstream did not answer");
+            match r {
+                Ok(r) => {
+                    stats.forwarded.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(%upstream, ?via, ms, "dns: upstream answered");
+                    Some(r)
+                }
+                // Our own shortage (no fd for a socket): not the upstream's
+                // doing, and no reason to doubt upstream_dns.
+                Err(e) if crate::proxy::is_local_shortage(&e) => {
+                    tracing::debug!(%upstream, ?via, "dns: cannot forward for lack of local resources: {e:#}");
+                    None
+                }
+                Err(e) => {
+                    if stats.forward_failed.fetch_add(1, Ordering::Relaxed) == 0 {
+                        tracing::warn!(
+                            %upstream, ?via, ms,
+                            "dns: the upstream resolver did not answer ({e:#}); MX/TXT/PTR and other non-A \
+                             lookups fail (check upstream_dns). Later failures are logged at debug"
+                        );
+                    } else {
+                        tracing::debug!(%upstream, ?via, ms, "dns: upstream did not answer: {e:#}");
+                    }
+                    None
+                }
             }
-            r
         }
     }
 }
@@ -278,11 +294,11 @@ fn same_questions(q: &[u8], r: &[u8], count: u16) -> bool {
 /// drops datagrams from any other address (another local user, or a blind
 /// spoofer, aiming at our ephemeral port), and the reply must also match the
 /// query's ID and question.
-async fn forward_udp(raw: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
+async fn forward_udp(raw: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
     let bind = if upstream.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let sock = UdpSocket::bind(bind).await.ok()?;
-    sock.connect(upstream).await.ok()?;
-    sock.send(raw).await.ok()?;
+    let sock = UdpSocket::bind(bind).await.context("open a socket")?;
+    sock.connect(upstream).await.context("connect")?;
+    sock.send(raw).await.context("send")?;
     let deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
     // Room for the largest datagram, not zero-filled: recv_buf writes into the
     // spare capacity.
@@ -291,29 +307,32 @@ async fn forward_udp(raw: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
         buf.clear();
         tokio::time::timeout_at(deadline, sock.recv_buf(&mut buf))
             .await
-            .ok()?
-            .ok()?;
+            .map_err(|_| anyhow!("no answer within {}s", FORWARD_TIMEOUT.as_secs()))?
+            .context("receive")?;
         if is_reply_to(raw, &buf) {
-            return Some(buf);
+            return Ok(buf);
         }
         tracing::debug!(%upstream, "dns: ignoring a datagram that does not answer our query");
     }
 }
 
 /// Forward over TCP (2-byte length prefix), with the same reply check.
-async fn forward_tcp(raw: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
+async fn forward_tcp(raw: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
     let work = async {
-        let mut s = tokio::net::TcpStream::connect(upstream).await.ok()?;
+        let mut s = tokio::net::TcpStream::connect(upstream).await.context("connect")?;
         let mut out = (raw.len() as u16).to_be_bytes().to_vec();
         out.extend_from_slice(raw);
-        s.write_all(&out).await.ok()?;
+        s.write_all(&out).await.context("send")?;
         let mut l = [0u8; 2];
-        s.read_exact(&mut l).await.ok()?;
+        s.read_exact(&mut l).await.context("receive")?;
         let mut body = vec![0u8; u16::from_be_bytes(l) as usize];
-        s.read_exact(&mut body).await.ok()?;
-        is_reply_to(raw, &body).then_some(body)
+        s.read_exact(&mut body).await.context("receive")?;
+        ensure!(is_reply_to(raw, &body), "not an answer to the query");
+        Ok(body)
     };
-    tokio::time::timeout(FORWARD_TIMEOUT, work).await.ok()?
+    tokio::time::timeout(FORWARD_TIMEOUT, work)
+        .await
+        .map_err(|_| anyhow!("no answer within {}s", FORWARD_TIMEOUT.as_secs()))?
 }
 
 #[cfg(test)]
@@ -517,6 +536,18 @@ mod tests {
         r
     }
 
+    #[test]
+    fn the_root_gets_no_fake_address() {
+        let p = pool();
+        let Answer::Reply(r) = answer(&query(".", RecordType::A, DNSClass::IN), &p).unwrap() else {
+            panic!("answered locally");
+        };
+        let m = Message::from_bytes(&r).unwrap();
+        assert_eq!(m.response_code(), ResponseCode::NoError);
+        assert!(m.answers().is_empty());
+        assert!(p.is_empty(), "nothing allocated");
+    }
+
     #[tokio::test]
     async fn forwards_in_flight_are_capped() {
         // An upstream that never answers: every forward waits out its timeout
@@ -666,7 +697,7 @@ mod tests {
         });
         let q = query("victim.example.", RecordType::TXT, DNSClass::IN);
         assert!(
-            forward_udp(&q, up_addr).await.is_none(),
+            forward_udp(&q, up_addr).await.is_err(),
             "datagrams from a non-upstream address are dropped"
         );
     }

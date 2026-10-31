@@ -17,8 +17,9 @@ use tokio::net::TcpStream;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The proxy answered properly but did not connect to the destination (a SOCKS5
-/// reply code or HTTP CONNECT status saying so). The proxy is up and speaking
-/// the protocol, so this never counts against its health.
+/// reply code or HTTP CONNECT status saying so), or got no answer from it in
+/// time, or the destination cannot be asked for at all. The proxy is up and
+/// speaking the protocol, so this never counts against its health.
 /// `about_target`: the answer is surely about the destination (refused,
 /// unreachable, forbidden), and another member would only repeat it. Otherwise
 /// (SOCKS5 "general failure", HTTP 500/503: the proxy's own upstream may be
@@ -104,12 +105,21 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // Build everything that can fail before touching the wire.
-    let creds = match user {
-        Some(u) => Some(socks5_auth_request(u, pass.unwrap_or(""))?),
-        None => None,
-    };
+    let creds = socks5_creds(user, pass)?;
     let req = socks5_connect_request(t)?;
+    socks5_greet(s, creds).await?;
+    socks5_request(s, &req).await
+}
 
+fn socks5_creds(user: Option<&str>, pass: Option<&str>) -> Result<Option<Vec<u8>>> {
+    user.map(|u| socks5_auth_request(u, pass.unwrap_or(""))).transpose()
+}
+
+/// Greeting and authentication: the proxy's own part of the handshake.
+async fn socks5_greet<S>(s: &mut S, creds: Option<Vec<u8>>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     s.write_all(&socks5_greeting(creds.is_some())).await?;
     let mut sel = [0u8; 2];
     s.read_exact(&mut sel).await.context("socks5: method selection")?;
@@ -130,8 +140,16 @@ where
         0xff => bail!("socks5: no acceptable auth method"),
         m => bail!("socks5: unexpected method {m:#x}"),
     }
+    Ok(())
+}
 
-    s.write_all(&req).await?;
+/// The connect request and its reply, which the proxy sends only once the
+/// destination has answered (or not).
+async fn socks5_request<S>(s: &mut S, req: &[u8]) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    s.write_all(req).await?;
 
     // reply: VER REP RSV ATYP BND.ADDR BND.PORT
     let mut head = [0u8; 4];
@@ -267,24 +285,55 @@ pub fn base64_encode(input: &[u8]) -> String {
 
 // ---------------------------------------------------------------- dialing --
 
-/// Connect to one node and finish the proxy handshake for `t`.
+/// Connect to one node and finish the proxy handshake for `t`. Only what is
+/// the proxy's own doing counts against it: reaching it, and its greeting.
+/// Proxies answer a connect request once the destination has (squid, ssh -D,
+/// dante), so a request left unanswered is about the destination.
 pub async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
+    let user = node.cfg.username.as_deref();
+    let pass = node.cfg.password.as_deref();
+    // A destination no proxy can be asked for (an empty or overlong name):
+    // found out before connecting, and nobody's fault.
+    let socks = match node.cfg.kind {
+        ProxyKind::Socks5 => Some((
+            socks5_creds(user, pass)?,
+            socks5_connect_request(t).map_err(|e| TargetRefused {
+                msg: format!("{e:#}"),
+                about_target: true,
+            })?,
+        )),
+        ProxyKind::Http => None,
+    };
     let mut s = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(node.addr))
         .await
         .map_err(|_| anyhow!("connect to proxy {} timed out", node.name))?
         .with_context(|| format!("connect to proxy {} ({})", node.name, node.addr))?;
     s.set_nodelay(true).ok();
-    let user = node.cfg.username.as_deref();
-    let pass = node.cfg.password.as_deref();
-    let hs = async {
-        match node.cfg.kind {
-            ProxyKind::Socks5 => socks5_handshake(&mut s, t, user, pass).await,
-            ProxyKind::Http => http_handshake(&mut s, t, user, pass).await,
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let unanswered = || -> anyhow::Error {
+        TargetRefused {
+            msg: format!(
+                "proxy {} got no answer from {t:?} within {}s",
+                node.name,
+                HANDSHAKE_TIMEOUT.as_secs()
+            ),
+            about_target: true,
         }
+        .into()
     };
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, hs)
-        .await
-        .map_err(|_| anyhow!("handshake with proxy {} timed out", node.name))??;
+    match socks {
+        Some((creds, req)) => {
+            tokio::time::timeout_at(deadline, socks5_greet(&mut s, creds))
+                .await
+                .map_err(|_| anyhow!("socks5 greeting of proxy {} timed out", node.name))??;
+            tokio::time::timeout_at(deadline, socks5_request(&mut s, &req))
+                .await
+                .map_err(|_| unanswered())??;
+        }
+        None => tokio::time::timeout_at(deadline, http_handshake(&mut s, t, user, pass))
+            .await
+            .map_err(|_| unanswered())??,
+    }
     Ok(s)
 }
 
@@ -335,14 +384,20 @@ pub async fn dial_group(
     Err(last_err)
 }
 
-/// Did `e` happen for lack of our own resources (fds, buffers, memory)?
+/// Did `e` happen for lack of our own resources (fds, buffers, memory,
+/// local ports)?
 /// That is not the proxy's fault: it must not count against its health, and
 /// every other proxy would fail the same way.
 pub fn is_local_shortage(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .and_then(|io| io.raw_os_error())
-            .is_some_and(|n| matches!(n, libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM))
+            .is_some_and(|n| {
+                matches!(
+                    n,
+                    libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EADDRNOTAVAIL
+                )
+            })
     })
 }
 
@@ -355,6 +410,7 @@ mod tests {
         let io = |n| anyhow::Error::new(std::io::Error::from_raw_os_error(n)).context("connect to the proxy");
         assert!(is_local_shortage(&io(libc::EMFILE)));
         assert!(is_local_shortage(&io(libc::ENFILE)));
+        assert!(is_local_shortage(&io(libc::EADDRNOTAVAIL)), "local ports used up");
         assert!(!is_local_shortage(&io(libc::ECONNREFUSED)));
         assert!(!is_local_shortage(&io(libc::ETIMEDOUT)));
     }
@@ -636,6 +692,13 @@ mod tests {
     enum Reply {
         Socks(u8),
         Http(&'static str),
+        /// Greets, then never answers the connect request (the destination
+        /// is a black hole).
+        SocksUnanswered,
+        /// Takes the CONNECT, never answers it.
+        HttpUnanswered,
+        /// Accepts the TCP connection, never greets.
+        Mute,
     }
 
     /// A proxy that always gives the same answer; counts connections.
@@ -667,6 +730,18 @@ mod tests {
                                 buf.push(b[0]);
                             }
                             c.write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes()).await.ok();
+                        }
+                        Reply::SocksUnanswered => {
+                            let mut g = [0u8; 3];
+                            c.read_exact(&mut g).await.ok();
+                            c.write_all(&[5, 0]).await.ok();
+                            // Hold on, silent, until the client gives up.
+                            let mut sink = [0u8; 64];
+                            while c.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                        }
+                        Reply::HttpUnanswered | Reply::Mute => {
+                            let mut sink = [0u8; 64];
+                            while c.read(&mut sink).await.is_ok_and(|n| n > 0) {}
                         }
                     }
                     let mut sink = [0u8; 64];
@@ -718,6 +793,64 @@ mod tests {
                 "one attempt per connection: retrying elsewhere would get the same answer"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_destination_that_never_answers_is_not_a_proxy_failure() {
+        // squid, ssh -D, dante answer the connect request only once the
+        // destination has: a black hole leaves the request unanswered. That is
+        // no reason to doubt the proxy, nor to make every member wait it out.
+        let cases = [
+            (Reply::SocksUnanswered, ProxyKind::Socks5),
+            (Reply::HttpUnanswered, ProxyKind::Http),
+        ]
+        .map(|(reply, kind)| async move {
+            let (a, hits_a) = scripted_proxy(reply).await;
+            let (b, hits_b) = scripted_proxy(reply).await;
+            let g = Group::new(
+                "g",
+                Strategy::RoundRobin,
+                vec![node_at("a", a, kind), node_at("b", b, kind)],
+            );
+            let e = dial_group(&g, &dom("black.hole", 443), 2, 1)
+                .await
+                .err()
+                .expect("must fail");
+            assert!(
+                e.downcast_ref::<TargetRefused>().is_some_and(|r| r.about_target),
+                "{e:#}"
+            );
+            assert!(g.nodes.iter().all(|n| n.is_healthy()), "{kind:?}: nodes must stay UP");
+            assert_eq!(
+                hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
+                1,
+                "{kind:?}"
+            );
+        });
+        // A proxy that does not even greet is at fault.
+        let mute = async {
+            let (m, _) = scripted_proxy(Reply::Mute).await;
+            let g = Group::new("g", Strategy::RoundRobin, vec![node_at("m", m, ProxyKind::Socks5)]);
+            assert!(dial_group(&g, &dom("x.example", 443), 0, 1).await.is_err());
+            assert!(!g.nodes[0].is_healthy(), "a silent proxy is marked down");
+        };
+        let [socks, http] = cases;
+        tokio::join!(socks, http, mute);
+    }
+
+    #[tokio::test]
+    async fn a_destination_no_proxy_can_be_asked_for_costs_no_connection() {
+        let (a, hits) = scripted_proxy(Reply::Socks(0)).await;
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]);
+        for d in ["", &"x".repeat(256)] {
+            let e = dial_group(&g, &dom(d, 80), 2, 1).await.err().expect("must fail");
+            assert!(
+                e.downcast_ref::<TargetRefused>().is_some_and(|r| r.about_target),
+                "{e:#}"
+            );
+        }
+        assert!(g.nodes[0].is_healthy());
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "found out before connecting");
     }
 
     #[tokio::test]

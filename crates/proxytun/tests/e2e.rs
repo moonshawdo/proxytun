@@ -1677,12 +1677,22 @@ fn gdb_attaches_from_outside_to_a_running_program() {
 /// Opens `n` connections and holds them (proxytun runs out of fds on the
 /// way), drops them, then makes one ordinary request.
 const PY_FD_PRESSURE: &str = r#"
-import socket, sys, time, urllib.request
+import socket, struct, sys, time, urllib.request
 held = []
 for i in range(int(sys.argv[1])):
     s = socket.create_connection(("203.0.113.1", 80), timeout=10)
     held.append(s)
-time.sleep(6)
+time.sleep(1)
+# A TXT lookup (forwarded upstream) while proxytun has no fd to spare.
+q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 16, 1)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(1)
+u.sendto(q, ("8.8.8.8", 53))
+try:
+    u.recv(512)
+except OSError:
+    pass
+time.sleep(4)
 for s in held:
     s.close()
 time.sleep(1)
@@ -1747,6 +1757,17 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
         out.dump()
     );
     assert!(!out.stderr.contains("marked DOWN"), "{}", out.dump());
+    // Nor is the upstream resolver blamed for the lookup we could not forward.
+    assert!(
+        out.stderr.contains("dns: cannot forward for lack of local resources"),
+        "{}",
+        out.dump()
+    );
+    assert!(
+        !out.stderr.contains("upstream resolver did not answer"),
+        "{}",
+        out.dump()
+    );
     assert!(out.stdout.contains(&format!("final: {BODY}")), "{}", out.dump());
 }
 
