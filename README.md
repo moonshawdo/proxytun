@@ -241,6 +241,6 @@ cargo test --target x86_64-unknown-linux-musl      # 静态版本
 和 `/etc/subuid` 里的区间,用"外层 user namespace + `max_user_namespaces=0` + setuid 的假 sudo"模拟 CentOS 7。缺少时对应用例输出 `SKIP`。
 
 代码结构:`crates/proxytun-core`(从 proxyhook 复制的配置、规则、负载均衡、代理握手、fake-ip DNS、嗅探、中继)与
-`crates/proxytun`(命名空间与 TUN、地址改写、sudo 助手、见证进程、主机端口、自检)。进度与交接见 [HANDOFF.md](HANDOFF.md)。
+`crates/proxytun`(命名空间与 TUN、地址改写、sudo 助手、见证进程、主机端口、自检)。
 
 许可证:GPL-2.0(代码来自 proxyhook)。
