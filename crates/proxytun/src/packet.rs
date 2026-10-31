@@ -10,6 +10,7 @@ pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 
 pub const TCP_SYN: u8 = 0x02;
+pub const TCP_RST: u8 = 0x04;
 pub const TCP_ACK: u8 = 0x10;
 
 const TTL: u8 = 64;

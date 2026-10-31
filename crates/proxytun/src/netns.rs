@@ -87,7 +87,7 @@ impl TempDir {
             bail!("mkdtemp {}: {}", template.display(), std::io::Error::last_os_error());
         }
         raw.pop();
-        Ok(TempDir(PathBuf::from(String::from_utf8(raw)?)))
+        Ok(TempDir(PathBuf::from(OsString::from_vec(raw))))
     }
 
     pub fn path(&self) -> &Path {
@@ -475,8 +475,21 @@ fn configure(range: Ipv4Net) -> Result<(OwnedFd, TcpListener)> {
     netcfg::set_addr(TUN_NAME, addrs.tun, Addrs::PREFIX, MTU).context("configure tun0")?;
     netcfg::link_up(TUN_NAME)?;
     netcfg::default_route(TUN_NAME)?;
+    raise_somaxconn();
     let listener = netcfg::listen(SocketAddrV4::new(addrs.tun, 0).into())?;
     Ok((tun, listener))
+}
+
+/// Before Linux 5.4 a new network namespace starts with somaxconn 128,
+/// whatever the host has, and cuts our listen backlog of 4096 to it: a burst
+/// of connections then waits out SYN retransmits. Only root may raise it
+/// (root and sudo modes); in a user namespace this quietly does nothing.
+fn raise_somaxconn() {
+    const PATH: &str = "/proc/sys/net/core/somaxconn";
+    let now: Option<u32> = std::fs::read_to_string(PATH).ok().and_then(|s| s.trim().parse().ok());
+    if now.is_some_and(|n| n < netcfg::BACKLOG) {
+        let _ = std::fs::write(PATH, netcfg::BACKLOG.to_string());
+    }
 }
 
 /// Point /etc/resolv.conf at `dns` in our own mount namespace. The file is

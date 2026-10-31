@@ -6,8 +6,11 @@
 //!
 //! Lifecycle of an entry:
 //!   * created by the program's SYN;
-//!   * `accept`ed by the relay (an entry that is never accepted is dropped
-//!     after `EMBRYONIC`: SYN lost, program gave up);
+//!   * answered by the listener (its SYN-ACK): the connection now waits in
+//!     the accept queue, however long accept takes (out of fds, say); a
+//!     reset from the listener before then ends it;
+//!   * `accept`ed by the relay (an entry the listener never answered is
+//!     dropped after `EMBRYONIC`: SYN lost, program gave up);
 //!   * `close`d when the relay is done with it, then kept for `LINGER` so the
 //!     last FIN/ACKs of both kernels still get through. A new SYN on the same
 //!     flow during that time gets a fresh entry: it is a new connection.
@@ -30,6 +33,9 @@ pub const PORTS: std::ops::RangeInclusive<u16> = 1024..=65535;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Embryonic(Instant),
+    /// Answered by the listener, waiting to be accepted: dropping it would
+    /// leave the program a connection nobody ever closes.
+    Queued,
     Accepted,
     Closed(Instant),
 }
@@ -93,6 +99,16 @@ impl Nat {
         self.by_port.get(&port).map(|e| (e.dst, e.src))
     }
 
+    /// The listener sent a packet with these flags to `NAT_IP:port`.
+    pub fn listener_sent(&mut self, port: u16, syn_ack: bool, rst: bool, now: Instant) {
+        let Some(e) = self.by_port.get_mut(&port) else { return };
+        e.state = match e.state {
+            State::Embryonic(_) | State::Queued if rst => State::Closed(now),
+            State::Embryonic(_) if syn_ack => State::Queued,
+            s => s,
+        };
+    }
+
     /// The relay accepted the connection from `NAT_IP:port`: where was the
     /// program going? `None` for an unknown or already closed entry.
     pub fn accept(&mut self, port: u16) -> Option<SocketAddrV4> {
@@ -120,7 +136,7 @@ impl Nat {
             .filter(|(_, e)| match e.state {
                 State::Embryonic(t) => now.saturating_duration_since(t) >= EMBRYONIC,
                 State::Closed(t) => now.saturating_duration_since(t) >= LINGER,
-                State::Accepted => false,
+                State::Queued | State::Accepted => false,
             })
             .map(|(&p, _)| p)
             .collect();
@@ -202,6 +218,29 @@ mod tests {
         assert_ne!(p1, p2);
         assert_eq!(n.accept(p2), Some(dst));
         assert_eq!(n.len(), 1, "the closed entry was replaced");
+    }
+
+    #[test]
+    fn a_connection_the_listener_answered_waits_for_accept_however_long() {
+        let mut n = Nat::default();
+        let t = Instant::now();
+        let (src, dst) = flow();
+        let port = n.outbound(src, dst, true, t).unwrap();
+        n.listener_sent(port, true, false, t);
+        // accept failing for minutes (no fd left): the program's side is
+        // established, so the entry must stay for the relay to find.
+        n.sweep(t + 10 * EMBRYONIC);
+        assert_eq!(n.accept(port), Some(dst));
+
+        // Reset by the listener before accept (it gave up on the handshake):
+        // ended, and gone after LINGER.
+        let other = sa("198.19.255.1:40001");
+        let port = n.outbound(other, dst, true, t).unwrap();
+        n.listener_sent(port, true, false, t);
+        n.listener_sent(port, false, true, t);
+        assert_eq!(n.accept(port), None);
+        n.sweep(t + LINGER);
+        assert_eq!(n.inbound(port), None);
     }
 
     #[test]

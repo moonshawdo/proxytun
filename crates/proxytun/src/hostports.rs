@@ -13,6 +13,7 @@
 
 use crate::capture::Shared;
 use proxytun_core::net::relay::{self, Transfer};
+use proxytun_core::throttle;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -110,11 +111,15 @@ pub fn scan(exclude: &[u16]) -> Vec<SocketAddr> {
 
 /// Relay connections to the namespace's `addr` to the host's `addr`.
 pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
+    let mut warned = None;
     loop {
         let (mut inbound, _) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(%addr, "host port accept: {e}");
+                // As for the relay: once in a while, not every 20 ms.
+                if throttle::due(&mut warned, std::time::Instant::now(), throttle::EVERY) {
+                    tracing::warn!(%addr, "host port accept: {e} (repeats within {}s not logged)", throttle::EVERY.as_secs());
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 continue;
             }

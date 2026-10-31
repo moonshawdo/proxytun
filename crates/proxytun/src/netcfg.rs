@@ -125,6 +125,9 @@ pub fn default_route(dev: &CStr) -> Result<()> {
     )
 }
 
+/// Listen backlog: capped by the namespace's net.core.somaxconn.
+pub const BACKLOG: u32 = 4096;
+
 /// A TCP listener on `addr` (IPv4 or IPv6), with a backlog large enough for
 /// bursts of connections arriving through the TUN device (std listens with
 /// 128).
@@ -132,7 +135,7 @@ pub fn listen(addr: SocketAddr) -> Result<TcpListener> {
     let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
     // Calling listen() again on a listening socket only resizes its backlog.
     // SAFETY: plain syscall on a socket we own.
-    if unsafe { libc::listen(l.as_raw_fd(), 4096) } < 0 {
+    if unsafe { libc::listen(l.as_raw_fd(), BACKLOG as libc::c_int) } < 0 {
         bail!("listen {addr}: {}", Error::last_os_error());
     }
     Ok(l)

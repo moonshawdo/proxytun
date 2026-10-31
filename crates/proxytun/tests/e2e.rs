@@ -505,6 +505,26 @@ fn the_whole_process_tree_is_captured_and_waited_for() {
 }
 
 #[test]
+fn the_exit_code_survives_a_caller_that_ignores_sigchld() {
+    require!("python3");
+    let dir = tmp_dir("sigchld-ignored");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // SIG_IGN survives exec: the kernel would reap proxytun's children unasked
+    // and the program's status would be lost. The program itself still gets
+    // the caller's setting.
+    let mut cmd = Command::new("python3");
+    cmd.arg("-c").arg(
+        "import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); \
+         os.execv(sys.argv[1], sys.argv[1:])",
+    );
+    cmd.args([BIN, "-c", cfg.to_str().unwrap(), "--", "python3", "-c"])
+        .arg("import signal, sys; print(signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN); sys.exit(7)");
+    let out = run_cmd(cmd, &[]);
+    assert_eq!(out.code, 7, "{}", out.dump());
+    assert_eq!(out.stdout, "True\n", "{}", out.dump());
+}
+
+#[test]
 fn exit_codes_are_propagated() {
     require!();
     let dir = tmp_dir("exit");
@@ -1695,12 +1715,18 @@ except OSError:
 time.sleep(4)
 for s in held:
     s.close()
-time.sleep(1)
-try:
-    body = urllib.request.urlopen("http://after.test/", timeout=10).read().decode()
-    print("final:", body, flush=True)
-except Exception as e:
-    print("final: failed", e, flush=True)
+# Once the leftovers (connections still in the accept queue) are through,
+# the proxy must serve again: never marked down.
+for attempt in range(10):
+    time.sleep(1)
+    try:
+        body = urllib.request.urlopen("http://after.test/", timeout=10).read().decode()
+        print("final:", body, flush=True)
+        break
+    except Exception as e:
+        last = e
+else:
+    print("final: failed", last, flush=True)
 "#;
 
 #[test]
@@ -1733,16 +1759,18 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
         "program: 100; proxytun: soft = hard\n{}",
         out.dump()
     );
+    assert!(out.stderr.contains("open-file limit"), "and says so\n{}", out.dump());
 
     // With no room to raise it, proxytun runs out of fds while the program
-    // holds 50 connections (within its own limit). The proxy is fine, though: it must
+    // holds 50 connections (within its own limit). No host ports: each would
+    // hold an fd, and how many listeners the host has varies. The proxy is fine, though: it must
     // not be marked down, and once they are gone the next request must go
     // through it.
     let prog = dir.join("pressure.py");
     std::fs::write(&prog, PY_FD_PRESSURE).unwrap();
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg("ulimit -n 64; exec \"$BIN\" -c \"$CFG\" -- python3 \"$PROG\" 50");
+        .arg("ulimit -n 64; exec \"$BIN\" --no-host-ports -c \"$CFG\" -- python3 \"$PROG\" 50");
     let out = run_cmd(
         cmd,
         &[
@@ -1757,6 +1785,9 @@ fn proxytun_uses_its_whole_fd_limit_and_blames_no_proxy_for_running_out() {
         out.dump()
     );
     assert!(!out.stderr.contains("marked DOWN"), "{}", out.dump());
+    // accept fails again at once while connections wait: said once in a
+    // while, not every 20 ms.
+    assert!(out.stderr.matches("relay accept:").count() <= 2, "{}", out.dump());
     // Nor is the upstream resolver blamed for the lookup we could not forward.
     assert!(
         out.stderr.contains("dns: cannot forward for lack of local resources"),
@@ -2416,11 +2447,13 @@ fn arguments_and_environment_need_not_be_utf8() {
     require_centos7!();
     let dir = shared_dir("not-utf8");
     write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
-    // As with GBK file names and directories (in $PWD) on CentOS 7: the
-    // program gets the very bytes, in either mode.
+    // As with GBK file names and directories (in $PWD, or $TMPDIR, where
+    // proxytun makes its own) on CentOS 7: the program gets the very bytes,
+    // in either mode.
     std::fs::write(
         dir.join("odd.sh"),
         r#"BAD=$(printf '\377'); export BAD
+TMPDIR="$D/$(printf '\304\343')"; mkdir -p -m 1777 "$TMPDIR"; export TMPDIR
 exec "$PT" -c "$D/cfg.toml" -- sh -c 'printf "%s|%s" "$1" "$BAD" | od -An -tx1 | tr -d " \n"' sh "$(printf '\304\343')"
 "#,
     )

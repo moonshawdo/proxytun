@@ -55,10 +55,12 @@ proxytun --proxy socks5://HOST:PORT -- curl -sI https://example.com
 ```bash
 proxytun --proxy socks5://HOST:PORT -- sh -c 'id; grep -E "^Cap(Prm|Eff)" /proc/self/status; cat /etc/resolv.conf; getent hosts example.com; ip -br addr; ip route'
 ulimit -u; umask; proxytun --proxy socks5://HOST:PORT -- sh -c 'ulimit -u; umask'
+proxytun --proxy socks5://HOST:PORT -- cat /proc/sys/net/core/somaxconn
 ```
 
 预期:
-- 最后两行(程序里的值)与它们前面两行(你自己 shell 的值)相同:程序拿到的是你的进程数上限和 umask,不是 sudo 给 root 的(CentOS 7 的 `20-nproc.conf` 对 root 不限);
+- 最后一行是 `4096`(3.10 内核上新网络命名空间默认 128,会让成批的连接等 SYN 重传;这一项开发机测不了);
+- 倒数第 2–3 行(程序里的值)与再往前两行(你自己 shell 的值)相同:程序拿到的是你的进程数上限和 umask,不是 sudo 给 root 的(CentOS 7 的 `20-nproc.conf` 对 root 不限);
 - `id` 是你自己的 uid、gid 和附加组(不是 root);
 - `CapPrm` / `CapEff` 全为 0;
 - `nameserver 198.19.255.53`;`example.com` 解析为 `198.18.x.x`;

@@ -19,6 +19,11 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// At most this many mappings (about 150 MB), however large the range: past
+/// it, the oldest are recycled as when the range is used up. A /8 would
+/// otherwise let random subdomains grow the table to gigabytes.
+pub const MAX_ENTRIES: u32 = 1 << 20;
+
 /// How long a mapping stays out of reach of recycling after its last use:
 /// the TTL our DNS answers carry.
 pub const REUSE_AFTER: Duration = Duration::from_secs(super::dns::FAKE_TTL as u64);
@@ -112,7 +117,7 @@ impl FakePool {
         let span = 1u64 << (32 - net.prefix_len() as u32);
         // Offsets 1..=span-2-reserved are usable (skip the network address,
         // and the broadcast address or the address below the reserved block).
-        let usable = span.saturating_sub(2 + reserved as u64).min(u32::MAX as u64) as u32;
+        let usable = span.saturating_sub(2 + reserved as u64).min(MAX_ENTRIES as u64) as u32;
         FakePool(Arc::new(Mutex::new(Inner {
             base: net.network().into(),
             usable,
@@ -361,6 +366,16 @@ mod tests {
             }
         }
         assert_eq!(p.len(), 50);
+    }
+
+    #[test]
+    fn a_huge_range_holds_no_more_than_max_entries() {
+        assert_eq!(pool("10.0.0.0/8").lock().usable, MAX_ENTRIES);
+        assert_eq!(
+            pool("198.18.0.0/15").lock().usable,
+            (1 << 17) - 2,
+            "below the cap: the whole range"
+        );
     }
 
     #[test]

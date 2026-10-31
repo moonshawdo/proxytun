@@ -162,6 +162,12 @@ pub fn run(args: Args) -> Result<i32> {
         r => r?,
     };
     raise_fd_limit();
+    // A caller that ignores SIGCHLD (that survives exec) would have the kernel
+    // reap our children unasked, the program's exit status with them. The
+    // program, forked already and waiting for the go-ahead, keeps the
+    // caller's setting.
+    // SAFETY: plain syscall.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     let netns::Handover {
         tun,
         listener,
@@ -193,6 +199,11 @@ pub fn run(args: Args) -> Result<i32> {
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Blocking work is resolving host names for direct rules
+        // (getaddrinfo, seconds on a slow resolver). Each thread counts
+        // against the user's process limit, which the program shares; the
+        // default would allow 512.
+        .max_blocking_threads(64)
         .build()
         .context("build tokio runtime")?;
     let health_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
@@ -316,16 +327,42 @@ fn raise_fd_limit() {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
     // SAFETY: plain syscalls on a local struct.
     unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) == 0 && l.rlim_cur < l.rlim_max {
-            let from = l.rlim_cur;
-            l.rlim_cur = l.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &l) == 0 {
-                tracing::debug!(from, to = l.rlim_max, "raised our open-file limit");
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) != 0 {
+            return;
+        }
+        if let Some(to) = fd_target(l, nr_open) {
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &to) != 0 {
+                tracing::warn!(
+                    soft = l.rlim_cur,
+                    hard = l.rlim_max,
+                    "cannot raise our open-file limit: {}",
+                    std::io::Error::last_os_error()
+                );
             }
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut l);
         }
     }
+    tracing::info!(
+        soft = l.rlim_cur,
+        hard = l.rlim_max,
+        "open-file limit: two per relayed connection"
+    );
+}
+
+/// The limits to set, if any: the soft one up to the hard one, both no
+/// higher than fs.nr_open (a hard limit above it, left from before the
+/// sysctl was lowered, makes every setrlimit fail).
+fn fd_target(now: libc::rlimit, nr_open: Option<libc::rlim_t>) -> Option<libc::rlimit> {
+    let max = nr_open.map_or(now.rlim_max, |n| now.rlim_max.min(n));
+    (max > now.rlim_cur || max < now.rlim_max).then_some(libc::rlimit {
+        rlim_cur: max,
+        rlim_max: max,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -500,5 +537,26 @@ mod tests {
         assert!(!already_delivered(true, Some(9), 7));
         // Program already gone: nothing to hold back for.
         assert!(!already_delivered(true, None, 7));
+    }
+
+    #[test]
+    fn our_fd_limit_goes_as_high_as_the_kernel_lets_it() {
+        let l = |cur, max| libc::rlimit {
+            rlim_cur: cur,
+            rlim_max: max,
+        };
+        let got = |t: Option<libc::rlimit>| t.map(|t| (t.rlim_cur, t.rlim_max));
+        assert_eq!(got(fd_target(l(1024, 4096), Some(1 << 20))), Some((4096, 4096)));
+        assert_eq!(got(fd_target(l(4096, 4096), Some(1 << 20))), None, "nothing to do");
+        // A hard limit above fs.nr_open: setrlimit refuses anything that keeps it.
+        assert_eq!(
+            got(fd_target(l(1024, 1 << 21), Some(1 << 19))),
+            Some((1 << 19, 1 << 19))
+        );
+        assert_eq!(
+            got(fd_target(l(1024, 4096), None)),
+            Some((4096, 4096)),
+            "nr_open unreadable"
+        );
     }
 }

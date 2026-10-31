@@ -11,11 +11,12 @@
 
 use crate::nat::Nat;
 use crate::netns::Addrs;
-use crate::packet::{self, Packet, PROTO_TCP, PROTO_UDP};
+use crate::packet::{self, Packet, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_RST, TCP_SYN};
 use anyhow::{anyhow, bail, Result};
 use proxytun_core::net::dns::{self, DnsStats, Transport};
 use proxytun_core::net::fakeip::{FakeGuard, FakePool};
 use proxytun_core::net::relay::{self, Live, Traffic};
+use proxytun_core::throttle;
 use proxytun_core::types::{Pending, Target};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -116,18 +117,11 @@ pub struct Shared {
     pub table_full_logged: Mutex<Option<Instant>>,
 }
 
-/// How often a full address-rewriting table is reported: every retried SYN
+/// Report a full address-rewriting table now and then: every retried SYN
 /// lands there, on the TUN thread (`dropped_table_full` counts them all).
-const TABLE_FULL_EVERY: Duration = Duration::from_secs(10);
-
-/// Is a report due, `every` after the last one? Records it if so.
-fn due(last: &Mutex<Option<Instant>>, now: Instant, every: Duration) -> bool {
-    let mut l = last.lock().unwrap_or_else(|e| e.into_inner());
-    if l.is_some_and(|t| now.saturating_duration_since(t) < every) {
-        return false;
-    }
-    *l = Some(now);
-    true
+fn table_full_due(sh: &Shared) -> bool {
+    let mut last = sh.table_full_logged.lock().unwrap_or_else(|e| e.into_inner());
+    throttle::due(&mut last, Instant::now(), throttle::EVERY)
 }
 
 impl Shared {
@@ -194,17 +188,23 @@ fn on_packet(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &mut [u8]) 
 fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
     let rewritten = if p.src == sh.listen && *p.dst.ip() == sh.addrs.nat {
         // The listener answering: back to the program, from where it dialed.
-        sh.nat().inbound(p.dst.port())
+        let mut nat = sh.nat();
+        let (syn_ack, rst) = (
+            p.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK,
+            p.flags & TCP_RST != 0,
+        );
+        nat.listener_sent(p.dst.port(), syn_ack, rst, Instant::now());
+        nat.inbound(p.dst.port())
     } else {
         let port = sh.nat().outbound(p.src, p.dst, p.is_syn(), Instant::now());
         if p.is_syn() {
             match port {
                 Some(port) => tracing::trace!(src = %p.src, dst = %p.dst, nat_port = port, "syn"),
-                None if due(&sh.table_full_logged, Instant::now(), TABLE_FULL_EVERY) => tracing::error!(
+                None if table_full_due(sh) => tracing::error!(
                     src = %p.src, dst = %p.dst,
                     "address-rewriting table full, dropping new connections (see dropped_table_full; \
                      reported every {}s)",
-                    TABLE_FULL_EVERY.as_secs()
+                    throttle::EVERY.as_secs()
                 ),
                 None => {}
             }
@@ -258,11 +258,19 @@ fn write_packet(tun: &OwnedFd, sh: &Shared, b: &[u8]) {
 
 /// Accept captured connections and relay each one.
 pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
+    let mut warned = None;
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("relay accept: {e}");
+                // Out of fds, it fails again at once as long as connections
+                // wait: said once in a while, not every 20 ms.
+                if throttle::due(&mut warned, Instant::now(), throttle::EVERY) {
+                    tracing::warn!(
+                        "relay accept: {e} (repeats within {}s not logged)",
+                        throttle::EVERY.as_secs()
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             }
@@ -363,9 +371,13 @@ pub fn log_stats(sh: &Shared) {
         up: n(&sh.traffic.up),
         down: n(&sh.traffic.down),
     };
+    // Read first: a lock taken inside the macro is held while the line is
+    // written, and a stalled stderr (Ctrl+S, a paused pager) would stall the
+    // TUN thread with it.
+    let (fake_ips, nat_entries) = (sh.pool.len(), sh.nat().len());
     tracing::info!(
-        fake_ips = sh.pool.len(),
-        nat_entries = sh.nat().len(),
+        fake_ips,
+        nat_entries,
         connections = now.connections,
         active = n(&s.active),
         relayed_up = now.up,
@@ -437,14 +449,44 @@ mod tests {
     }
 
     #[test]
-    fn a_full_table_is_reported_now_and_then_not_per_syn() {
-        let last = Mutex::new(None);
-        let t = Instant::now();
-        assert!(due(&last, t, TABLE_FULL_EVERY), "the first time");
-        assert!(!due(&last, t + Duration::from_secs(1), TABLE_FULL_EVERY));
-        assert!(!due(&last, t + Duration::from_secs(9), TABLE_FULL_EVERY));
-        assert!(due(&last, t + TABLE_FULL_EVERY, TABLE_FULL_EVERY));
-        assert!(!due(&last, t + TABLE_FULL_EVERY, TABLE_FULL_EVERY));
+    fn a_connection_the_listener_answered_outlives_a_stalled_accept() {
+        let sh = shared("127.0.0.1:9".parse().unwrap());
+        let (tun, _other) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let tun = OwnedFd::from(tun);
+        let (program, dst) = (
+            crate::packet::tests::sa("198.19.255.1:40000"),
+            crate::packet::tests::sa("198.18.0.5:443"),
+        );
+        let mut syn = crate::packet::tests::tcp(program, dst, TCP_SYN, b"");
+        let p = packet::parse(&syn).unwrap();
+        on_tcp(&tun, &sh, &mut syn, &p);
+        let port = sh.nat().outbound(program, dst, false, Instant::now()).unwrap();
+        // The listener's SYN-ACK: the handshake completes in the kernel.
+        let nat = SocketAddrV4::new(sh.addrs.nat, port);
+        let mut syn_ack = crate::packet::tests::tcp(sh.listen, nat, TCP_SYN | TCP_ACK, b"");
+        let p = packet::parse(&syn_ack).unwrap();
+        on_tcp(&tun, &sh, &mut syn_ack, &p);
+        // accept stalls (out of fds) past EMBRYONIC: the entry must still be
+        // there for the relay to find.
+        sh.nat().sweep(Instant::now() + 2 * crate::nat::EMBRYONIC);
+        assert_eq!(sh.nat().accept(port), Some(dst));
+    }
+
+    #[test]
+    fn stats_are_written_without_holding_the_address_table() {
+        let sh = Arc::new(shared("127.0.0.1:9".parse().unwrap()));
+        let free = Arc::new(Mutex::new(Vec::new()));
+        let (sh2, free2) = (sh.clone(), free.clone());
+        // Whenever a line is written, could the TUN thread take the table?
+        let sub = tracing_subscriber::fmt()
+            .with_writer(move || {
+                free2.lock().unwrap().push(sh2.nat.try_lock().is_ok());
+                std::io::sink()
+            })
+            .finish();
+        tracing::subscriber::with_default(sub, || log_stats(&sh));
+        let free = free.lock().unwrap();
+        assert!(!free.is_empty() && free.iter().all(|&f| f), "{free:?}");
     }
 
     async fn relay_from(l: &TcpListener, sh: &Shared, from: SocketAddrV4) -> (TcpStream, Result<()>) {

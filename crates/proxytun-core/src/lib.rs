@@ -11,6 +11,7 @@ pub mod net;
 pub mod policy;
 pub mod proxy;
 pub mod sniff;
+pub mod throttle;
 pub mod types;
 
 #[cfg(test)]

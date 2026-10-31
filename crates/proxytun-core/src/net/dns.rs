@@ -93,7 +93,16 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
                         ip
                     }
                     Err(_) => {
-                        tracing::error!(%domain, "fake-ip pool exhausted, answering SERVFAIL");
+                        // Once in a while: resolvers retry, at query rate.
+                        static LOGGED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+                        let mut last = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+                        if crate::throttle::due(&mut last, Instant::now(), crate::throttle::EVERY) {
+                            tracing::error!(
+                                %domain,
+                                "fake-ip pool exhausted, answering SERVFAIL (repeats within {}s not logged)",
+                                crate::throttle::EVERY.as_secs()
+                            );
+                        }
                         return reply(base_response(&req, ResponseCode::ServFail));
                     }
                 }
