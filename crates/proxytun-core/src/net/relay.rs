@@ -3,114 +3,19 @@
 //! the target is a bare IP, run the rule engine, then copy bytes to a proxy
 //! group / straight out / nowhere.
 
-use crate::balancer::Registry;
-use crate::config::Config;
+use crate::live::{Live, SniffCfg};
 use crate::net::fakeip::FakeGuard;
-use crate::policy::{env_proxies, Policy};
+use crate::net::pump::{finish, Traffic};
+use crate::policy::Policy;
 use crate::proxy;
 use crate::sniff::{self, Sniffed};
 use crate::types::{Decision, Target};
 use anyhow::{anyhow, Result};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{field, Span};
-
-/// Hostname sniffing for connections to a literal IP.
-#[derive(Debug, Clone)]
-pub struct SniffCfg {
-    pub enabled: bool,
-    pub ports: Vec<u16>,
-    /// Lower-cased domain suffixes that are never the real destination
-    /// (the "public name" a real ECH connection shows).
-    pub skip: Vec<String>,
-    pub timeout: Duration,
-    /// Dial the sniffed name (true) or only route by it and dial the IP (false).
-    pub override_destination: bool,
-}
-
-#[cfg(test)]
-impl Default for SniffCfg {
-    fn default() -> Self {
-        SniffCfg {
-            enabled: true,
-            ports: vec![80, 443, 8443],
-            skip: vec!["cloudflare-ech.com".into()],
-            timeout: Duration::from_millis(300),
-            override_destination: true,
-        }
-    }
-}
-
-impl SniffCfg {
-    fn skips(&self, name: &str) -> bool {
-        self.skip.iter().any(|s| crate::policy::is_subdomain(name, s))
-    }
-}
-
-/// Everything a connection handler needs; swapped atomically on SIGHUP.
-pub struct Live {
-    pub policy: Policy,
-    pub registry: Registry,
-    pub retries: u32,
-    pub fail_threshold: u32,
-    pub sniff: SniffCfg,
-}
-
-/// Build the per-connection state from a config. The program's own
-/// `*_proxy` variables are read from our environment, which it inherits.
-pub fn build_live(cfg: &Config) -> Result<Live> {
-    // vars() would panic on one entry that is not UTF-8 (a GBK directory in
-    // PWD); no proxy URL is among those.
-    let env =
-        env_proxies(std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))));
-    Ok(Live {
-        policy: Policy::new(cfg, env)?,
-        registry: Registry::build(cfg)?,
-        retries: cfg.retries,
-        fail_threshold: cfg.health.fail_threshold,
-        sniff: SniffCfg {
-            enabled: cfg.sniff,
-            ports: cfg.sniff_ports.clone(),
-            skip: cfg.sniff_skip_domains.clone(),
-            timeout: Duration::from_millis(cfg.sniff_timeout_ms),
-            override_destination: cfg.sniff_override_destination,
-        },
-    })
-}
-
-/// Bytes relayed so far, all connections together: `up` from the program
-/// towards its targets, `down` back.
-#[derive(Default)]
-pub struct Traffic {
-    pub up: AtomicU64,
-    pub down: AtomicU64,
-}
-
-/// Bytes one connection moved each way.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Transfer {
-    up: u64,
-    down: u64,
-}
-
-/// The line every relayed connection ends with: how long it lived, how long
-/// reaching its proxy (or the target itself) took, through what, the bytes
-/// each way, and how it ended. Enough to tell a slow proxy from a slow
-/// transfer, at the default log level.
-fn log_closed(start: Instant, dial: Duration, via: &str, moved: &Transfer, r: &Result<()>) {
-    let (ms, dial_ms) = (start.elapsed().as_millis() as u64, dial.as_millis() as u64);
-    let (up, down) = (moved.up, moved.down);
-    match r {
-        Ok(()) => tracing::info!(ms, dial_ms, via = %via, up, down, "closed"),
-        Err(e) => tracing::info!(ms, dial_ms, via = %via, up, down, "closed: {e:#}"),
-    }
-}
 
 /// One captured connection handed to the relay: where the program meant to go.
 pub struct Pending {
@@ -130,23 +35,28 @@ pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: 
         Target::V4(ip, port) => live.policy.is_passthrough(ip, port),
         Target::Domain(..) => false,
     };
-    // `target` is what we connect to, `rule_target` what the rules look at.
-    let (mut target, mut rule_target) = (target.clone(), target);
+    // A name sniffed from a literal IP's first bytes (a domain target is
+    // never sniffed, so never copied).
+    let mut sniffed = None;
     if !passthrough {
         if let Some(domain) = maybe_sniff(&inbound, &target, &live.sniff, &live.policy).await {
             tracing::debug!(ip = ?target, %domain, "recovered hostname from the first bytes");
-            rule_target = Target::Domain(domain, target.port());
-            if live.sniff.override_destination {
-                target = rule_target.clone();
-            }
+            sniffed = Some(Target::Domain(domain, target.port()));
         }
     }
-    Span::current().record("target", field::debug(&target));
+    // `target` is what we connect to, `rule_target` what the rules look at.
+    let rule_target = sniffed.as_ref().unwrap_or(&target);
+    let target = if live.sniff.override_destination {
+        rule_target
+    } else {
+        &target
+    };
+    Span::current().record("target", field::debug(target));
     let decision = if passthrough {
         tracing::info!(decision = ?Decision::Direct, "routing (localnet)");
         Decision::Direct
     } else {
-        let d = live.policy.decide(&rule_target);
+        let d = live.policy.decide(rule_target);
         tracing::info!(decision = ?d, "routing");
         d
     };
@@ -159,9 +69,9 @@ pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: 
             tracing::info!(ms = start.elapsed().as_millis() as u64, "closed: blocked by a rule");
             return Ok(());
         }
-        Decision::Direct => dial_direct(&target).await.map(|s| (s, None, "direct".to_string())),
+        Decision::Direct => dial_direct(target).await.map(|s| (s, None, "direct".to_string())),
         Decision::Proxy { group } => match live.registry.group(&group) {
-            Some(g) => proxy::dial_group(g, &target, live.retries, live.fail_threshold)
+            Some(g) => proxy::dial_group(g, target, live.retries, live.fail_threshold)
                 .await
                 .map(|(s, conn, node)| (s, Some(conn), node)),
             None => Err(anyhow!("rule names unknown group '{group}'")),
@@ -178,36 +88,6 @@ pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: 
         Err(e) => (Err(e), None, "-".to_string()),
     };
     finish(inbound, out, traffic, start, dial, &via).await
-}
-
-/// The end of every relayed connection, once its way out (`via`) is dialed
-/// or failed to be: copy both ways, then log how it ended. An abort reaches
-/// each side as one, a reset: a transfer cut off, or a target that could not
-/// be reached, must not look like a complete (or empty) one ending in a FIN.
-/// `start` is when the connection came in, `dial` how long dialing took.
-pub async fn finish(
-    mut inbound: TcpStream,
-    out: Result<TcpStream>,
-    traffic: &Traffic,
-    start: Instant,
-    dial: Duration,
-    via: &str,
-) -> Result<()> {
-    let (moved, r) = match out {
-        Ok(mut out) => {
-            let (moved, r) = pump(&mut inbound, &mut out, traffic).await;
-            if r.is_err() {
-                let _ = out.set_zero_linger();
-            }
-            (moved, r)
-        }
-        Err(e) => (Transfer::default(), Err(e)),
-    };
-    if r.is_err() {
-        let _ = inbound.set_zero_linger();
-    }
-    log_closed(start, dial, via, &moved, &r);
-    r
 }
 
 /// Notice a dead path to the proxy or target, which nothing else would: the
@@ -292,64 +172,6 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Copy both ways until both sides are done, and say how many bytes went
-/// each way (`up` = read from `a`), also when it ended in an error. A plain
-/// copy, not splice(2): for connections that came in through the TUN device
-/// it measured 20-30% faster (the TUN thread is the bottleneck either way, and
-/// splice only adds to it). See docs/DESIGN.md.
-async fn pump(a: &mut TcpStream, b: &mut TcpStream, traffic: &Traffic) -> (Transfer, Result<()>) {
-    a.set_nodelay(true).ok();
-    let mut a = Counted {
-        s: a,
-        n: 0,
-        total: &traffic.up,
-    };
-    let mut b = Counted {
-        s: b,
-        n: 0,
-        total: &traffic.down,
-    };
-    // 64 KiB buffers: the 8 KiB default costs throughput on fast links.
-    let r = copy_bidirectional_with_sizes(&mut a, &mut b, 64 * 1024, 64 * 1024).await;
-    (Transfer { up: a.n, down: b.n }, r.map(|_| ()).map_err(Into::into))
-}
-
-/// One side of a relayed connection, counting the bytes read from it (in `n`,
-/// and in the shared `total` as they pass, so long transfers show up in the
-/// stats before they end).
-struct Counted<'a> {
-    s: &'a mut TcpStream,
-    n: u64,
-    total: &'a AtomicU64,
-}
-
-impl AsyncRead for Counted<'_> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let r = Pin::new(&mut *self.s).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = r {
-            let k = (buf.filled().len() - before) as u64;
-            self.n += k;
-            self.total.fetch_add(k, Ordering::Relaxed);
-        }
-        r
-    }
-}
-
-impl AsyncWrite for Counted<'_> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut *self.s).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.s).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.s).poll_shutdown(cx)
-    }
-}
-
 /// Host-name lookups for direct rules run on blocking threads (getaddrinfo,
 /// seconds on a slow resolver): at most this many at once, fewer than the
 /// runtime's 64 blocking threads. So a lookup never waits in that pool's
@@ -403,7 +225,8 @@ async fn dial_direct(t: &Target) -> Result<TcpStream> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::policy::env_proxies;
+    use crate::live::build_live;
+    use crate::policy::EnvProxies;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -458,18 +281,20 @@ mod tests {
     }
 
     fn mk_live(proxy: SocketAddr, rules: &str) -> Arc<Live> {
-        mk_live_sniff(proxy, rules, SniffCfg::default())
+        Arc::new(live_for(proxy, rules))
     }
 
     fn mk_live_sniff(proxy: SocketAddr, rules: &str, sniff: SniffCfg) -> Arc<Live> {
-        let cfg = Config::parse(&format!("[proxy]\ntype=\"socks5\"\naddr=\"{proxy}\"\n{rules}")).unwrap();
         Arc::new(Live {
-            policy: Policy::new(&cfg, env_proxies(std::iter::empty())).unwrap(),
-            registry: Registry::build(&cfg).unwrap(),
-            retries: 2,
-            fail_threshold: 3,
             sniff,
+            ..live_for(proxy, rules)
         })
+    }
+
+    /// One SOCKS5 proxy at `proxy`, `rules`, and the defaults for the rest.
+    fn live_for(proxy: SocketAddr, rules: &str) -> Live {
+        let cfg = Config::parse(&format!("[proxy]\ntype=\"socks5\"\naddr=\"{proxy}\"\n{rules}")).unwrap();
+        Live::new(&cfg, EnvProxies::default()).unwrap()
     }
 
     /// A client connection that the relay carries to `p`'s target, the way the
@@ -717,13 +542,7 @@ mod tests {
             "#
         ))
         .unwrap();
-        let live = Arc::new(Live {
-            policy: Policy::new(&cfg, env_proxies(std::iter::empty())).unwrap(),
-            registry: Registry::build(&cfg).unwrap(),
-            retries: 2,
-            fail_threshold: 3,
-            sniff: SniffCfg::default(),
-        });
+        let live = Arc::new(Live::new(&cfg, EnvProxies::default()).unwrap());
         for _ in 0..4 {
             let pend = pending(Target::Domain("example.com".into(), 443));
             let mut c = relay_pending(&live, pend).await;
@@ -949,29 +768,6 @@ mod tests {
         .unwrap();
         assert_eq!(wait_seen(&seen, 1).await, ["domain:example.com:443"]);
     }
-
-    #[test]
-    fn skip_list_matches_the_name_and_its_subdomains_only() {
-        let c = SniffCfg::default();
-        assert!(c.skips("cloudflare-ech.com"));
-        assert!(c.skips("x.cloudflare-ech.com"));
-        assert!(!c.skips("notcloudflare-ech.com"));
-        assert!(!c.skips("cloudflare.com"));
-    }
-
-    #[test]
-    fn a_skip_entry_is_written_as_a_domain_suffix_rule_value_may_be() {
-        let cfg = Config::parse(
-            "sniff_skip_domains = [\"*.Example.com\", \".ech.test\"]\n[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n",
-        )
-        .unwrap();
-        let c = build_live(&cfg).unwrap().sniff;
-        for name in ["example.com", "a.example.com", "ech.test", "b.ech.test"] {
-            assert!(c.skips(name), "{name}");
-        }
-        assert!(!c.skips("badexample.com"));
-    }
-
     #[tokio::test]
     async fn a_lan_address_keeps_its_ip_even_with_a_hostname_in_the_payload() {
         // /etc/hosts: nas.lan -> 192.168.1.10; the program's TLS says nas.lan.
@@ -1027,112 +823,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wait_seen(&seen, 1).await, ["ip:5.5.5.6:443"]);
-    }
-
-    // ------------------------------------------------------------ pump --
-
-    async fn tcp_pair() -> (TcpStream, TcpStream) {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
-        let (s, _) = l.accept().await.unwrap();
-        (c, s)
-    }
-
-    type Pumped = tokio::task::JoinHandle<(Transfer, Result<()>, Arc<Traffic>)>;
-
-    /// client <-> [a  pump  b] <-> server
-    async fn pumped() -> (TcpStream, TcpStream, Pumped) {
-        let (client, mut a) = tcp_pair().await;
-        let (mut b, server) = tcp_pair().await;
-        let traffic = Arc::new(Traffic::default());
-        let h = tokio::spawn(async move {
-            let (moved, r) = pump(&mut a, &mut b, &traffic).await;
-            (moved, r, traffic)
-        });
-        (client, server, h)
-    }
-
-    fn pattern(n: usize) -> Vec<u8> {
-        (0..n).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
-    }
-
-    #[tokio::test]
-    async fn pump_moves_a_large_payload_intact_in_both_directions() {
-        let (mut client, mut server, h) = pumped().await;
-        let up = pattern(16 << 20);
-        let down = pattern(9 << 20);
-        let (up2, down2) = (up.clone(), down.clone());
-        let srv = tokio::spawn(async move {
-            let mut got = vec![0u8; up2.len()];
-            server.read_exact(&mut got).await.unwrap();
-            assert!(got == up2, "client->server bytes differ");
-            server.write_all(&down2).await.unwrap();
-            server.shutdown().await.unwrap();
-        });
-        client.write_all(&up).await.unwrap();
-        client.shutdown().await.unwrap();
-        let mut got = Vec::new();
-        client.read_to_end(&mut got).await.unwrap();
-        assert!(got == down, "server->client bytes differ");
-        srv.await.unwrap();
-        let (moved, r, traffic) = h.await.unwrap();
-        r.unwrap();
-        let (up, down) = (up.len() as u64, down.len() as u64);
-        assert_eq!(moved, Transfer { up, down });
-        assert_eq!(
-            (traffic.up.load(Ordering::Relaxed), traffic.down.load(Ordering::Relaxed)),
-            (up, down),
-            "the shared totals follow"
-        );
-    }
-
-    #[tokio::test]
-    async fn pump_keeps_the_other_direction_open_after_a_half_close() {
-        let (mut client, mut server, h) = pumped().await;
-        client.write_all(b"request").await.unwrap();
-        client.shutdown().await.unwrap(); // client is done sending
-        let mut got = Vec::new();
-        server.read_to_end(&mut got).await.unwrap(); // sees EOF after the data
-        assert_eq!(got, b"request");
-        server.write_all(b"late reply").await.unwrap(); // reverse path still works
-        server.shutdown().await.unwrap();
-        let mut reply = Vec::new();
-        client.read_to_end(&mut reply).await.unwrap();
-        assert_eq!(reply, b"late reply");
-        let (moved, r, _) = h.await.unwrap();
-        r.unwrap();
-        assert_eq!(moved, Transfer { up: 7, down: 10 });
-    }
-
-    #[tokio::test]
-    async fn a_reset_peer_ends_the_pump_instead_of_hanging() {
-        use std::os::fd::AsRawFd;
-        let (mut client, mut server, h) = pumped().await;
-        // Some bytes get through first: they must still be counted.
-        client.write_all(&[7; 1000]).await.unwrap();
-        let mut first = [0u8; 1000];
-        server.read_exact(&mut first).await.unwrap();
-        // Abortive close of the client: RST instead of FIN.
-        let abortive = libc::linger {
-            l_onoff: 1,
-            l_linger: 0,
-        };
-        unsafe {
-            libc::setsockopt(
-                client.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                &abortive as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::linger>() as u32,
-            );
-        }
-        drop(client);
-        let mut buf = [0u8; 8];
-        let _ = server.read(&mut buf).await;
-        let r = tokio::time::timeout(Duration::from_secs(5), h).await;
-        let (moved, r, _) = r.expect("the pump must end after a reset").unwrap();
-        assert!(r.is_err(), "a reset is an error");
-        assert_eq!(moved.up, 1000, "bytes moved before the error are counted");
     }
 
     #[tokio::test]

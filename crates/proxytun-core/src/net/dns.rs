@@ -171,12 +171,18 @@ where
         let Some(resp) = respond(&q, pool, upstream, Transport::Tcp, stats).await else {
             return;
         };
-        let mut out = (resp.len() as u16).to_be_bytes().to_vec();
-        out.extend_from_slice(&resp);
-        if stream.write_all(&out).await.is_err() {
+        if stream.write_all(&tcp_framed(&resp)).await.is_err() {
             return;
         }
     }
+}
+
+/// A message as DNS over TCP sends it: a 2-byte length, then the message, in
+/// one write.
+fn tcp_framed(msg: &[u8]) -> Vec<u8> {
+    let mut out = (msg.len() as u16).to_be_bytes().to_vec();
+    out.extend_from_slice(msg);
+    out
 }
 
 /// How the query reached us; forwarded queries go upstream the same way, so a
@@ -327,9 +333,7 @@ async fn forward_udp(raw: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
 async fn forward_tcp(raw: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
     let work = async {
         let mut s = tokio::net::TcpStream::connect(upstream).await.context("connect")?;
-        let mut out = (raw.len() as u16).to_be_bytes().to_vec();
-        out.extend_from_slice(raw);
-        s.write_all(&out).await.context("send")?;
+        s.write_all(&tcp_framed(raw)).await.context("send")?;
         let mut l = [0u8; 2];
         s.read_exact(&mut l).await.context("receive")?;
         let mut body = vec![0u8; u16::from_be_bytes(l) as usize];

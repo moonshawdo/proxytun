@@ -125,20 +125,23 @@ pub struct Group {
     pub nodes: Vec<Arc<Node>>,
     rr: AtomicUsize,
     rng: AtomicU64,
-    /// Node indices repeated by weight, for weighted-round-robin.
+    /// Node indices repeated by weight, for weighted-round-robin (empty for
+    /// the other strategies).
     schedule: Vec<usize>,
 }
 
 impl Group {
     pub fn new(name: &str, strategy: Strategy, nodes: Vec<Arc<Node>>) -> Result<Group> {
-        // Interleave rather than repeat in blocks so weight 2/1 yields a,b,a
-        // style spreading instead of a,a,b bursts.
-        let max_w = nodes.iter().map(|n| n.weight).max().unwrap_or(1);
         let mut schedule = Vec::new();
-        for round in 0..max_w {
-            for (i, n) in nodes.iter().enumerate() {
-                if round < n.weight {
-                    schedule.push(i);
+        if strategy == Strategy::WeightedRoundRobin {
+            // Interleave rather than repeat in blocks so weight 2/1 yields a,b,a
+            // style spreading instead of a,a,b bursts.
+            let max_w = nodes.iter().map(|n| n.weight).max().unwrap_or(1);
+            for round in 0..max_w {
+                for (i, n) in nodes.iter().enumerate() {
+                    if round < n.weight {
+                        schedule.push(i);
+                    }
                 }
             }
         }

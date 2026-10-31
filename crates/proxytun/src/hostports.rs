@@ -12,7 +12,7 @@
 //! the user excluded, nor listeners opened after start-up.
 
 use crate::capture::Shared;
-use proxytun_core::net::relay;
+use proxytun_core::net::pump;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
@@ -128,7 +128,7 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 let dial = start.elapsed();
                 // As for relayed connections, an abort is a reset: a host port
                 // closed since startup looks refused, not empty.
-                let _ = relay::finish(inbound, dialed.map_err(Into::into), &sh.traffic, start, dial, "host").await;
+                let _ = pump::finish(inbound, dialed.map_err(Into::into), &sh.traffic, start, dial, "host").await;
                 sh.stats.active.fetch_sub(1, Ordering::Relaxed);
             }
             .instrument(span),

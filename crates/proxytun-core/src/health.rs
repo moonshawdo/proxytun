@@ -7,7 +7,7 @@
 //! proxy-to-target leg, which would need a real external destination.
 
 use crate::balancer::Node;
-use crate::config::{HealthCfg, ProxyKind};
+use crate::config::HealthCfg;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,11 +18,7 @@ pub async fn probe(node: &Node, timeout: Duration) -> Result<Duration> {
     let started = Instant::now();
     let work = async {
         let mut s = TcpStream::connect(node.addr).await?;
-        if node.cfg.kind == ProxyKind::Socks5 {
-            let creds = crate::proxy::socks5_creds(node.cfg.username.as_deref(), node.cfg.password.as_deref())?;
-            crate::proxy::socks5_greet(&mut s, creds).await?;
-        }
-        Ok::<_, anyhow::Error>(())
+        crate::proxy::greet(&mut s, &node.cfg).await
     };
     tokio::time::timeout(timeout, work)
         .await
@@ -80,7 +76,7 @@ pub fn spawn(nodes: Vec<Arc<Node>>, cfg: HealthCfg) -> tokio::task::JoinHandle<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProxyCfg;
+    use crate::config::{ProxyCfg, ProxyKind};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 

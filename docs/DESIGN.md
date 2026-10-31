@@ -117,7 +117,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
   主路径普通拷贝快 20–30%;主机端口转发慢一半，但 1.35 GB/s 对本地服务足够，为它单留 splice 不值得。
   主路径的上限约 1 GB/s(单个 TUN 收发循环),远高于真实代理的吞吐，不做多队列 TUN、校验和卸载等优化。
   每条连接的额外开销约 0.5 ms(与客户端自己做 SOCKS5 握手相比，见 [PERFORMANCE.md](PERFORMANCE.md))。将来 proxyhook 改为依赖 core 时,splice 可以从 proxyhook 仓库拷回 `net/splice.rs`,
-  再给 `relay::pump` 加一个选择参数。
+  再给 `net::pump` 里的 `pump` 加一个选择参数。
 - 中继缓冲每方向 64 KiB(每条连接一建立就占 128 KiB)。经 TUN 下载 3 GB 实测:64 KiB 约 990 MB/s,32 KiB 约 915(−8%),
   16 KiB 约 750(−24%),8 KiB 约 545(−45%);按"吞吐下降不超过 5%"的标准不缩小。
 - 中继以错误结束(拨号失败、一端 RST、读写出错)时两端都用 RST 关闭(主机端口转发同样):发 FIN 的话，下载被截断的程序读到干净的 EOF,
@@ -313,6 +313,9 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
 - workspace:`crates/proxytun-core`(共享库)+ `crates/proxytun`(程序)。
 - core 来自 proxyhook:`config`、`types`、`policy`、`balancer`、`health`、`proxy`、`sniff`、`net::{fakeip, dns, relay}`;
   去掉了 ptrace、ticket、uid 校验(`peer`)、`doctor`、`app`。DNS 只保留应答/转发逻辑和 `serve_tcp`(无监听服务器),
-  中继只保留与 ticket 解耦的 `route()` 与 `build_live()`。按 proxytun 的需要修改。
+  中继只保留与 ticket 解耦的部分。按 proxytun 的需要修改，并拆成接口窄的小模块：`proxy::{socks5, http}` 是两种握手，
+  `proxy` 本身只管拨号、换成员与失败归属;`live`(`Live`、`build_live`)与 `net::pump`(双向拷贝与收尾，主机端口转发也用)从中继分出，
+  中继只剩 `route()`;`config::proxy_url` 解析 `--proxy` 的 URL。
+- 代理协议、负载均衡策略是封闭的集合，用枚举加穷尽的 `match`,不用 trait:加一种协议是一个新文件、一个枚举成员，再补编译器指出的 `match` 分支。
 - 许可证 GPL-2.0(代码来自 proxyhook)。文档中文，代码注释英文。只做 x86-64(gnu + musl 静态),不写架构相关代码。
 - 不引入重量级新依赖:TUN 与地址配置用 ioctl;改写表的容量与超时取合理默认值并写入文档。

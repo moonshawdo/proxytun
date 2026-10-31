@@ -35,25 +35,31 @@ flowchart LR
         HP --> NETNS
     end
     subgraph CORE["crates/proxytun-core"]
-        RELAY["net/relay.rs<br/>route, finish"]
+        RELAY["net/relay.rs<br/>route"]
+        PUMP["net/pump.rs<br/>双向拷贝与收尾"]
+        LIVE["live.rs<br/>Live, build_live"]
         DNS["net/dns.rs<br/>应答与转发"]
         FAKE["net/fakeip.rs<br/>假 IP 池"]
         POL["policy.rs<br/>规则"]
         BAL["balancer.rs<br/>代理组"]
-        PRX["proxy/<br/>SOCKS5, HTTP"]
+        PRX["proxy/<br/>拨号与失败归属<br/>socks5.rs, http.rs"]
         HEA["health.rs<br/>探测"]
         SNF["sniff.rs<br/>SNI / Host"]
-        CFG["config.rs<br/>配置"]
+        CFG["config/<br/>配置, --proxy URL"]
         ERR["errno.rs<br/>按 errno 分类"]
     end
     CAP --> RELAY
     CAP --> DNS
-    HP --> RELAY
+    HP --> PUMP
     DNS --> FAKE
+    RELAY --> LIVE
+    RELAY --> PUMP
     RELAY --> POL
-    RELAY --> BAL
     RELAY --> PRX
     RELAY --> SNF
+    LIVE --> POL
+    LIVE --> BAL
+    LIVE --> CFG
     PRX --> BAL
     HEA --> BAL
     HEA --> PRX
@@ -65,6 +71,7 @@ flowchart LR
     MAIN --> NETNS
     MAIN --> SUDO
     APP --> CFG
+    APP --> LIVE
     APP --> HEA
 ```
 
@@ -90,15 +97,17 @@ flowchart LR
 
 | 文件 | 职责 |
 |---|---|
-| `config.rs` | 配置文件的解析、规范化与校验;`--proxy` 覆盖 |
+| `config/` | `mod.rs`:配置文件的解析、规范化与校验(按代理、代理组、各项取值、规则分开校验),运行时用到的查询(上游 DNS 地址、文件权限提醒);`proxy_url.rs`:`--proxy` / `PROXYTUN_PROXY` 的 URL 解析与覆盖，消息里隐去凭据 |
 | `policy.rs` | 程序环境变量里的代理地址;直连判定(`localnet`、程序自己的代理)与规则匹配，纯逻辑 |
 | `balancer.rs` | 代理节点(健康、活跃连接数、延迟)与代理组，六种选择策略，只读原子量、不加锁 |
-| `health.rs` | 并发的主动健康探测(TCP 连接 + SOCKS5 问候，含认证) |
-| `proxy/` | SOCKS5(ATYP=3 域名)与 HTTP CONNECT 握手，失败分类(代理的问题 / 目标的问题 / 本机资源不足),组内换成员重试 |
+| `live.rs` | `Live`:一代配置的规则、代理组与嗅探设置，中继每条连接读一次,SIGHUP 时整体替换;`Live::new` 只由配置和给定的环境变量构造,`build_live` 读本进程的环境变量后调用它 |
+| `health.rs` | 并发的主动健康探测:TCP 连接，再做代理自己那部分握手(`proxy::greet`:SOCKS5 问候，含认证;HTTP 没有),不涉及协议细节 |
+| `proxy/` | `socks5.rs`(ATYP=3 域名、用户名密码认证)与 `http.rs`(CONNECT,逐字节读应答头)两种握手;`mod.rs`:连一个节点(按协议穷尽 `match`,连接、问候、请求各自计时)、健康探测的问候、组内换成员重试，失败由 `Blame` 归类(目标的问题 / 说不清或代理自己的规则 / 本机端口耗尽 / 本机资源不足 / 代理的问题，见 [7.2](operations.md#72-握手与失败分类)) |
 | `sniff.rs` | 从首包里取 TLS SNI 或 HTTP Host,纯函数 |
 | `net/fakeip.rs` | 假 IP 池:应答的 TTL(60 秒)、LRU、连接期间钉住、120 秒内不回收、最多 100 万条 |
 | `net/dns.rs` | 假 DNS 应答(A / AAAA / HTTPS / SVCB / localhost)、向上游转发(UDP、TCP)与应答校验、转发并发上限(256) |
-| `net/relay.rs` | `Pending`(捕获侧交来的连接：目标与钉住假 IP 的守卫);`route`:嗅探、规则、拨号(代理组或直连)、出站 keepalive;`finish`(`route` 与主机端口转发共用的收尾):双向拷贝、出错时两端 RST、结束汇总;direct 规则的域名解析上限 |
+| `net/relay.rs` | `Pending`(捕获侧交来的连接：目标与钉住假 IP 的守卫);`route`:嗅探、规则、拨号(代理组或直连)、出站 keepalive,再交给 `pump::finish`;direct 规则的域名解析上限 |
+| `net/pump.rs` | `finish`(`route` 与主机端口转发共用的收尾):双向拷贝并计数(`Traffic`)、出错时两端 RST、结束汇总 |
 | `errno.rs` | 按错误链里的 errno 判断失败原因：本机资源不足(fd、缓冲区、内存、本地端口)不算代理或上游的问题;拨号、健康探测、DNS 转发都用它 |
 | `throttle.rs` | 会按包、按查询、按 accept 频率重复的日志，限速为每 10 秒一条 |
 | `types.rs` | 捕获侧与中继侧之间传递的类型(目标、规则判定结果) |

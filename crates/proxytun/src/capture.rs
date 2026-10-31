@@ -12,9 +12,11 @@
 use crate::nat::Nat;
 use crate::packet::{self, Packet, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_RST, TCP_SYN};
 use anyhow::{anyhow, bail, Result};
+use proxytun_core::live::Live;
 use proxytun_core::net::dns::{self, DnsStats, Transport};
 use proxytun_core::net::fakeip::{FakeGuard, FakePool};
-use proxytun_core::net::relay::{self, Live, Pending, Traffic};
+use proxytun_core::net::pump::Traffic;
+use proxytun_core::net::relay::{self, Pending};
 use proxytun_core::throttle::{self, Throttle};
 use proxytun_core::types::Target;
 use std::net::{SocketAddr, SocketAddrV4};
@@ -570,6 +572,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::packet::tests::sa;
     use proxytun_core::config::Config;
+    use proxytun_core::live::build_live;
     use std::net::Ipv4Addr;
     use tokio::net::{TcpSocket, TcpStream};
 
@@ -583,7 +586,7 @@ pub(crate) mod tests {
             Nat::new(NAT, 1),
             FakePool::with_reserved_tail("198.18.0.0/15".parse().unwrap(), 0),
             "127.0.0.1:9".parse().unwrap(),
-            Arc::new(relay::build_live(&cfg).unwrap()),
+            Arc::new(build_live(&cfg).unwrap()),
             MAX_RELAYS,
         )
     }
