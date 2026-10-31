@@ -612,10 +612,11 @@ fn proxy_endpoint(v: &str) -> Option<(String, u16)> {
     };
     let rest = rest.split('/').next()?;
     let hostport = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    // Without a port, curl and git go to 1080 (443 for an https:// proxy),
+    // whatever the scheme: so do we, to recognise where they go.
     let default_port = match scheme.as_deref() {
         Some("https") => 443,
-        Some("socks5") | Some("socks5h") | Some("socks4") | Some("socks") => 1080,
-        _ => 80,
+        _ => 1080,
     };
     if let Some(stripped) = hostport.strip_prefix('[') {
         let (h, tail) = stripped.split_once(']')?;
@@ -992,13 +993,16 @@ mod tests {
     fn env_proxy_hostname_and_default_ports() {
         let e = env(&[
             ("http_proxy", "Proxy.Corp.Example"),
+            ("HTTP_PROXY", "http://plain.example"),
             ("https_proxy", "https://secure.example"),
             ("all_proxy", "socks5://s.example"),
         ]);
+        // Where curl and git connect: 1080 even for http:// (not 80).
         assert_eq!(
             e.domains,
             vec![
-                ("proxy.corp.example".to_string(), 80),
+                ("proxy.corp.example".to_string(), 1080),
+                ("plain.example".to_string(), 1080),
                 ("secure.example".to_string(), 443),
                 ("s.example".to_string(), 1080)
             ]

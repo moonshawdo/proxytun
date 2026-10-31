@@ -112,7 +112,7 @@ pub fn scan(exclude: &[u16]) -> Vec<SocketAddr> {
 pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
     let (what, mut log) = (format!("host port {addr}"), crate::capture::AcceptLog::default());
     loop {
-        let (mut inbound, _, slot) = crate::capture::accept_with_slot(&listener, &sh, &what, &mut log, |_| {}).await;
+        let (mut inbound, _, slot) = crate::capture::accept_with_slot(&listener, &sh, &what, &mut log).await;
         let id = sh.next_conn_id();
         let span = tracing::error_span!("conn", id, target = %addr);
         let sh = sh.clone();
@@ -126,9 +126,20 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 let dialed = TcpStream::connect(addr).await;
                 let dial = start.elapsed();
                 let (moved, r) = match dialed {
-                    Ok(mut out) => relay::pump(&mut inbound, &mut out, &sh.traffic).await,
+                    Ok(mut out) => {
+                        let (moved, r) = relay::pump(&mut inbound, &mut out, &sh.traffic).await;
+                        if r.is_err() {
+                            let _ = out.set_zero_linger();
+                        }
+                        (moved, r)
+                    }
                     Err(e) => (Transfer::default(), Err(e.into())),
                 };
+                // As for relayed connections, an abort is a reset: a host port
+                // closed since startup looks refused, not empty.
+                if r.is_err() {
+                    let _ = inbound.set_zero_linger();
+                }
                 sh.stats.active.fetch_sub(1, Ordering::Relaxed);
                 relay::log_closed(start, dial, "host", &moved, &r);
             }
@@ -158,6 +169,22 @@ mod tests {
    1: 00000000000000000000000000000000:1F91 00000000000000000000000000000000:0000 0A
    2: 0000000000000000FFFF00000100007F:2710 00000000000000000000000000000000:0000 0A
 ";
+
+    #[tokio::test]
+    async fn a_host_port_closed_since_startup_resets_the_program() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inside = l.local_addr().unwrap();
+        let SocketAddr::V4(listen) = inside else { unreachable!() };
+        let sh = Arc::new(crate::capture::tests::shared(listen));
+        let gone = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        tokio::spawn(serve(l, gone, sh));
+        let mut c = TcpStream::connect(inside).await.unwrap();
+        let r = tokio::io::AsyncReadExt::read(&mut c, &mut [0u8; 1]).await;
+        assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
+    }
 
     #[test]
     fn proc_net_tables_are_read_in_host_byte_order() {

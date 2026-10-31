@@ -4,7 +4,7 @@
 //!
 //! Lifecycle: addresses are handed out sequentially; once the range is used up,
 //! the least-recently-used mapping that has no live connection is recycled,
-//! but only once `REUSE_AFTER` (the TTL of our answers) has passed since it
+//! but only once `REUSE_AFTER` (twice the TTL of our answers) has passed since it
 //! was last handed out or used: until then the program may still connect to
 //! it from its cache, and must not reach another name that way. Every lookup
 //! refreshes recency, and `acquire` pins a mapping while a connection that was
@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 pub const MAX_ENTRIES: u32 = 1 << 20;
 
 /// How long a mapping stays out of reach of recycling after its last use:
-/// the TTL our DNS answers carry.
-pub const REUSE_AFTER: Duration = Duration::from_secs(super::dns::FAKE_TTL as u64);
+/// twice the TTL our DNS answers carry, for caches that keep an answer a
+/// while past it (serving it stale while they refresh).
+pub const REUSE_AFTER: Duration = Duration::from_secs(2 * super::dns::FAKE_TTL as u64);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PoolFull;
@@ -299,6 +300,9 @@ mod tests {
         p.alloc_at("b.com", t).unwrap();
         // Within the TTL of our answer, a.com's address may still be in the
         // program's cache: handing it to c.com would send that traffic there.
+        // So it may a little past it, in a cache serving stale answers.
+        let ttl = Duration::from_secs(super::super::dns::FAKE_TTL as u64);
+        assert_eq!(p.alloc_at("c.com", t + ttl + Duration::from_secs(1)), Err(PoolFull));
         assert_eq!(p.alloc_at("c.com", t + REUSE_AFTER / 2), Err(PoolFull));
         // Asked again meanwhile: the clock restarts.
         p.alloc_at("a.com", t + REUSE_AFTER / 2).unwrap();

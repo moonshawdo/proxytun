@@ -2254,11 +2254,16 @@ def listener():
     l.listen(1)
     return l
 
-if case in ("linger", "stranger"):
-    # Fds whose last close blocks for a minute: a socket with SO_LINGER and
-    # unsent data, and its peer, which never reads. They travel inside the
-    # receiving end of a socketpair, so all we hold is that end, closed right
-    # after sending: from then on whoever got it holds the last reference.
+def again(n):
+    """Start over with a fresh socket path, for the n-th try."""
+    global path, helper
+    path = os.path.join(d, f"ctl-{case}-{n}")
+    helper = ["sudo", "--", binary, "__proxytun_root_setup", path]
+
+def hostile_end():
+    """The receiving end of a socketpair with fds in flight inside it whose
+    last close blocks for 20 s: a socket with SO_LINGER and unsent data, and
+    its peer, which never reads."""
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
@@ -2270,11 +2275,54 @@ if case in ("linger", "stranger"):
             a.send(b"x" * 65536)
     except BlockingIOError:
         pass
-    a.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 60))
+    a.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 20))
     x, y = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     socket.send_fds(x, [b"in flight"], [a.fileno(), b.fileno()])
     for s in (a, b, srv, x):
-        s.close()
+        s.close()  # in flight still: not the last
+    return y
+
+def send_and_exit(c, y):
+    """Send `y` on `c`, drop our copy at once and exit. Our close follows the
+    send so closely that the copy sent is the last (we must have closed ours,
+    the caller, before). Should we still be late, the receiver gone already,
+    ours is the last and we linger instead: our output goes nowhere and
+    nobody waits for us."""
+    null = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, 1)
+    os.dup2(null, 2)
+    try:
+        socket.send_fds(c, [b"junk\0"], [y.fileno()])
+    except OSError:
+        os._exit(0)  # the helper hung up first: ours is the only copy
+    y.close()
+    os._exit(0)
+
+# A helper that would block on them does so only if its copy is the last,
+# which depends on timing (our sender's close against its own): five tries.
+TRIES = 5
+
+if case == "queued":
+    # Queued on the connection, never read: the helper turns down a socket
+    # that is not the sudo caller's and hangs up.
+    worst = 0
+    for n in range(TRIES):
+        again(n)
+        y = hostile_end()
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            l = listener()
+            os.write(w, b"x")
+            c, _ = l.accept()
+            send_and_exit(c, y)
+        y.close()
+        os.read(r, 1)
+        start = time.monotonic()
+        rc = subprocess.call(helper)
+        worst = max(worst, time.monotonic() - start)
+    print(f"rc={rc} after {worst:.0f}s", flush=True)
+    sys.exit()
 
 if case == "stranger":
     # The socket belongs to our child, not to the process that ran sudo.
@@ -2284,36 +2332,42 @@ if case == "stranger":
         l = listener()
         os.write(w, b"x")
         c, _ = l.accept()
-        # Queued, never read: the helper ends the connection unread.
-        socket.send_fds(c, [b"junk\0"], [y.fileno()])
-        y.close()
         uid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
         print("peer uid:", uid, flush=True)
-        try:
-            got = c.recv(4096)
-        except ConnectionResetError:  # closed with our message unread
-            got = b""
-        print("got:", got.decode(errors="replace"), flush=True)
+        print("got:", c.recv(4096).decode(errors="replace"), flush=True)
         os._exit(0)
-    y.close()
     os.read(r, 1)
-    start = time.monotonic()
     rc = subprocess.call(helper)
     os.waitpid(pid, 0)
-    print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
+    print(f"rc={rc}", flush=True)
     sys.exit()
 
+if case == "linger":
+    # With a malformed request: the program side, not root, gets them.
+    worst = 0
+    for n in range(TRIES):
+        again(n)
+        y = hostile_end()
+        l = listener()
+        p = subprocess.Popen(helper)
+        c, _ = l.accept()
+        start = time.monotonic()
+        r, w = os.pipe()
+        if os.fork() == 0:
+            os.read(r, 1)
+            send_and_exit(c, y)
+        y.close()
+        os.write(w, b"x")
+        got = c.recv(4096)[:2].decode(errors="replace")
+        rc = p.wait(timeout=90)
+        worst = max(worst, time.monotonic() - start)
+    print("got:", got, flush=True)
+    print(f"rc={rc} after {worst:.0f}s", flush=True)
+    sys.exit()
 l = listener()
 p = subprocess.Popen(helper)
 c, _ = l.accept()
 start = time.monotonic()
-if case == "linger":
-    socket.send_fds(c, [b"junk\0"], [y.fileno()])
-    y.close()
-    print("got:", c.recv(4096)[:2].decode(errors="replace"), flush=True)
-    rc = p.wait(timeout=90)
-    print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
-    sys.exit()
 if case == "silent":
     rc = p.wait(timeout=30)
     print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
@@ -2347,7 +2401,7 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     require_centos7!("python3");
     let dir = shared_dir("helper-client");
     std::fs::write(dir.join("client.py"), PY_HELPER_CLIENT).unwrap();
-    let cases = ["stranger", "range", "pgrp", "fds", "linger", "silent", "late"];
+    let cases = ["stranger", "range", "pgrp", "fds", "linger", "queued", "silent", "late"];
     let user = format!(
         "for c in {}; do python3 \"$D/client.py\" \"$BIN\" \"$D\" $c > \"$D/out-$c\" 2>&1 & done; wait",
         cases.join(" ")
@@ -2361,6 +2415,7 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     // nothing.
     assert!(got("stranger").contains("peer uid: 1000\n"), "{}", all());
     assert!(got("stranger").contains("got: \n"), "{}", all());
+    assert!(got("stranger").ends_with("rc=1\n"), "{}", all());
     assert!(
         got("stranger").contains("the socket was not created by the process that ran sudo"),
         "{}",
@@ -2387,7 +2442,7 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     assert!(got("fds").contains("expected 5 fds"), "{}", all());
     assert!(got("fds").ends_with("rc=1\n"), "{}", all());
     // Whatever fds a client sends, root never holds them: closing them (the
-    // socket lingers for a minute) cannot keep it, and sudo, waiting.
+    // socket lingers for 20 s) cannot keep it, and sudo, waiting.
     assert!(got("linger").contains("malformed request"), "{}", all());
     assert!(got("linger").contains("got: ER\n"), "{}", all());
     let secs = |c: &str| -> u64 {
@@ -2401,8 +2456,13 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     };
     assert!(secs("linger") < 5, "{}", all());
     // Nor when they are only queued on the connection, and the helper ends
-    // it without reading (here: for the stranger).
-    assert!(secs("stranger") < 5, "{}", all());
+    // it without reading (here: turning down a stranger's socket).
+    assert!(
+        got("queued").contains("the socket was not created by the process that ran sudo"),
+        "{}",
+        all()
+    );
+    assert!(secs("queued") < 5, "{}", all());
     // A client that never talks does not keep root waiting.
     assert!((5..=15).contains(&secs("silent")), "{}", all());
     // That limit is for talking to root only: the program, the helper gone,

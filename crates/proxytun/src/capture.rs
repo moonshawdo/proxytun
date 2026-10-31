@@ -134,14 +134,14 @@ pub struct AcceptLog {
 /// The next connection on `listener` that may be relayed, with its slot.
 /// accept failing (out of fds) fails again at once while connections wait:
 /// reported now and then, retried after a pause. A connection over
-/// `MAX_RELAYS` is reset, after `refused` cleans up after it, and the next
-/// one taken.
+/// `MAX_RELAYS` is reset, and the next one taken. (Its table entry ends when
+/// the reset passes the TUN device; should the reset be lost there, it is
+/// still waiting to be accepted, and `nat::QUEUED` resets the program.)
 pub async fn accept_with_slot(
     listener: &TcpListener,
     sh: &Shared,
     what: &str,
     log: &mut AcceptLog,
-    refused: impl Fn(SocketAddr),
 ) -> (tokio::net::TcpStream, SocketAddr, tokio::sync::OwnedSemaphorePermit) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -159,10 +159,7 @@ pub async fn accept_with_slot(
         };
         match sh.relay_slots.clone().try_acquire_owned() {
             Ok(slot) => return (stream, peer, slot),
-            Err(_) => {
-                refused(peer);
-                refuse_busy(sh, stream, &mut log.busy);
-            }
+            Err(_) => refuse_busy(sh, stream, &mut log.busy),
         }
     }
 }
@@ -261,7 +258,8 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
         nat.inbound(p.dst)
     } else {
         let mut table = sh.nat();
-        let nat = table.outbound(p.src, p.dst, p.is_syn(), Instant::now());
+        let syn = p.is_syn().then(|| packet::tcp_seq(pkt, p));
+        let nat = table.outbound(p.src, p.dst, syn, Instant::now());
         if rst {
             table.program_reset(p.src, p.dst, Instant::now());
         }
@@ -270,10 +268,6 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
             match nat {
                 Some(nat) => tracing::trace!(src = %p.src, dst = %p.dst, %nat, "syn"),
                 None => {
-                    // Refused at once: the program gets ECONNREFUSED now
-                    // rather than retrying its SYN for two minutes.
-                    let ack = packet::tcp_seq(pkt, p).wrapping_add(1);
-                    write_packet(tun, sh, &packet::build_tcp_reset(p.dst, p.src, 0, Some(ack)));
                     if table_full_due(sh) {
                         tracing::error!(
                             src = %p.src, dst = %p.dst,
@@ -292,10 +286,23 @@ fn on_tcp(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
             packet::rewrite_tcp(pkt, p, src, dst);
             write_packet(tun, sh, &pkt[..p.len]);
         }
-        None if p.is_syn() => count(&sh.stats.drop_table_full, 1),
         None => {
-            count(&sh.stats.drop_no_flow, 1);
-            tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
+            // From the program: answered as by a host without such a
+            // connection. A SYN that found the table full gets ECONNREFUSED
+            // now rather than retrying for two minutes; anything else (its
+            // connection ended here long ago) ECONNRESET rather than
+            // retransmitting for a quarter of an hour.
+            if p.src != sh.listen {
+                if let Some(r) = packet::reset_answering(pkt, p) {
+                    write_packet(tun, sh, &r);
+                }
+            }
+            if p.is_syn() {
+                count(&sh.stats.drop_table_full, 1);
+            } else {
+                count(&sh.stats.drop_no_flow, 1);
+                tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
+            }
         }
     }
 }
@@ -336,17 +343,7 @@ fn write_packet(tun: &OwnedFd, sh: &Shared, b: &[u8]) {
 pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
     let mut log = AcceptLog::default();
     loop {
-        let (stream, peer, slot) = accept_with_slot(&listener, &sh, "relay", &mut log, |peer| {
-            // Refused: its entry ends here too, or it would wait for an
-            // accept forever.
-            if let SocketAddr::V4(p) = peer {
-                let mut nat = sh.nat();
-                if nat.accept(p).is_some() {
-                    nat.close(p, Instant::now());
-                }
-            }
-        })
-        .await;
+        let (stream, peer, slot) = accept_with_slot(&listener, &sh, "relay", &mut log).await;
         let id = sh.next_conn_id();
         // Every line about this connection names it. Error level: present
         // whenever anything is logged, so a proxy failing at warn names it too.
@@ -410,8 +407,10 @@ async fn relay_one(sh: &Shared, stream: tokio::net::TcpStream, peer: SocketAddr)
 }
 
 /// Map a fake IP back to its domain (pinning the mapping for the connection's
-/// lifetime); anything else stays a literal IP. A stale fake IP, recycled
-/// since the program resolved it, stays an IP and the proxy fails it.
+/// lifetime); anything else stays a literal IP, and a fake IP the pool never
+/// handed out goes to the proxy as one, which fails it. A program that kept
+/// an answer past `REUSE_AFTER` (twice its TTL) may find the address
+/// recycled, naming another domain by then.
 fn to_target(dst: SocketAddrV4, pool: &FakePool) -> (Target, Option<FakeGuard>) {
     match pool.acquire(*dst.ip()) {
         Some((domain, guard)) => (Target::Domain(domain, dst.port()), Some(guard)),
@@ -505,7 +504,7 @@ pub fn log_stats(sh: &Shared) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::packet::tests::sa;
     use proxytun_core::config::Config;
@@ -515,7 +514,7 @@ mod tests {
     /// The (one) NAT address here, so a test can play the rewritten client.
     const NAT: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
-    fn shared(listen: SocketAddrV4) -> Shared {
+    pub(crate) fn shared(listen: SocketAddrV4) -> Shared {
         let cfg = Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n").unwrap();
         Shared {
             listen,
@@ -545,7 +544,7 @@ mod tests {
         let mut syn = crate::packet::tests::tcp(program, dst, TCP_SYN, b"");
         let p = packet::parse(&syn).unwrap();
         on_tcp(&tun, &sh, &mut syn, &p);
-        let nat = sh.nat().outbound(program, dst, false, Instant::now()).unwrap();
+        let nat = sh.nat().outbound(program, dst, None, Instant::now()).unwrap();
         // The listener's SYN-ACK: the handshake completes in the kernel.
         let mut syn_ack = crate::packet::tests::tcp(sh.listen, nat, TCP_SYN | TCP_ACK, b"");
         let p = packet::parse(&syn_ack).unwrap();
@@ -563,7 +562,7 @@ mod tests {
         let mut syn = crate::packet::tests::tcp(other, dst, TCP_SYN, b"");
         let p = packet::parse(&syn).unwrap();
         on_tcp(&tun, &sh, &mut syn, &p);
-        let nat = sh.nat().outbound(other, dst, false, Instant::now()).unwrap();
+        let nat = sh.nat().outbound(other, dst, None, Instant::now()).unwrap();
         let mut syn_ack = crate::packet::tests::tcp(sh.listen, nat, TCP_SYN | TCP_ACK, b"");
         let p = packet::parse(&syn_ack).unwrap();
         on_tcp(&tun, &sh, &mut syn_ack, &p);
@@ -583,7 +582,7 @@ mod tests {
         let mut syn = crate::packet::tests::tcp(third, dst, TCP_SYN, b"");
         let p = packet::parse(&syn).unwrap();
         on_tcp(&tun, &sh, &mut syn, &p);
-        let nat = sh.nat().outbound(third, dst, false, Instant::now()).unwrap();
+        let nat = sh.nat().outbound(third, dst, None, Instant::now()).unwrap();
         let mut rst = crate::packet::tests::tcp(third, dst, TCP_RST, b"");
         let p = packet::parse(&rst).unwrap();
         on_tcp(&tun, &sh, &mut rst, &p);
@@ -638,7 +637,7 @@ mod tests {
         // A real entry (a DNS-over-TCP connection) is relayed, then closed.
         let nat = sh
             .nat()
-            .outbound(sa("198.19.255.1:5555"), sa("9.9.9.9:53"), true, Instant::now())
+            .outbound(sa("198.19.255.1:5555"), sa("9.9.9.9:53"), Some(1), Instant::now())
             .unwrap();
         let (_c, r) = relay_from(&l, &sh, nat).await;
         r.unwrap();
@@ -665,7 +664,7 @@ mod tests {
         };
         let entry = |program: &str| {
             sh.nat()
-                .outbound(sa(program), sa("9.9.9.9:53"), true, Instant::now())
+                .outbound(sa(program), sa("9.9.9.9:53"), Some(1), Instant::now())
                 .unwrap()
         };
         // One connection (DNS over TCP, held open) takes the only slot.
@@ -683,7 +682,10 @@ mod tests {
             .expect("answered at once");
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::ConnectionReset);
         assert_eq!(sh.stats.relays_refused.load(Ordering::Relaxed), 1);
-        assert_eq!(sh.nat().accept(second), None, "its entry is closed");
+        // Its entry is left to the TUN thread, which sees the reset go by:
+        // ended here, a lost reset would leave the program waiting forever
+        // instead of reset after `nat::QUEUED`.
+        assert_eq!(sh.nat().accept(second), Some(sa("9.9.9.9:53")));
     }
 
     /// A pipe stands in for the TUN device: what we write comes out of the
@@ -719,6 +721,7 @@ mod tests {
         let mut icmp = tcp(sa("1.1.1.1:1"), sa("2.2.2.2:2"), TCP_SYN, b"");
         icmp[9] = packet::PROTO_ICMP;
         let mut stray = tcp(sa("198.19.255.1:40000"), sa("198.18.0.9:443"), TCP_ACK, b"x");
+        stray[28..32].copy_from_slice(&0x0a0b_0c0du32.to_be_bytes()); // what it acknowledges
         let mut syn = tcp(sa("198.19.255.1:40000"), sa("198.18.0.9:443"), TCP_SYN, b"");
         let mut quic = packet::build_udp(sa("198.19.255.1:5000"), sa("1.2.3.4:443"), b"quic").unwrap();
         let mut sizes = 0;
@@ -731,7 +734,7 @@ mod tests {
             let mut nat = sh.nat();
             for i in 0..crate::nat::PORTS.len() {
                 let src = SocketAddrV4::new([10, 0, (i >> 8) as u8, i as u8].into(), 1);
-                nat.outbound(src, sa("1.1.1.1:80"), true, Instant::now());
+                nat.outbound(src, sa("1.1.1.1:80"), Some(1), Instant::now());
             }
         }
         let mut late = tcp(sa("198.19.255.1:40001"), sa("198.18.0.9:443"), TCP_SYN, b"");
@@ -751,20 +754,29 @@ mod tests {
             (1, 1, 1, 1, 1),
             "IPv6, ICMP, a stray ACK, a SYN into a full table, a QUIC datagram"
         );
-        // Out: the rewritten SYN, the ICMP refusal of the datagram, and the
-        // reset refusing the SYN that found the table full.
+        // Out: the reset answering the stray ACK, the rewritten SYN, the ICMP
+        // refusal of the datagram, and the reset refusing the SYN that found
+        // the table full.
         let mut written = vec![0u8; 4096];
         let got = out.read(&mut written).unwrap();
-        assert_eq!(n(&s.tun_packets_out), 3);
+        assert_eq!(n(&s.tun_packets_out), 4);
         assert_eq!(n(&s.tun_bytes_out), got as u64);
-        let first = packet::parse(&written[..got]).unwrap();
+        let stray_reset = packet::parse(&written[..got]).unwrap();
+        assert_eq!(
+            (stray_reset.src, stray_reset.dst, stray_reset.flags),
+            (sa("198.18.0.9:443"), sa("198.19.255.1:40000"), TCP_RST),
+            "a segment of no connection is reset, not left to be retransmitted"
+        );
+        assert_eq!(packet::tcp_seq(&written[..got], &stray_reset), 0x0a0b_0c0d);
+        let at = stray_reset.len;
+        let first = packet::parse(&written[at..got]).unwrap();
         assert_eq!(
             (first.dst, *first.src.ip()),
             (listen, NAT),
             "the SYN was rewritten to the listener"
         );
-        let second = packet::parse(&written[first.len..got]).unwrap();
-        let reset_at = first.len + second.len;
+        let second = packet::parse(&written[at + first.len..got]).unwrap();
+        let reset_at = at + first.len + second.len;
         let reset = &written[reset_at..got];
         let r = packet::parse(reset).unwrap();
         assert!(crate::packet::tests::checksums_ok(reset));

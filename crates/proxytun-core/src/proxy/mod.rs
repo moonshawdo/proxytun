@@ -21,9 +21,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// time, or the destination cannot be asked for at all. The proxy is up and
 /// speaking the protocol, so this never counts against its health.
 /// `about_target`: the answer is surely about the destination (refused,
-/// unreachable, forbidden), and another member would only repeat it. Otherwise
-/// (SOCKS5 "general failure", HTTP 500/503: the proxy's own upstream may be
-/// what failed) another member is tried.
+/// unreachable), and another member would only repeat it. Otherwise (SOCKS5
+/// "general failure" or "not allowed by ruleset", HTTP 403/500/503: the
+/// proxy's own upstream or its own rules may be what failed) another member
+/// is tried.
 /// `answered`: the proxy said so. When it said nothing (the destination
 /// never answered it) or was never asked, its health is left as it was.
 #[derive(Debug)]
@@ -114,12 +115,12 @@ where
     socks5_request(s, &req).await
 }
 
-fn socks5_creds(user: Option<&str>, pass: Option<&str>) -> Result<Option<Vec<u8>>> {
+pub(crate) fn socks5_creds(user: Option<&str>, pass: Option<&str>) -> Result<Option<Vec<u8>>> {
     user.map(|u| socks5_auth_request(u, pass.unwrap_or(""))).transpose()
 }
 
 /// Greeting and authentication: the proxy's own part of the handshake.
-async fn socks5_greet<S>(s: &mut S, creds: Option<Vec<u8>>) -> Result<()>
+pub(crate) async fn socks5_greet<S>(s: &mut S, creds: Option<Vec<u8>>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -156,7 +157,20 @@ where
 
     // reply: VER REP RSV ATYP BND.ADDR BND.PORT
     let mut head = [0u8; 4];
-    s.read_exact(&mut head).await.context("socks5: connect reply")?;
+    if let Err(e) = s.read_exact(&mut head).await {
+        use std::io::ErrorKind::{ConnectionAborted, ConnectionReset, UnexpectedEof};
+        // Hung up instead of replying: what `ssh -D` does when it cannot
+        // reach the destination. Like no reply at all, about the destination.
+        if matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted) {
+            return Err(TargetRefused {
+                msg: format!("socks5: the proxy hung up instead of replying to the connect request ({e})"),
+                about_target: true,
+                answered: false,
+            }
+            .into());
+        }
+        return Err(anyhow::Error::new(e).context("socks5: connect reply"));
+    }
     if head[0] != 0x05 {
         bail!("socks5: bad version {:#x} in reply", head[0]);
     }
@@ -167,8 +181,8 @@ where
             head[1]
         );
         return match head[1] {
-            // Not allowed, network/host unreachable, refused, TTL expired.
-            0x02..=0x06 => Err(TargetRefused {
+            // Network/host unreachable, refused, TTL expired.
+            0x03..=0x06 => Err(TargetRefused {
                 msg,
                 about_target: true,
                 answered: true,
@@ -176,7 +190,8 @@ where
             .into()),
             // Command / address type not supported: this proxy cannot do it.
             0x07 | 0x08 => Err(anyhow!(msg)),
-            // General failure, unknown codes.
+            // General failure, not allowed by this proxy's rules (another's
+            // may differ), unknown codes.
             _ => Err(TargetRefused {
                 msg,
                 about_target: false,
@@ -249,14 +264,15 @@ where
         // Wrong or missing credentials, or no CONNECT support: a problem with
         // this proxy entry.
         Some(405 | 407) => bail!("http connect failed: {status_line}"),
-        // Forbidden, or the proxy failed to reach / timed out on the destination.
-        Some(403 | 502 | 504) => Err(TargetRefused {
+        // The proxy failed to reach / timed out on the destination.
+        Some(502 | 504) => Err(TargetRefused {
             msg: format!("http connect failed: {status_line}"),
             about_target: true,
             answered: true,
         }
         .into()),
-        // 500, 503, ...: maybe the destination, maybe the proxy's upstream.
+        // 403 (this proxy's rules; another's may differ), 500, 503, ...:
+        // maybe the destination, maybe the proxy itself.
         Some(_) => Err(TargetRefused {
             msg: format!("http connect failed: {status_line}"),
             about_target: false,
@@ -721,6 +737,9 @@ mod tests {
         /// Greets, then never answers the connect request (the destination
         /// is a black hole).
         SocksUnanswered,
+        /// Greets, takes the connect request and hangs up, as `ssh -D` does
+        /// when the destination cannot be reached.
+        SocksHangsUp,
         /// Takes the CONNECT, never answers it.
         HttpUnanswered,
         /// Accepts the TCP connection, never greets.
@@ -767,6 +786,16 @@ mod tests {
                             let mut sink = [0u8; 64];
                             while c.read(&mut sink).await.is_ok_and(|n| n > 0) {}
                         }
+                        Reply::SocksHangsUp => {
+                            let mut g = [0u8; 3];
+                            c.read_exact(&mut g).await.ok();
+                            c.write_all(&[5, 0]).await.ok();
+                            let mut h = [0u8; 5];
+                            c.read_exact(&mut h).await.ok();
+                            let mut rest = vec![0u8; h[4] as usize + 2];
+                            c.read_exact(&mut rest).await.ok();
+                            return;
+                        }
                         Reply::SlowGreeting => {
                             let mut g = [0u8; 3];
                             c.read_exact(&mut g).await.ok();
@@ -807,11 +836,9 @@ mod tests {
     #[tokio::test]
     async fn a_destination_refused_by_the_proxy_is_not_a_proxy_failure() {
         for (reply, kind) in [
-            (Reply::Socks(0x02), ProxyKind::Socks5), // not allowed by ruleset
             (Reply::Socks(0x04), ProxyKind::Socks5), // host unreachable
             (Reply::Socks(0x05), ProxyKind::Socks5), // connection refused
             (Reply::Socks(0x06), ProxyKind::Socks5), // TTL expired
-            (Reply::Http("403 Forbidden"), ProxyKind::Http),
             (Reply::Http("502 Bad Gateway"), ProxyKind::Http),
             (Reply::Http("504 Gateway Timeout"), ProxyKind::Http),
         ] {
@@ -840,9 +867,12 @@ mod tests {
         // squid, ssh -D, dante answer the connect request only once the
         // destination has: a black hole leaves the request unanswered. That is
         // no reason to doubt the proxy, nor to make every member wait it out.
+        // ssh -D hangs up instead: the same, not a broken proxy (three
+        // unreachable destinations in a row used to take it down).
         let cases = [
             (Reply::SocksUnanswered, ProxyKind::Socks5),
             (Reply::HttpUnanswered, ProxyKind::Http),
+            (Reply::SocksHangsUp, ProxyKind::Socks5),
         ]
         .map(|(reply, kind)| async move {
             let (a, hits_a) = scripted_proxy(reply).await;
@@ -879,8 +909,8 @@ mod tests {
             assert!(dial_group(&g, &dom("x.example", 443), 0, 1).await.is_err());
             assert!(!g.nodes[0].is_healthy(), "a silent proxy is marked down");
         };
-        let [socks, http] = cases;
-        tokio::join!(socks, http, mute);
+        let [socks, http, hangs_up] = cases;
+        tokio::join!(socks, http, hangs_up, mute);
     }
 
     #[tokio::test]
@@ -938,10 +968,13 @@ mod tests {
     #[tokio::test]
     async fn an_unclear_refusal_tries_another_member_without_blaming_the_proxy() {
         // "General failure" / 503: perhaps the destination, perhaps the proxy's
-        // own upstream is down. Another member may well get through, but the
-        // proxy answered properly, so its health is not touched.
+        // own upstream is down. "Not allowed" / 403: this proxy's own rules,
+        // which another's may not share. Another member may well get through,
+        // but the proxy answered properly, so its health is not touched.
         for (reply, kind) in [
             (Reply::Socks(0x01), ProxyKind::Socks5),
+            (Reply::Socks(0x02), ProxyKind::Socks5),
+            (Reply::Http("403 Forbidden"), ProxyKind::Http),
             (Reply::Http("503 Service Unavailable"), ProxyKind::Http),
             (Reply::Http("500 Internal Server Error"), ProxyKind::Http),
         ] {

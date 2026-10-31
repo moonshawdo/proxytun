@@ -1,16 +1,16 @@
 //! Active health probing of upstream proxies.
 //!
-//! A probe is: TCP connect to the proxy, plus (for SOCKS5) the method-selection
-//! round trip. The elapsed time feeds the node's latency EWMA used by the
+//! A probe is: TCP connect to the proxy, plus (for SOCKS5) the greeting a
+//! real connection starts with, authentication included: a proxy that turns
+//! our credentials down would fail every connection, so it is not healthy. The elapsed time feeds the node's latency EWMA used by the
 //! `least-latency` strategy. It measures the hop to the proxy only, not the
 //! proxy-to-target leg, which would need a real external destination.
 
 use crate::balancer::Node;
 use crate::config::{HealthCfg, ProxyKind};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// One probe; returns the measured round trip.
@@ -19,12 +19,8 @@ pub async fn probe(node: &Node, timeout: Duration) -> Result<Duration> {
     let work = async {
         let mut s = TcpStream::connect(node.addr).await?;
         if node.cfg.kind == ProxyKind::Socks5 {
-            s.write_all(&[0x05, 0x01, 0x00]).await?;
-            let mut r = [0u8; 2];
-            s.read_exact(&mut r).await?;
-            if r[0] != 0x05 {
-                bail!("not a socks5 server (version byte {:#x})", r[0]);
-            }
+            let creds = crate::proxy::socks5_creds(node.cfg.username.as_deref(), node.cfg.password.as_deref())?;
+            crate::proxy::socks5_greet(&mut s, creds).await?;
         }
         Ok::<_, anyhow::Error>(())
     };
@@ -85,6 +81,7 @@ pub fn spawn(nodes: Vec<Arc<Node>>, cfg: HealthCfg) -> tokio::task::JoinHandle<(
 mod tests {
     use super::*;
     use crate::config::ProxyCfg;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn node(addr: std::net::SocketAddr, kind: ProxyKind) -> Arc<Node> {
@@ -114,6 +111,54 @@ mod tests {
             }
         });
         a
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_turns_our_credentials_down_stays_down() {
+        // Asks for a username and password, then rejects them, as it would
+        // every real connection: probes must not bring it back up.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut c, _) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut g = [0u8; 4];
+                    c.read_exact(&mut g).await.ok();
+                    c.write_all(&[5, 2]).await.ok();
+                    let mut auth = [0u8; 64];
+                    let _ = c.read(&mut auth).await;
+                    c.write_all(&[1, 1]).await.ok();
+                });
+            }
+        });
+        let n = Node::new(ProxyCfg {
+            name: "n".into(),
+            kind: ProxyKind::Socks5,
+            addr: a.to_string(),
+            username: Some("u".into()),
+            password: Some("wrong".into()),
+            weight: 1,
+        })
+        .unwrap();
+        let cfg = HealthCfg {
+            fail_threshold: 1,
+            ..HealthCfg::default()
+        };
+        probe_and_record(&n, &cfg).await;
+        assert!(!n.is_healthy());
+        // Nor one that accepts none of our methods.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            c.read_exact(&mut g).await.ok();
+            c.write_all(&[5, 0xff]).await.ok();
+        });
+        let n = node(a, ProxyKind::Socks5);
+        probe_and_record(&n, &cfg).await;
+        assert!(!n.is_healthy());
     }
 
     #[tokio::test]

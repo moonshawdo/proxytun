@@ -11,6 +11,7 @@ use crate::sniff::{self, Sniffed};
 use crate::types::{Decision, Dest, Pending, Target};
 use anyhow::{anyhow, Result};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -167,13 +168,51 @@ pub async fn route(live: &Live, traffic: &Traffic, mut inbound: TcpStream, pendi
         // `_conn` counts the connection as active on its proxy while it lasts.
         Ok((mut out, _conn, via)) => {
             out.set_nodelay(true).ok();
+            keepalive(&out);
             let (moved, r) = pump(&mut inbound, &mut out, traffic).await;
+            if r.is_err() {
+                let _ = out.set_zero_linger();
+            }
             (via, moved, r)
         }
         Err(e) => ("-".to_string(), Transfer::default(), Err(e)),
     };
+    // An abort reaches each side as one, a reset: a transfer cut off, or a
+    // target that could not be reached, must not look like a complete (or
+    // empty) one ending in a FIN.
+    if r.is_err() {
+        let _ = inbound.set_zero_linger();
+    }
     log_closed(start, dial, &via, &moved, &r);
     r
+}
+
+/// Notice a dead path to the proxy or target, which nothing else would: the
+/// program's own keepalives are answered by our listener, right next to it.
+/// Idle, the first probe goes after 60 s, then every 15 s; unanswered (or
+/// data unacknowledged) for 120 s, the connection fails, and the relay with
+/// it, resetting the program.
+fn keepalive(s: &TcpStream) {
+    let fd = s.as_raw_fd();
+    for (level, opt, v) in [
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15),
+        (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 4),
+        (libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, 120_000),
+    ] {
+        let v: libc::c_int = v;
+        // SAFETY: an int option on a socket we own.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                &v as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+    }
 }
 
 /// For a literal-IP target on a sniff port, peek (without consuming) the
@@ -530,6 +569,78 @@ mod tests {
         let mut c = relay_pending(&live, pend).await;
         let mut b = [0u8; 1];
         assert_eq!(c.read(&mut b).await.unwrap_or(0), 0, "closed, never silently direct");
+    }
+
+    #[tokio::test]
+    async fn an_abort_reaches_the_other_side_as_a_reset_not_an_end() {
+        let (proxy, _) = echo_socks5().await;
+        let direct = "[[rules]]\nmatch=\"domain\"\nvalue=\"localhost\"\naction=\"direct\"";
+        let reset = |r: std::io::Result<usize>| r.map_err(|e| e.kind());
+        // Nothing to reach: the program learns so, it does not see an empty
+        // reply.
+        let live = mk_live(crate::testutil::refused().addr, "");
+        let mut c = relay_pending(&live, pending(Target::Domain("example.com".into(), 443))).await;
+        let mut b = [0u8; 16];
+        assert_eq!(reset(c.read(&mut b).await), Err(std::io::ErrorKind::ConnectionReset));
+
+        // The target cuts the transfer off: the program gets what came, then
+        // the reset, not a clean end that passes for a complete download.
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            s.write_all(b"part").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            s.set_zero_linger().unwrap();
+        });
+        let live = mk_live(proxy, direct);
+        let mut c = relay_pending(&live, pending(Target::Domain("localhost".into(), port))).await;
+        let mut got = [0u8; 4];
+        c.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"part");
+        assert_eq!(reset(c.read(&mut b).await), Err(std::io::ErrorKind::ConnectionReset));
+
+        // The program aborts an upload: the target must not take it for a
+        // finished one.
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let _ = tx.send(s.read_to_end(&mut buf).await.map_err(|e| e.kind()));
+        });
+        let mut c = relay_pending(&live, pending(Target::Domain("localhost".into(), port))).await;
+        c.write_all(b"half an upload").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        c.set_zero_linger().unwrap();
+        drop(c);
+        let seen = tokio::time::timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+        assert_eq!(seen, Err(std::io::ErrorKind::ConnectionReset));
+    }
+
+    #[tokio::test]
+    async fn the_way_out_is_probed_while_idle() {
+        let (proxy, _) = echo_socks5().await;
+        let live = mk_live(proxy, "");
+        let mut c = relay_pending(&live, pending(Target::Domain("example.com".into(), 443))).await;
+        c.write_all(b"x").await.unwrap();
+        c.read_exact(&mut [0u8; 1]).await.unwrap();
+        // Our connection to the proxy, idle now: its keepalive timer runs
+        // ("tr" 2 in /proc/net/tcp).
+        let SocketAddr::V4(p) = proxy else { unreachable!() };
+        let rem = format!("{:08X}:{:04X}", u32::from_le_bytes(p.ip().octets()), p.port());
+        let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let ours: Vec<&str> = tcp
+            .lines()
+            .map(str::split_whitespace)
+            .filter_map(|mut f| {
+                let (_, _, r, st, _, tr) = (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+                (r == rem && st == "01").then_some(tr)
+            })
+            .collect();
+        assert_eq!(ours.len(), 1, "{tcp}");
+        assert!(ours[0].starts_with("02:"), "no keepalive timer: {}", ours[0]);
     }
 
     #[tokio::test]

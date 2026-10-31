@@ -9,6 +9,7 @@ pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
 
+pub const TCP_FIN: u8 = 0x01;
 pub const TCP_SYN: u8 = 0x02;
 pub const TCP_RST: u8 = 0x04;
 pub const TCP_ACK: u8 = 0x10;
@@ -211,6 +212,25 @@ pub fn build_tcp_reset(src: SocketAddrV4, dst: SocketAddrV4, seq: u32, ack: Opti
     buf
 }
 
+/// The reset answering a TCP segment that belongs to no connection (RFC 793,
+/// "Reset Generation"), from its destination: at the sequence number the
+/// segment acknowledges; acknowledging nothing (a SYN), at 0, acknowledging
+/// all the segment occupies. A reset is never answered.
+pub fn reset_answering(buf: &[u8], p: &Packet) -> Option<Vec<u8>> {
+    if p.flags & TCP_RST != 0 {
+        return None;
+    }
+    let tcp = &buf[p.ihl..p.len];
+    if p.flags & TCP_ACK != 0 {
+        let ack = u32::from_be_bytes(tcp[8..12].try_into().expect("4 bytes"));
+        return Some(build_tcp_reset(p.dst, p.src, ack, None));
+    }
+    let data = tcp.len().saturating_sub((tcp[12] >> 4) as usize * 4);
+    let flags = (p.flags & TCP_SYN != 0) as usize + (p.flags & TCP_FIN != 0) as usize;
+    let ack = tcp_seq(buf, p).wrapping_add((data + flags) as u32);
+    Some(build_tcp_reset(p.dst, p.src, 0, Some(ack)))
+}
+
 /// ICMP "port unreachable" answering `orig`, sent as if from its destination:
 /// the kernel matches the quoted header to the program's socket and fails it
 /// with ECONNREFUSED. Quotes the IP header and the first 8 payload bytes
@@ -232,8 +252,6 @@ pub fn build_port_unreachable(orig: &[u8], p: &Packet) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    const TCP_FIN: u8 = 0x01;
 
     pub(crate) fn sa(s: &str) -> SocketAddrV4 {
         s.parse().unwrap()
@@ -372,5 +390,30 @@ pub(crate) mod tests {
     fn oversized_udp_payload_is_refused() {
         assert!(build_udp(sa("1.1.1.1:53"), sa("2.2.2.2:1"), &vec![0; 65507]).is_some());
         assert!(build_udp(sa("1.1.1.1:53"), sa("2.2.2.2:1"), &vec![0; 65508]).is_none());
+    }
+
+    #[test]
+    fn a_segment_of_no_connection_is_answered_as_rfc_793_says() {
+        let (prog, dst) = (sa("198.19.255.1:40000"), sa("198.18.0.9:443"));
+        let field = |b: &[u8], at: usize| u32::from_be_bytes(b[20 + at..24 + at].try_into().unwrap());
+        // With an ACK: a reset at the number it acknowledges, nothing more.
+        let mut data = tcp(prog, dst, TCP_ACK | TCP_FIN, b"hello");
+        data[28..32].copy_from_slice(&77u32.to_be_bytes());
+        let r = reset_answering(&data, &parse(&data).unwrap()).unwrap();
+        let rp = parse(&r).unwrap();
+        assert_eq!((rp.src, rp.dst, rp.flags), (dst, prog, TCP_RST));
+        assert_eq!(field(&r, 4), 77);
+        assert!(checksums_ok(&r));
+        // Without (a SYN): at 0, acknowledging all it occupies.
+        let syn = tcp(prog, dst, TCP_SYN, b"");
+        let r = reset_answering(&syn, &parse(&syn).unwrap()).unwrap();
+        assert_eq!(parse(&r).unwrap().flags, TCP_RST | TCP_ACK);
+        assert_eq!((field(&r, 4), field(&r, 8)), (0, 0x0102_0304 + 1));
+        let fin = tcp(prog, dst, TCP_FIN, b"abc");
+        let r = reset_answering(&fin, &parse(&fin).unwrap()).unwrap();
+        assert_eq!(field(&r, 8), 0x0102_0304 + 3 + 1, "data, then the FIN");
+        // Never a reset for a reset.
+        let rst = tcp(prog, dst, TCP_RST | TCP_ACK, b"");
+        assert_eq!(reset_answering(&rst, &parse(&rst).unwrap()), None);
     }
 }
