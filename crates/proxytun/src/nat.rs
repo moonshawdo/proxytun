@@ -79,7 +79,10 @@ pub struct Nat {
     addrs: u32,
     by_flow: HashMap<(SocketAddrV4, SocketAddrV4), Key>,
     by_key: HashMap<Key, Entry>,
-    /// Unused keys, oldest freed first: a just-closed one is the last to be
+    /// How many keys were ever handed out: those never used come first (see
+    /// `take_key`), with no list of a million unused keys kept for them.
+    fresh: u32,
+    /// Keys given back, oldest first: a just-closed one is the last to be
     /// reused, and finding one costs the same however full the table is (it
     /// runs on the TUN thread, under the lock).
     free: VecDeque<Key>,
@@ -101,11 +104,8 @@ impl Nat {
             addrs: addrs as u32,
             by_flow: HashMap::new(),
             by_key: HashMap::new(),
-            // Address after address for each port: consecutive connections
-            // use them all, not one until it runs out.
-            free: PORTS
-                .flat_map(|p| (0..addrs as u32).map(move |i| i << 16 | p as u32))
-                .collect(),
+            fresh: 0,
+            free: VecDeque::new(),
             embryonic: VecDeque::new(),
             queued: VecDeque::new(),
             closed: VecDeque::new(),
@@ -144,7 +144,7 @@ impl Nat {
         if !syn {
             return None;
         }
-        let key = self.free.pop_front()?;
+        let key = self.take_key()?;
         self.by_flow.insert((src, dst), key);
         self.by_key.insert(
             key,
@@ -257,6 +257,18 @@ impl Nat {
             }
         }
         gone
+    }
+
+    /// A key never used yet, else the one given back longest ago. Never-used
+    /// keys go address after address for each port: consecutive connections
+    /// use all addresses, not one until it runs out.
+    fn take_key(&mut self) -> Option<Key> {
+        if self.fresh < self.addrs * PORTS.len() as u32 {
+            let (n, addrs) = (self.fresh, self.addrs);
+            self.fresh += 1;
+            return Some((n % addrs) << 16 | (*PORTS.start() as u32 + n / addrs));
+        }
+        self.free.pop_front()
     }
 
     fn state(&self, key: Key) -> Option<State> {
@@ -374,6 +386,8 @@ mod tests {
         assert_eq!(n.inbound(p1), Some((dst, src)), "still translated");
         assert_eq!(n.sweep(t + LINGER), 1);
         assert_eq!(n.inbound(p1), None);
+        let p3 = n.outbound(sa("198.19.255.1:40009"), dst, true, t).unwrap();
+        assert_ne!(p3, p1, "a just-freed port is the last to be reused");
         assert_eq!(n.outbound(src, dst, false, t), Some(p2), "the flow is the new one's");
     }
 
@@ -552,5 +566,12 @@ mod tests {
             "took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn a_new_table_keeps_no_list_of_unused_ports() {
+        // A million keys at hand, none of them listed up front.
+        let n = Nat::new(FIRST, NAT_ADDRS);
+        assert!(n.free.capacity() < 1024, "{}", n.free.capacity());
     }
 }

@@ -124,9 +124,52 @@ pub struct Shared {
     pub relay_slots: Arc<tokio::sync::Semaphore>,
 }
 
+/// When an accept loop last reported trouble.
+#[derive(Default)]
+pub struct AcceptLog {
+    failed: Option<Instant>,
+    busy: Option<Instant>,
+}
+
+/// The next connection on `listener` that may be relayed, with its slot.
+/// accept failing (out of fds) fails again at once while connections wait:
+/// reported now and then, retried after a pause. A connection over
+/// `MAX_RELAYS` is reset, after `refused` cleans up after it, and the next
+/// one taken.
+pub async fn accept_with_slot(
+    listener: &TcpListener,
+    sh: &Shared,
+    what: &str,
+    log: &mut AcceptLog,
+    refused: impl Fn(SocketAddr),
+) -> (tokio::net::TcpStream, SocketAddr, tokio::sync::OwnedSemaphorePermit) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                if throttle::due(&mut log.failed, Instant::now(), throttle::EVERY) {
+                    tracing::warn!(
+                        "{what} accept: {e} (repeats within {}s not logged)",
+                        throttle::EVERY.as_secs()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+        };
+        match sh.relay_slots.clone().try_acquire_owned() {
+            Ok(slot) => return (stream, peer, slot),
+            Err(_) => {
+                refused(peer);
+                refuse_busy(sh, stream, &mut log.busy);
+            }
+        }
+    }
+}
+
 /// A connection over `MAX_RELAYS`: reset at once, so the program fails fast
 /// instead of waiting on a connection nobody serves.
-pub fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream, warned: &mut Option<Instant>) {
+fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream, warned: &mut Option<Instant>) {
     count(&sh.stats.relays_refused, 1);
     if throttle::due(warned, Instant::now(), throttle::EVERY) {
         tracing::warn!(
@@ -291,34 +334,19 @@ fn write_packet(tun: &OwnedFd, sh: &Shared, b: &[u8]) {
 
 /// Accept captured connections and relay each one.
 pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
-    let (mut warned, mut busy_warned) = (None, None);
+    let mut log = AcceptLog::default();
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                // Out of fds, it fails again at once as long as connections
-                // wait: said once in a while, not every 20 ms.
-                if throttle::due(&mut warned, Instant::now(), throttle::EVERY) {
-                    tracing::warn!(
-                        "relay accept: {e} (repeats within {}s not logged)",
-                        throttle::EVERY.as_secs()
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
-            }
-        };
-        let Ok(slot) = sh.relay_slots.clone().try_acquire_owned() else {
-            // Its entry ends here too, or it would wait for an accept forever.
+        let (stream, peer, slot) = accept_with_slot(&listener, &sh, "relay", &mut log, |peer| {
+            // Refused: its entry ends here too, or it would wait for an
+            // accept forever.
             if let SocketAddr::V4(p) = peer {
                 let mut nat = sh.nat();
                 if nat.accept(p).is_some() {
                     nat.close(p, Instant::now());
                 }
             }
-            refuse_busy(&sh, stream, &mut busy_warned);
-            continue;
-        };
+        })
+        .await;
         let id = sh.next_conn_id();
         // Every line about this connection names it. Error level: present
         // whenever anything is logged, so a proxy failing at warn names it too.
