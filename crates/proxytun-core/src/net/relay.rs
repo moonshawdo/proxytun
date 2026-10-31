@@ -62,7 +62,10 @@ pub struct Live {
 /// Build the per-connection state from a config. The program's own
 /// `*_proxy` variables are read from our environment, which it inherits.
 pub fn build_live(cfg: &Config) -> Result<Live> {
-    let env = env_proxies(std::env::vars());
+    // vars() would panic on one entry that is not UTF-8 (a GBK directory in
+    // PWD); no proxy URL is among those.
+    let env =
+        env_proxies(std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))));
     Ok(Live {
         policy: Policy::new(cfg, env)?,
         registry: Registry::build(cfg)?,
@@ -538,12 +541,16 @@ mod tests {
 
     #[tokio::test]
     async fn fake_ip_pin_is_held_for_the_connection_lifetime() {
-        use crate::net::fakeip::FakePool;
+        use crate::net::fakeip::{FakePool, REUSE_AFTER};
         let (proxy, _) = echo_socks5().await;
         let live = mk_live(proxy, "");
         let pool = FakePool::new("10.9.0.0/30".parse().unwrap());
-        let a = pool.alloc("a.test").unwrap();
-        let b = pool.alloc("b.test").unwrap();
+        // Time is driven by hand: a slot is recycled only once its last use
+        // is REUSE_AFTER old.
+        let t = std::time::Instant::now();
+        let at = |n: u32| t + n * REUSE_AFTER;
+        let a = pool.alloc_at("a.test", at(0)).unwrap();
+        let b = pool.alloc_at("b.test", at(0)).unwrap();
         let (dom, guard) = pool.acquire(a).unwrap();
         let pend = Pending {
             target: Target::Domain(dom, 80),
@@ -555,16 +562,17 @@ mod tests {
         c.read_exact(&mut buf).await.unwrap();
         // While the connection is open `a` is pinned: churn through the other
         // slot as hard as we like, `a` must keep its mapping.
-        assert_eq!(pool.alloc("c.test").unwrap(), b);
+        assert_eq!(pool.alloc_at("c.test", at(2)).unwrap(), b);
         for i in 0..5 {
-            pool.alloc(&format!("churn{i}.test")).unwrap();
+            pool.alloc_at(&format!("churn{i}.test"), at(4 + 2 * i)).unwrap();
         }
         assert_eq!(pool.lookup(a).as_deref(), Some("a.test"));
         drop(c);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        // Pin released: `a` is now the oldest entry and gets recycled.
-        pool.alloc("after1.test").unwrap();
-        pool.alloc("after2.test").unwrap();
+        // Pin released (and used just now): once that use is old enough, `a`
+        // is the oldest entry and gets recycled.
+        pool.alloc_at("after1.test", at(20)).unwrap();
+        pool.alloc_at("after2.test", at(22)).unwrap();
         assert_ne!(pool.lookup(a).as_deref(), Some("a.test"));
     }
 

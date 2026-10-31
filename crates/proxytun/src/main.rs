@@ -95,7 +95,7 @@ struct Cli {
     // Parsing stops at the program name, so its own options (`-c` there) are
     // not taken for ours, as with proxychains and graftcp.
     #[arg(trailing_var_arg = true, required_unless_present = "doctor")]
-    argv: Vec<String>,
+    argv: Vec<std::ffi::OsString>,
 }
 
 impl Cli {
@@ -133,12 +133,13 @@ fn init_logging(filter: &str, file: Option<&Path>) -> Result<()> {
         // file close-on-exec, so the program inherits neither.
         Some(path) => {
             // Not through a link, and only into a file of our own: in /tmp,
-            // someone else may have created it first, readable by them.
+            // someone else may have created it first, readable by them, or as
+            // a FIFO nobody reads, which would block a plain open forever.
             let f = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(path)
                 .with_context(|| format!("open log file {}", path.display()))?;
             let meta = f.metadata()?;
@@ -161,7 +162,7 @@ fn main() -> Result<()> {
     let mode = std::env::args_os().nth(1);
     if mode.as_deref() == Some(std::ffi::OsStr::new(sudo::HELPER_ARG)) {
         // The root helper, run through sudo (it checks that itself).
-        sudo::helper_main(&std::env::args().collect::<Vec<_>>());
+        sudo::helper_main(&std::env::args_os().collect::<Vec<_>>());
     }
     // Everything else, the namespace setup included, must not run as root
     // through sudo or setuid.
@@ -171,7 +172,7 @@ fn main() -> Result<()> {
     }
     if mode.as_deref() == Some(std::ffi::OsStr::new(netns::SETUP_ARG)) {
         // The process that sets up the namespace and becomes the program.
-        netns::setup_main(&std::env::args().collect::<Vec<_>>());
+        netns::setup_main(&std::env::args_os().collect::<Vec<_>>());
     }
     let cli = Cli::parse();
     init_logging(

@@ -57,8 +57,9 @@ proxytun(主机网络,普通用户)
 sudo 模式的安全边界:
 
 - 特权助手只接受由 sudo 启动(real 与 effective uid 都是 0);以 setuid 方式启动直接拒绝(那时 `SUDO_UID` 可以伪造)。
-- 它以你的文件权限去连 socket,并且只为运行 sudo 的那个进程服务:socket 的创建者必须是它自己的祖先进程,且属于 `SUDO_UID`;
-  程序的 gid 和附加组取自你的进程在 `/proc` 里的记录,不信任请求里自报的身份。
+- 它以你的身份(有效 uid/gid)去连 socket,对方看到的是你而不是 root;只为运行 sudo 的那个进程服务:socket 的创建者必须是
+  它自己的祖先进程,且属于 `SUDO_UID`,否则直接断开、什么也不告诉对方。程序的 gid 和附加组取自你的进程在 `/proc` 里的记录,
+  不信任请求里自报的身份。
 - 请求的每个字段都重新校验(假 IP 段 /8–/22、进程组必须是调用者自己的、只转发回环地址且不超过 250 个),10 秒内收不到请求就退出。
 - 不读配置、不以 root 打开你给的任何路径。程序先完全降权并设置 `no_new_privs`(命名空间里的网络由你控制,不能让 `sudo`、`su`
   这类 setuid 程序在里面重新拿到 root),再进入你的工作目录、按你的 `PATH` 找程序;助手把 fd 交回后立即退出。
@@ -67,6 +68,8 @@ sudo 模式的安全边界:
 
 proxytun 拒绝经 sudo、doas、pkexec 或 setuid 以 root 身份运行(只有特权助手例外),内部的命名空间准备入口也一样:
 即使 sudoers 只放行了 proxytun,也拿不到一个 root 程序。需要 root 模式,请以 root 登录(或 `su -`)后运行。`--no-sudo` 禁止回退到 sudo。
+proxytun 只认得 sudo、doas、pkexec 和 setuid 这几种提权方式:**只用 sudo 授权 proxytun**,不要用 ksu、userhelper/consolehelper、
+`systemd-run --uid=0` 等其他方式让普通用户以 root 运行它。这些方式不留可识别的痕迹,proxytun 会当成真正的 root,程序保持 root。
 
 sudo 以 root 身份执行 proxytun 自己的可执行文件,所以要放在只有 root 能写的位置(普通用户能改它,就等于能以 root 执行任意代码)。
 想免密码时,只放行特权助手:

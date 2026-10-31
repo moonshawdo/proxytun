@@ -2076,7 +2076,7 @@ fn under_sudo_a_setuid_program_cannot_regain_root() {
 /// A client of the root helper that is not proxytun: it runs sudo itself
 /// and then misbehaves, or is merely slow, as `case` says.
 const PY_HELPER_CLIENT: &str = r#"
-import os, socket, subprocess, sys, time
+import os, socket, struct, subprocess, sys, time
 binary, d, case = sys.argv[1:4]
 path = os.path.join(d, "ctl-" + case)
 helper = ["sudo", "--", binary, "__proxytun_root_setup", path]
@@ -2095,6 +2095,8 @@ if case == "stranger":
         l = listener()
         os.write(w, b"x")
         c, _ = l.accept()
+        uid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        print("peer uid:", uid, flush=True)
         print("got:", c.recv(4096).decode(errors="replace"), flush=True)
         os._exit(0)
     os.read(r, 1)
@@ -2149,10 +2151,13 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     assert_eq!(out.code, 0, "{}", out.dump());
     let got = |c: &str| std::fs::read_to_string(dir.join(format!("out-{c}"))).unwrap();
     let all = || cases.map(|c| format!("--- {c} ---\n{}", got(c))).join("\n");
-    // A socket that is not the sudo caller's own: someone else's proxytun,
-    // or anything listening.
+    // A socket that is not the sudo caller's own (someone else's proxytun, or
+    // anything listening) sees the user connecting, not root, and is told
+    // nothing.
+    assert!(got("stranger").contains("peer uid: 1000\n"), "{}", all());
+    assert!(got("stranger").contains("got: \n"), "{}", all());
     assert!(
-        got("stranger").contains("got: ERR sudo helper: the socket was not created by the process that ran sudo"),
+        got("stranger").contains("the socket was not created by the process that ran sudo"),
         "{}",
         all()
     );
@@ -2236,13 +2241,15 @@ fn the_log_file_is_never_someone_elses_nor_a_link() {
     // Another user got there first, with a file anyone may write and they
     // may read; or a link to wherever.
     // (A copy of proxytun: the user cannot reach our build directory.)
-    let root = "touch \"$D/theirs\" && chmod 666 \"$D/theirs\" && cp \"$BIN\" \"$D/pt\"";
+    let root = "touch \"$D/theirs\" && chmod 666 \"$D/theirs\" && mkfifo -m 666 \"$D/fifo\" && cp \"$BIN\" \"$D/pt\"";
     let user = "ln -s \"$D/own\" \"$D/link\"; \
         \"$D/pt\" -v -c \"$D/cfg.toml\" --log-file \"$D/theirs\" -- true; echo theirs=$?; \
-        \"$D/pt\" -v -c \"$D/cfg.toml\" --log-file \"$D/link\" -- true; echo link=$?";
+        \"$D/pt\" -v -c \"$D/cfg.toml\" --log-file \"$D/link\" -- true; echo link=$?; \
+        timeout 10 \"$D/pt\" -v -c \"$D/cfg.toml\" --log-file \"$D/fifo\" -- true; echo fifo=$?";
     let out = sh_like_centos7(&dir, root, user);
     let codes: Vec<&str> = out.stdout.lines().collect();
-    assert_eq!(codes, ["theirs=1", "link=1"], "{}", out.dump());
+    // (A FIFO nobody reads: refused at once, not waited on.)
+    assert_eq!(codes, ["theirs=1", "link=1", "fifo=1"], "{}", out.dump());
     assert!(out.stderr.contains("is not a regular file of yours"), "{}", out.dump());
     // ELOOP, worded differently by glibc and musl.
     assert!(out.stderr.contains("(os error 40)"), "{}", out.dump());
@@ -2256,37 +2263,78 @@ fn the_log_file_is_never_someone_elses_nor_a_link() {
 
 #[test]
 fn under_sudo_the_program_keeps_the_users_limits_umask_and_fds() {
-    require_centos7!();
+    require_centos7!("bash");
     let dir = shared_dir("sudo-parity");
     write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
     std::fs::write(dir.join("five"), "inherited\n").unwrap();
+    for n in 20..=60 {
+        std::fs::write(dir.join(format!("f{n}")), format!("{n},")).unwrap();
+    }
     // What the program sees of its process: sudo gives root other limits and
     // umask and closes inherited fds; none of that may reach the program.
-    let probe = "ulimit -Sn; ulimit -Hn; umask; cat <&5; echo to-seven >&7; ls /proc/self/fd | tr '\\n' ' '";
-    let script = |pt: &str| {
-        format!("ulimit -Sn 777; umask 002; exec 5<\"$D/five\" 7>&1; {pt} -c \"$D/cfg.toml\" -- sh -c \"{probe}\"")
-    };
+    // Two inherited fds sit right under the fd limit, where they must stay;
+    // a band of them (each its own file) covers the numbers that are free
+    // while they are put in place, so none may end up on another's number.
+    std::fs::write(
+        dir.join("parity.sh"),
+        r#"ulimit -Sn 777; umask 002; exec 775<"$D/five" 776>&1
+for n in $(seq 20 60); do eval "exec $n<\"\$D/f$n\""; done
+exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; umask; cat <&775; echo to-776 >&776;
+  for n in $(seq 20 60); do cat <&$n; done; echo; ls /proc/self/fd | sort -n | tr "\n" " "'
+"#,
+    )
+    .unwrap();
     // Without sudo (user namespaces), as the reference.
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(script("\"$BIN\""));
-    let plain = run_cmd(cmd, &[("BIN", BIN), ("D", dir.to_str().unwrap())]);
+    let mut cmd = Command::new("bash");
+    cmd.arg(dir.join("parity.sh"));
+    let plain = run_cmd(cmd, &[("PT", BIN), ("D", dir.to_str().unwrap())]);
     assert_eq!(plain.code, 0, "{}", plain.dump());
     assert!(!plain.stderr.contains("asking sudo"), "{}", plain.dump());
     let lines: Vec<&str> = plain.stdout.lines().collect();
-    assert_eq!(lines.len(), 6, "{}", plain.dump());
+    assert_eq!(lines.len(), 7, "{}", plain.dump());
     assert_eq!(lines[0], "777", "{}", plain.dump());
+    let band: Vec<String> = (20..=60).map(|n| n.to_string()).collect();
     assert_eq!(
         lines[2..],
-        ["0002", "inherited", "to-seven", "0 1 2 3 5 7 "],
+        [
+            "0002".to_string(),
+            "inherited".into(),
+            "to-776".into(),
+            format!("{},", band.join(",")),
+            format!("0 1 2 3 {} 775 776 ", band.join(" ")),
+        ],
         "{}",
         plain.dump()
     );
     // Through sudo, the same. (A copy of proxytun: the user cannot reach our
     // build directory.)
-    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", &script("\"$D/pt\""));
+    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", "PT=\"$D/pt\" bash \"$D/parity.sh\"");
     assert_eq!(out.code, 0, "{}", out.dump());
     assert!(out.stderr.contains("asking sudo"), "{}", out.dump());
     assert_eq!(out.stdout, plain.stdout, "{}", out.dump());
+}
+
+#[test]
+fn arguments_and_environment_need_not_be_utf8() {
+    require_centos7!();
+    let dir = shared_dir("not-utf8");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // As with GBK file names and directories (in $PWD) on CentOS 7: the
+    // program gets the very bytes, in either mode.
+    std::fs::write(
+        dir.join("odd.sh"),
+        r#"BAD=$(printf '\377'); export BAD
+exec "$PT" -c "$D/cfg.toml" -- sh -c 'printf "%s|%s" "$1" "$BAD" | od -An -tx1 | tr -d " \n"' sh "$(printf '\304\343')"
+"#,
+    )
+    .unwrap();
+    let mut cmd = Command::new("sh");
+    cmd.arg(dir.join("odd.sh"));
+    let plain = run_cmd(cmd, &[("PT", BIN), ("D", dir.to_str().unwrap())]);
+    assert_eq!((plain.code, plain.stdout.as_str()), (0, "c4e37cff"), "{}", plain.dump());
+    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", "PT=\"$D/pt\" sh \"$D/odd.sh\"");
+    assert!(out.stderr.contains("asking sudo"), "{}", out.dump());
+    assert_eq!((out.code, out.stdout.as_str()), (0, "c4e37cff"), "{}", out.dump());
 }
 
 #[test]

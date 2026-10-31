@@ -3,16 +3,25 @@
 //! hostname all the way to the proxy.
 //!
 //! Lifecycle: addresses are handed out sequentially; once the range is used up,
-//! the least-recently-used mapping that has no live connection is recycled.
-//! Every lookup refreshes recency, and `acquire` pins a mapping while a
-//! connection that was resolved through it is alive (so a busy long-lived
-//! connection can never have its domain pulled out from under it). If every
-//! entry is pinned the pool reports `PoolFull` instead of overwriting.
+//! the least-recently-used mapping that has no live connection is recycled,
+//! but only once `REUSE_AFTER` (the TTL of our answers) has passed since it
+//! was last handed out or used: until then the program may still connect to
+//! it from its cache, and must not reach another name that way. Every lookup
+//! refreshes recency, and `acquire` pins a mapping while a connection that was
+//! resolved through it is alive (so a busy long-lived connection can never
+//! have its domain pulled out from under it); pinned mappings leave the
+//! recycling order until released. With nothing recyclable the pool reports
+//! `PoolFull` instead of overwriting.
 
 use ipnet::Ipv4Net;
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// How long a mapping stays out of reach of recycling after its last use:
+/// the TTL our DNS answers carry.
+pub const REUSE_AFTER: Duration = Duration::from_secs(super::dns::FAKE_TTL as u64);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PoolFull;
@@ -23,6 +32,8 @@ pub struct FakePool(Arc<Mutex<Inner>>);
 struct Entry {
     domain: String,
     tick: u64,
+    /// When it was last handed out or used.
+    used: Instant,
     active: u32,
 }
 
@@ -36,7 +47,7 @@ struct Inner {
     clock: u64,
     entries: HashMap<u32, Entry>,
     by_domain: HashMap<String, u32>,
-    /// tick -> offset, oldest first.
+    /// tick -> offset, oldest first; unpinned entries only.
     lru: BTreeMap<u64, u32>,
 }
 
@@ -57,18 +68,25 @@ impl Drop for FakeGuard {
         let mut g = self.pool.lock();
         if let Some(e) = g.entries.get_mut(&self.off) {
             e.active = e.active.saturating_sub(1);
+            if e.active == 0 {
+                // Recyclable again, as the most recently used.
+                g.touch(self.off, Instant::now());
+            }
         }
     }
 }
 
 impl Inner {
-    fn touch(&mut self, off: u32) {
+    fn touch(&mut self, off: u32, now: Instant) {
         self.clock += 1;
-        let now = self.clock;
+        let tick = self.clock;
         if let Some(e) = self.entries.get_mut(&off) {
             self.lru.remove(&e.tick);
-            e.tick = now;
-            self.lru.insert(now, off);
+            e.tick = tick;
+            e.used = now;
+            if e.active == 0 {
+                self.lru.insert(tick, off);
+            }
         }
     }
 
@@ -114,10 +132,14 @@ impl FakePool {
 
     /// Allocate (or reuse) a fake IP for a domain. Names are case-insensitive.
     pub fn alloc(&self, domain: &str) -> Result<Ipv4Addr, PoolFull> {
+        self.alloc_at(domain, Instant::now())
+    }
+
+    pub(crate) fn alloc_at(&self, domain: &str, now: Instant) -> Result<Ipv4Addr, PoolFull> {
         let domain = domain.to_ascii_lowercase();
         let mut g = self.lock();
         if let Some(&off) = g.by_domain.get(&domain) {
-            g.touch(off);
+            g.touch(off, now);
             return Ok(g.ip(off));
         }
 
@@ -126,15 +148,14 @@ impl FakePool {
             g.next_free += 1;
             o
         } else {
-            // Recycle the oldest mapping that no live connection is using.
-            let victim = g
-                .lru
-                .iter()
-                .map(|(_, &off)| off)
-                .find(|off| g.entries[off].active == 0)
-                .ok_or(PoolFull)?;
+            // Recycle the oldest mapping no live connection is using, if no
+            // program can still hold it from our answer.
+            let (&tick, &victim) = g.lru.iter().next().ok_or(PoolFull)?;
+            if now.saturating_duration_since(g.entries[&victim].used) < REUSE_AFTER {
+                return Err(PoolFull);
+            }
+            g.lru.remove(&tick);
             let old = g.entries.remove(&victim).expect("lru entry exists");
-            g.lru.remove(&old.tick);
             g.by_domain.remove(&old.domain);
             victim
         };
@@ -144,11 +165,12 @@ impl FakePool {
             Entry {
                 domain: domain.clone(),
                 tick: 0,
+                used: now,
                 active: 0,
             },
         );
         g.by_domain.insert(domain, off);
-        g.touch(off);
+        g.touch(off, now);
         Ok(g.ip(off))
     }
 
@@ -157,7 +179,7 @@ impl FakePool {
         let mut g = self.lock();
         let off = g.off_of(ip)?;
         let domain = g.entries.get(&off)?.domain.clone();
-        g.touch(off);
+        g.touch(off, Instant::now());
         Some(domain)
     }
 
@@ -168,7 +190,7 @@ impl FakePool {
         let e = g.entries.get_mut(&off)?;
         e.active += 1;
         let domain = e.domain.clone();
-        g.touch(off);
+        g.touch(off, Instant::now()); // pinned: out of the recycling order
         drop(g);
         Some((
             domain,
@@ -236,11 +258,12 @@ mod tests {
     fn tiny_range_recycles_least_recently_used() {
         // /30 => 2 usable addresses.
         let p = pool("10.0.0.0/30");
-        let a = p.alloc("a.com").unwrap();
-        let b = p.alloc("b.com").unwrap();
+        let t = Instant::now();
+        let a = p.alloc_at("a.com", t).unwrap();
+        let b = p.alloc_at("b.com", t).unwrap();
         // Touch a so b is the LRU victim.
         assert_eq!(p.lookup(a).as_deref(), Some("a.com"));
-        let c = p.alloc("c.com").unwrap();
+        let c = p.alloc_at("c.com", t + 2 * REUSE_AFTER).unwrap();
         assert_eq!(c, b, "oldest mapping's address is recycled");
         assert_eq!(p.lookup(c).as_deref(), Some("c.com"));
         assert_eq!(p.lookup(a).as_deref(), Some("a.com"));
@@ -254,12 +277,44 @@ mod tests {
         let b = p.alloc("b.com").unwrap();
         let (_, ga) = p.acquire(a).unwrap();
         let (_, gb) = p.acquire(b).unwrap();
-        assert_eq!(p.alloc("c.com"), Err(PoolFull));
+        let later = Instant::now() + 2 * REUSE_AFTER;
+        assert_eq!(p.alloc_at("c.com", later), Err(PoolFull));
         // Releasing one pin frees exactly that slot.
         drop(ga);
-        let c = p.alloc("c.com").unwrap();
+        let c = p.alloc_at("c.com", later + 2 * REUSE_AFTER).unwrap();
         assert_eq!(c, a);
         drop(gb);
+    }
+
+    #[test]
+    fn an_address_a_program_may_still_have_cached_goes_to_no_other_name() {
+        let p = pool("10.0.0.0/30");
+        let t = Instant::now();
+        let a = p.alloc_at("a.com", t).unwrap();
+        p.alloc_at("b.com", t).unwrap();
+        // Within the TTL of our answer, a.com's address may still be in the
+        // program's cache: handing it to c.com would send that traffic there.
+        assert_eq!(p.alloc_at("c.com", t + REUSE_AFTER / 2), Err(PoolFull));
+        // Asked again meanwhile: the clock restarts.
+        p.alloc_at("a.com", t + REUSE_AFTER / 2).unwrap();
+        assert_ne!(p.alloc_at("c.com", t + REUSE_AFTER).unwrap(), a, "b.com's time is up");
+        assert_eq!(p.alloc_at("d.com", t + REUSE_AFTER).unwrap_err(), PoolFull);
+        assert_eq!(p.alloc_at("d.com", t + 2 * REUSE_AFTER).unwrap(), a);
+    }
+
+    #[test]
+    fn recycling_does_not_walk_past_pinned_entries() {
+        let p = pool("10.0.0.0/22");
+        let t = Instant::now();
+        let ips: Vec<Ipv4Addr> = (0..1022)
+            .map(|i| p.alloc_at(&format!("d{i}.test"), t).unwrap())
+            .collect();
+        // The oldest half pinned by live connections; they are out of the way.
+        let guards: Vec<FakeGuard> = ips[..511].iter().map(|&ip| p.acquire(ip).unwrap().1).collect();
+        assert_eq!(p.lock().lru.len(), 511);
+        assert_eq!(p.alloc_at("new.test", t + REUSE_AFTER).unwrap(), ips[511]);
+        drop(guards);
+        assert_eq!(p.lock().lru.len(), 1022, "released: recyclable again");
     }
 
     #[test]
@@ -315,7 +370,7 @@ mod tests {
         assert_eq!(ips[0], Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(*ips.last().unwrap(), Ipv4Addr::new(10, 0, 2, 254));
         // Full: the next name recycles the oldest instead of entering 10.0.3.0/24.
-        assert_eq!(p.alloc("one.more").unwrap(), ips[0]);
+        assert_eq!(p.alloc_at("one.more", Instant::now() + REUSE_AFTER).unwrap(), ips[0]);
         assert_eq!(p.len(), 766);
         assert_eq!(p.lookup(Ipv4Addr::new(10, 0, 3, 1)), None);
     }

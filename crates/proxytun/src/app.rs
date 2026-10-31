@@ -27,7 +27,7 @@ pub struct Args {
     pub proxy: Option<String>,
     pub no_sudo: bool,
     pub no_host_ports: bool,
-    pub argv: Vec<String>,
+    pub argv: Vec<std::ffi::OsString>,
 }
 
 /// Read an environment variable that may hold a secret, then destroy it: the
@@ -76,7 +76,7 @@ pub fn run(args: Args) -> Result<i32> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         pid = std::process::id(),
-        program = args.argv.first().map_or("", String::as_str),
+        program = %args.argv.first().map(|a| a.to_string_lossy()).unwrap_or_default(),
         "starting"
     );
     // Our memory holds proxy credentials (config, $PROXYTUN_PROXY). Without
@@ -151,9 +151,10 @@ pub fn run(args: Args) -> Result<i32> {
             if !joined {
                 tracing::warn!(
                     "sudo started the program in a terminal session of its own (sudoers `use_pty`?): \
-                     it now runs in a session of its own without a controlling terminal; proxytun \
+                     it now runs in a session of its own without a controlling terminal: proxytun \
                      passes Ctrl+C and Ctrl+\\ on to it, but job control (Ctrl+Z) and window size \
-                     changes do not reach it"
+                     changes do not reach it, and programs that open /dev/tty (password prompts of \
+                     ssh, git, sudo) fail"
                 );
             }
             (child, ns)
@@ -376,9 +377,13 @@ fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option
                 tracing::info!(sig, code, "exiting on a signal");
                 std::process::exit(code)
             }
-            let witness = witness.clone();
+            let (witness, main_pid) = (witness.clone(), main_pid.clone());
             tokio::spawn(async move {
                 tokio::time::sleep(WITNESS_DELAY).await;
+                // Reaped meanwhile: the pid may already be someone else's.
+                if main_pid.load(Ordering::SeqCst) != pid {
+                    return;
+                }
                 let group = action == ExitSignal::Terminal || witness.as_ref().is_some_and(|w| w.saw(sig));
                 // SAFETY: plain syscall.
                 let ours = unsafe { libc::getpgrp() };

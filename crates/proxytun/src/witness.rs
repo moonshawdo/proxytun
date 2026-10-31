@@ -110,7 +110,7 @@ unsafe fn witness_loop(ctl: libc::c_int, back: libc::c_int, set: &libc::sigset_t
     }
     // Only the watched signals may reach it: a terminal hangup (SIGHUP to the
     // foreground group) or Ctrl+Z must neither kill nor stop the witness.
-    for sig in 1..libc::SIGRTMAX() {
+    for sig in 1..=libc::SIGRTMAX() {
         if libc::sigismember(set, sig) == 0 && sig != libc::SIGKILL && sig != libc::SIGSTOP {
             libc::signal(sig, libc::SIG_IGN);
         }
@@ -192,7 +192,14 @@ mod tests {
         let pid = w.pid;
         let all = watched.iter().fold(0, |m, &s| m | bit(s));
         assert_eq!(status(pid, "SigBlk:") & all, all, "watched signals stay pending");
-        for s in [libc::SIGHUP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGUSR1, libc::SIGPIPE] {
+        for s in [
+            libc::SIGHUP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGUSR1,
+            libc::SIGPIPE,
+            libc::SIGRTMAX(),
+        ] {
             assert_ne!(status(pid, "SigIgn:") & bit(s), 0, "signal {s} would kill or stop it");
         }
         assert_eq!(

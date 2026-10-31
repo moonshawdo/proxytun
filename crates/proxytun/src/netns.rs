@@ -18,10 +18,11 @@ use nix::sched::{unshare, CloneFlags};
 use nix::sys::socket::{
     recvmsg, sendmsg, socketpair, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
 };
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::io::{IoSlice, IoSliceMut};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 pub const TUN_NAME: &CStr = c"tun0";
@@ -106,7 +107,7 @@ pub const SETUP_ARG: &str = "__proxytun_setup";
 /// What the setup process needs; passed on its command line.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Setup {
-    pub argv: Vec<String>,
+    pub argv: Vec<OsString>,
     pub fake_range: Ipv4Net,
     /// Host loopback listeners to bind inside (see hostports.rs).
     pub forwards: Vec<SocketAddr>,
@@ -129,20 +130,22 @@ pub fn split_addrs(s: &str) -> Option<Vec<SocketAddr>> {
 
 impl Setup {
     /// `proxytun SETUP_ARG <ctl fd> <fake range> <forwards> -- argv...`
-    fn to_args(&self, exe: &str, ctl: RawFd) -> Vec<String> {
-        let mut a = vec![
+    fn to_args(&self, exe: &str, ctl: RawFd) -> Vec<OsString> {
+        let mut a: Vec<OsString> = [
             exe.to_string(),
             SETUP_ARG.to_string(),
             ctl.to_string(),
             self.fake_range.to_string(),
             join_addrs(&self.forwards),
             "--".to_string(),
-        ];
+        ]
+        .map(OsString::from)
+        .into();
         a.extend(self.argv.iter().cloned());
         a
     }
 
-    fn from_args(args: &[String]) -> Option<(Setup, RawFd)> {
+    fn from_args(args: &[OsString]) -> Option<(Setup, RawFd)> {
         let [_, mode, ctl, range, forwards, dashes, argv @ ..] = args else {
             return None;
         };
@@ -151,10 +154,10 @@ impl Setup {
         }
         let setup = Setup {
             argv: argv.to_vec(),
-            fake_range: range.parse().ok()?,
-            forwards: split_addrs(forwards)?,
+            fake_range: range.to_str()?.parse().ok()?,
+            forwards: split_addrs(forwards.to_str()?)?,
         };
-        Some((setup, ctl.parse().ok()?))
+        Some((setup, ctl.to_str()?.parse().ok()?))
     }
 }
 
@@ -318,7 +321,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
     let args: Vec<CString> = s
         .to_args("proxytun", theirs.as_raw_fd())
         .into_iter()
-        .map(|a| CString::new(a).context("argument contains NUL"))
+        .map(|a| CString::new(a.into_vec()).context("argument contains NUL"))
         .collect::<Result<_>>()?;
     let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
     ptrs.push(std::ptr::null());
@@ -351,7 +354,7 @@ fn reap(pid: libc::pid_t) {
 
 /// Entry point of the setup process (`proxytun SETUP_ARG ...`). Never
 /// returns: it becomes the program, or exits with 125-127 on failure.
-pub fn setup_main(args: &[String]) -> ! {
+pub fn setup_main(args: &[OsString]) -> ! {
     let Some((s, ctl)) = Setup::from_args(args) else {
         eprintln!("proxytun: {SETUP_ARG} is internal to proxytun");
         std::process::exit(2);
@@ -531,8 +534,8 @@ fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
 /// exec; proxytun blocked some signals for its signalfd. Signals the caller
 /// ignored (nohup, `cmd &`) stay ignored by themselves: dispositions survive
 /// both execs and proxytun installs its own handlers only after the fork.
-pub fn exec(argv: &[String]) -> i32 {
-    let argv: Vec<CString> = match argv.iter().map(|a| CString::new(a.as_str())).collect() {
+pub fn exec(argv: &[OsString]) -> i32 {
+    let argv: Vec<CString> = match argv.iter().map(|a| CString::new(a.as_bytes())).collect() {
         Ok(v) => v,
         Err(_) => return 127, // checked by proxytun before we got here
     };
@@ -589,6 +592,12 @@ mod tests {
         };
         assert_eq!(Setup::from_args(&none.to_args("p", 3)), Some((none, 3)));
         assert_eq!(Setup::from_args(&["p".into(), SETUP_ARG.into()]), None, "truncated");
+        let odd = Setup {
+            argv: vec!["cat".into(), OsString::from_vec(b"\xc4\xe3.txt".to_vec())],
+            fake_range: "10.0.0.0/8".parse().unwrap(),
+            forwards: vec![],
+        };
+        assert_eq!(Setup::from_args(&odd.to_args("p", 3)), Some((odd, 3)), "not UTF-8");
     }
 
     #[test]

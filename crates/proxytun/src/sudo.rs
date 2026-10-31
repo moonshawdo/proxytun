@@ -6,8 +6,9 @@
 //! `sudo -- <proxytun> HELPER_ARG <socket>` (sudo closes inherited fds, hence
 //! the socket path). The helper, as root:
 //!   * runs only when started by sudo (real and effective uid 0), never setuid;
-//!   * reaches the socket with the caller's file permissions, and serves only
-//!     the process that ran sudo: the socket's creator must be one of its own
+//!   * reaches the socket as the caller (effective uid and gid theirs, so
+//!     whatever listens there sees them, not root), and serves only the
+//!     process that ran sudo: the socket's creator must be one of its own
 //!     ancestors (alive, so its pid cannot have been reused) and belong to
 //!     SUDO_UID; the program's gid and groups are read from that process in
 //!     /proc (kernel-provided), never from the request;
@@ -61,7 +62,7 @@ struct Request {
     /// The fds the program inherits, by their numbers in proxytun. They
     /// follow the four fixed ones in the message, in this order.
     inherit: Vec<RawFd>,
-    argv: Vec<String>,
+    argv: Vec<OsString>,
     env: Vec<OsString>,
 }
 
@@ -113,7 +114,9 @@ impl Request {
             list => list.split(',').map(|n| n.parse().ok()).collect::<Option<_>>()?,
         };
         let argc: usize = text()?.parse().ok()?;
-        let argv = (0..argc).map(|_| text()).collect::<Option<Vec<_>>>()?;
+        let argv: Vec<OsString> = (0..argc)
+            .map(|_| fields.next().map(|a| OsString::from_vec(a.to_vec())))
+            .collect::<Option<_>>()?;
         if argv.is_empty() {
             return None;
         }
@@ -202,6 +205,9 @@ pub fn root_refusal_here() -> Option<String> {
 /// working directory.
 const MAX_INHERIT: usize = 249;
 
+/// No fd number reaches this (the kernel's default fs.nr_open).
+const FD_CEILING: RawFd = 1 << 20;
+
 /// How long the helper waits for its client.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -234,7 +240,10 @@ fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
     );
     let mut seen = std::collections::HashSet::new();
     for &n in &req.inherit {
-        ensure!(n >= 3 && seen.insert(n), "inherited fd {n} not allowed");
+        ensure!(
+            (3..FD_CEILING).contains(&n) && seen.insert(n),
+            "inherited fd {n} not allowed"
+        );
     }
     Ok(())
 }
@@ -294,26 +303,29 @@ fn ancestor_within(
     false
 }
 
-/// Run `f` with the file permissions of `uid`/`gid` and no supplementary
-/// groups: what the caller cannot reach, root does not reach for it either.
-/// fsuid != 0 also drops the file capabilities for the duration.
+/// Run `f` as the caller: effective uid and gid `uid`/`gid`, no
+/// supplementary groups, no capabilities. What the caller cannot reach, root
+/// does not reach for them, and a socket connected meanwhile carries their
+/// credentials, not root's, to whatever listens there. The saved uid stays 0
+/// to come back.
 fn as_caller<T>(uid: libc::uid_t, gid: libc::gid_t, f: impl FnOnce() -> T) -> Result<T> {
-    // SAFETY: plain syscalls on our own credentials.
+    const KEEP: u32 = u32::MAX; // -1: leave this id as it is
+                                // SAFETY: plain syscalls on our own credentials.
     unsafe {
-        if libc::setgroups(0, std::ptr::null()) != 0 {
-            bail!("setgroups: {}", std::io::Error::last_os_error());
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setresgid(KEEP, gid, KEEP) != 0
+            || libc::setresuid(KEEP, uid, KEEP) != 0
+        {
+            bail!("taking the caller's identity: {}", std::io::Error::last_os_error());
         }
-        libc::setfsgid(gid);
-        libc::setfsuid(uid);
-        // setfsuid reports the previous value; asking again confirms it took.
-        let (fu, fg) = (libc::setfsuid(u32::MAX), libc::setfsgid(u32::MAX));
         ensure!(
-            fu as u32 == uid && fg as u32 == gid,
-            "could not take the caller's file permissions"
+            libc::geteuid() == uid && libc::getegid() == gid,
+            "could not take the caller's identity"
         );
         let r = f();
-        libc::setfsuid(0);
-        libc::setfsgid(0);
+        if libc::setresuid(KEEP, 0, KEEP) != 0 || libc::setresgid(KEEP, 0, KEEP) != 0 {
+            bail!("back to root: {}", std::io::Error::last_os_error());
+        }
         Ok(r)
     }
 }
@@ -385,9 +397,10 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
         std::thread::sleep(Duration::from_millis(20));
     };
     let cred = getsockopt(&ctl, sockopt::PeerCredentials).context("SO_PEERCRED")?;
+    // The helper connects as us (see `as_caller`).
     ensure!(
-        cred.uid() == 0,
-        "the helper socket was answered by uid {}, not root",
+        cred.uid() == nix::unistd::getuid().as_raw(),
+        "the helper socket was answered by uid {}, not on our behalf",
         cred.uid()
     );
 
@@ -453,7 +466,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
 
 /// Entry point of the root helper (`proxytun HELPER_ARG <socket>`). Never
 /// returns.
-pub fn helper_main(args: &[String]) -> ! {
+pub fn helper_main(args: &[OsString]) -> ! {
     let code = match helper(args) {
         Ok(()) => 0,
         Err(e) => {
@@ -476,7 +489,7 @@ fn refuse(ctl: &OwnedFd, e: anyhow::Error) -> Result<()> {
     Err(e)
 }
 
-fn helper(args: &[String]) -> Result<()> {
+fn helper(args: &[OsString]) -> Result<()> {
     let [_, mode, path] = args else {
         bail!("{HELPER_ARG} is internal to proxytun");
     };
@@ -497,7 +510,7 @@ fn helper(args: &[String]) -> Result<()> {
 
     let ctl = seqpacket(SockFlag::empty())?;
     set_timeouts(&ctl, HELPER_TIMEOUT)?;
-    let addr = UnixAddr::new(path.as_str())?;
+    let addr = UnixAddr::new(path.as_os_str())?;
     as_caller(sudo_uid, sudo_gid, || connect(ctl.as_raw_fd(), &addr))?.context("connect to proxytun")?;
     let cred = getsockopt(&ctl, sockopt::PeerCredentials).context("SO_PEERCRED")?;
     // The socket's creator must be the process that ran sudo: one of our
@@ -505,8 +518,9 @@ fn helper(args: &[String]) -> Result<()> {
     // not been reused and its /proc entries are its own.
     // SAFETY: plain syscall.
     let parent = unsafe { libc::getppid() };
+    // Anyone else's socket learns nothing from us, not even why.
     if !ancestor_within(parent, cred.pid(), 4, |p| crate::witness::proc_stat(p).map(|s| s.ppid)) {
-        return refuse(&ctl, anyhow!("the socket was not created by the process that ran sudo"));
+        bail!("the socket was not created by the process that ran sudo");
     }
     let status = std::fs::read_to_string(format!("/proc/{}/status", cred.pid())).unwrap_or_default();
     let who = match identity(sudo_uid, cred.uid(), cred.gid(), &status) {
@@ -643,7 +657,7 @@ impl Prepared {
         stdio: [&OwnedFd; 3],
         cwd: &OwnedFd,
         ctl: &OwnedFd,
-        argv: &[String],
+        argv: &[OsString],
     ) -> String {
         // SAFETY: plain syscalls; the helper is single-threaded, so the
         // child may use the environment and the allocator.
@@ -716,24 +730,32 @@ impl Prepared {
             }
         }
         netns::wait_go(ctl);
-        // The inherited fds at the numbers they had in proxytun, moved out of
-        // the way first: a number to fill may be held by one of them (or by
-        // ctl, done with now). The moved copies close on exec.
-        if let Some(top) = self.inherit.iter().map(|(n, _)| *n).max() {
-            let mut moved = Vec::new();
-            for (n, fd) in &self.inherit {
+        // The inherited fds at the numbers they had in proxytun. Each is first
+        // copied to the lowest free number that is no one's target (a target
+        // may be held by one of them, or by ctl, done with now), staying under
+        // the caller's fd limit as userns mode would; the copies close on exec.
+        let targets: std::collections::HashSet<RawFd> = self.inherit.iter().map(|(n, _)| *n).collect();
+        let mut moved = Vec::new();
+        for (n, fd) in &self.inherit {
+            let mut from = 3;
+            let m = loop {
                 // SAFETY: plain syscalls on fds we hold.
-                let m = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, top + 1) };
+                let m = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, from) };
                 if m < 0 {
                     return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
                 }
-                moved.push((*n, m));
-            }
-            for (n, m) in moved {
-                // SAFETY: as above.
-                if unsafe { libc::dup2(m, n) } < 0 {
-                    return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
+                if !targets.contains(&m) {
+                    break m;
                 }
+                unsafe { libc::close(m) };
+                from = m + 1;
+            };
+            moved.push((*n, m));
+        }
+        for (n, m) in moved {
+            // SAFETY: as above.
+            if unsafe { libc::dup2(m, n) } < 0 {
+                return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
             }
         }
         let code = netns::exec(argv);
@@ -753,7 +775,12 @@ mod tests {
             forwards: vec!["127.0.0.1:5432".parse().unwrap(), "[::1]:80".parse().unwrap()],
             umask: 0o027,
             inherit: vec![3, 7, 250],
-            argv: vec!["curl".into(), "".into(), "a b=c".into()],
+            argv: vec![
+                "curl".into(),
+                "".into(),
+                "a b=c".into(),
+                OsString::from_vec(b"\xc4\xe3".to_vec()),
+            ],
             env: vec![
                 OsString::from("HOME=/home/u"),
                 OsString::from_vec(b"BIN=\xff\xfe".to_vec()),
@@ -875,6 +902,7 @@ mod tests {
             "stdio is not inherited this way"
         );
         assert!(validate(&with(0o022, &[5, 5]), 7).is_err(), "duplicate fd");
+        assert!(validate(&with(0o022, &[RawFd::MAX]), 7).is_err(), "beyond any fd limit");
         let fds: Vec<RawFd> = (3..3 + MAX_INHERIT as RawFd).collect();
         assert!(validate(&with(0o022, &fds), 7).is_ok(), "as many as fit");
         let fds: Vec<RawFd> = (3..4 + MAX_INHERIT as RawFd).collect();

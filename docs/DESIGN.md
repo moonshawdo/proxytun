@@ -47,11 +47,16 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   在 euid 为 0 时,只要 real uid 不是 0(setuid 安装),或环境里有 `SUDO_UID` / `SUDO_USER` / `SUDO_COMMAND` / `DOAS_USER` / `PKEXEC_UID`,
   就以退出码 2 拒绝。否则只放行 proxytun 的 sudoers 规则就等于放行任意 root 命令:`sudo proxytun -- sh`,
   或把 fd 0 冒充控制 socket 的 `sudo proxytun __proxytun_setup 0 ... -- sh`。不提供绕过开关;root 模式只给本来就是 root 的人用(root 登录、`su -`)。
+  不设这些变量的提权方式(ksu、userhelper、`systemd-run --uid=0`)识别不了;第二轮复查后用户决定不加 audit loginuid 判据
+  (它会连 `su -` 一起拒绝,且仍拦不住 systemd 启动的服务),改为在 README 写明只能用 sudo 授权 proxytun。
 - **特权助手的边界**:
   - 只做:建网络 + 挂载命名空间、建 TUN、bind-mount `resolv.conf`、建主机端口转发的监听 socket、fork 出程序;fd 交回后立即退出,程序由 proxytun(subreaper)收养。
   - 由 sudo 以当前可执行文件的绝对路径 + 隐藏子命令启动;sudo 会关闭 fd≥3,双方经 0700 私有目录里的 unix socket 通信。
   - 只接受 real 与 effective uid 都为 0(sudo 的做法);setuid 启动时 real uid 是调用者,`SUDO_UID` 也由调用者设置,直接拒绝。
-  - 以 `SUDO_UID`/`SUDO_GID` 的文件权限(`setfsuid`/`setfsgid`,清空附加组)连接 socket:调用者自己进不去的目录,root 也不替他进去。
+  - 以 `SUDO_UID`/`SUDO_GID` 为有效 uid/gid(`setresuid`/`setresgid` 只改有效 id,saved uid 仍为 0 以便切回;清空附加组)连接 socket:
+    调用者自己进不去的目录,root 也不替他进去;对端用 `SO_PEERCRED` 看到的是调用者而不是 root,无法被当成 root 的连接利用
+    (第二轮复查由 fsuid 改为 euid)。proxytun 相应地要求连上来的是自己的 uid。祖先检查不通过时直接断开,不发错误消息。
+    已知限制:清空了附加组,`$TMPDIR` 只能经附加组进入时连接会失败。
   - 对端(socket 创建者,`SO_PEERCRED`)必须是助手往上 4 层以内的祖先(sudo、可能存在的 `use_pty` 监控进程、proxytun),
     这同时保证它还活着、pid 没有被复用,`/proc/<pid>` 读到的就是它;其 uid 必须等于 `SUDO_UID`。程序的 uid/gid/附加组取自它的 `/proc` 状态,
     不信任消息里自报的身份。
@@ -71,7 +76,8 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
     此时程序不在 proxytun 的进程组,终端的 Ctrl+C 只到 proxytun:`SI_KERNEL` 的信号也按"程序是否还在本进程组"决定是否转发(见第 5 节)。
     程序没有控制终端,Ctrl+Z 与窗口大小变化到不了它:检测到时 warn。
   - 程序的进程属性与 userns 模式一致:umask 随请求传过去;非 close-on-exec 的 fd(≥3,最多 249 个,SCM_RIGHTS 一次 253 个减去固定的 4 个)
-    随请求传过去,放行后先挪到最大编号之上再 `dup2` 回原编号;资源限制在降权前逐项降到调用者的值(`prlimit` 读调用者的 16 项,
+    随请求传过去(编号须小于 2^20),放行后先各自复制到不属于任何目标编号的最低空闲编号,再 `dup2` 回原编号:
+    继承的 fd 紧挨着上限时也不会超出调用者的 fd 上限;资源限制在降权前逐项降到调用者的值(`prlimit` 读调用者的 16 项,
     只降不升:CentOS 7 的 `20-nproc.conf` 给 root 不限进程数,管理员给用户设的 nproc/memlock 必须仍然有效)。
   - sudoers 的 `ROLE`/`TYPE`(或 AppArmor profile)会让 sudo 在另一个安全上下文里运行助手,程序会带着它:比较
     `/proc/self/attr/current` 与调用者的,不同就拒绝。默认配置下 sudo 不改上下文。
@@ -106,6 +112,9 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 - **IPv6**:v1 不支持。命名空间内不配 IPv6 路由(只有 `::1`),字面 IPv6 连接立即"网络不可达";AAAA 返回空(同 proxyhook)。
 - **地址规划**:`fake_ip_range` 末尾的 /24 留给命名空间内部(默认 `198.19.255.0/24`:`.1` TUN 自身、`.53` 假 DNS、若干改写用源地址),
   其余作 fake IP,因此 `fake_ip_range` 至少 /22。198.18.0.0/15 是 RFC 2544 测试保留段,不会与真实目标冲突。
+- **fake IP 回收**(第二轮复查):地址用完后回收最久未用、且没有连接在用的映射,但距上次应答或使用不足 60 秒(应答的 TTL)的不回收:
+  程序可能还缓存着它,回收给别的域名会把流量(含明文 Cookie)送错地方。回收不了就答 SERVFAIL。有连接在用的映射移出回收队列,
+  回收是 O(log n),不再逐个跳过。
 - **MTU**:65520。包只在本机内核与 proxytun 之间流转,包越大用户态处理的包数越少。
 - **localnet / 程序环境里的代理**:沿用 proxyhook 的 `Policy::is_passthrough`,命中的目标由 proxytun 直连,不走规则与代理(避免代理套代理)。
   `localnet` 默认为空(proxyhook 默认 `127.0.0.0/8`,在 proxytun 里不起作用:命名空间的回环到不了 proxytun)。
