@@ -342,7 +342,10 @@ fn run_cmd(mut cmd: Command, env: &[(&str, &str)]) -> Out {
     let deadline = Instant::now() + Duration::from_secs(60);
     let code = loop {
         if let Some(st) = child.try_wait().unwrap() {
-            break st.code().unwrap_or(-1);
+            // Killed by a signal: minus its number, as Python has it.
+            break st
+                .code()
+                .unwrap_or_else(|| -std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(1));
         }
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -525,12 +528,99 @@ fn the_exit_code_survives_a_caller_that_ignores_sigchld() {
 }
 
 #[test]
+fn as_a_pid_namespaces_init_or_a_subreaper_proxytun_still_ends_with_the_program() {
+    require!("unshare", "python3");
+    let dir = tmp_dir("init");
+    let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // In a container without an init (`docker run` without --init), and
+    // under a wrapper that made itself a subreaper: orphans, our signal
+    // witness among them, come to us, and we wait for all of them.
+    let mut cmd = Command::new("unshare");
+    cmd.args([
+        "-Urpf",
+        "--mount-proc",
+        BIN,
+        "-c",
+        cfg.to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        "exit 7",
+    ]);
+    let out = run_cmd(cmd, &[]);
+    assert_eq!(out.code, 7, "{}", out.dump());
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "-c",
+        "import ctypes, os, sys; ctypes.CDLL(None).prctl(36, 1, 0, 0, 0); os.execv(sys.argv[1], sys.argv[1:])",
+        BIN,
+        "-c",
+        cfg.to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        "exit 7",
+    ]);
+    let out = run_cmd(cmd, &[]);
+    assert_eq!(out.code, 7, "{}", out.dump());
+}
+
+/// Runs argv[3:] (proxytun and its arguments) with stderr on a pipe that,
+/// as argv[2] says, nobody reads ("stalled") or nobody has open ("gone").
+const PY_STDERR: &str = r#"
+import fcntl, os, subprocess, sys
+mode, argv = sys.argv[1], sys.argv[2:]
+r, w = os.pipe()
+fcntl.fcntl(w, 1031, 4096)  # F_SETPIPE_SZ: one page, full after a few lines
+if mode == "gone":
+    os.close(r)
+p = subprocess.Popen(argv, stderr=w, stdout=subprocess.PIPE)
+os.close(w)
+try:
+    out, _ = p.communicate(timeout=40)
+    print("rc", p.returncode)
+    sys.stdout.write(out.decode())
+except subprocess.TimeoutExpired:
+    p.kill()
+    print("rc timeout")
+"#;
+
+#[test]
+fn a_stalled_or_vanished_stderr_stops_neither_the_program_nor_proxytun() {
+    require!("python3", "curl");
+    let origin = start_origin();
+    let mock = start_mock_proxy(origin);
+    let dir = tmp_dir("stderr");
+    let cfg = write_cfg(&dir, mock.addr, "sniff = false", "");
+    std::fs::write(dir.join("stderr.py"), PY_STDERR).unwrap();
+    // Each connection logs a dozen lines at trace level: a pipe nobody reads
+    // is full after a few connections, and a terminal on Ctrl+S, or a reader gone
+    // (`2>&1 | head`, a closed ssh session), are no different for us.
+    let prog = "for i in $(seq 40); do curl -s --max-time 5 http://log.test/ || echo fail; echo; done; exit 7";
+    for mode in ["stalled", "gone"] {
+        let mut cmd = Command::new("python3");
+        cmd.arg(dir.join("stderr.py"))
+            .arg(mode)
+            .args([BIN, "-vv", "-c", cfg.to_str().unwrap(), "--", "sh", "-c"])
+            .arg(format!("({prog}) 2>/dev/null"));
+        let out = run_cmd(cmd, &[]);
+        assert!(out.stdout.starts_with("rc 7\n"), "{mode}\n{}", out.dump());
+        assert_eq!(out.stdout.matches(BODY).count(), 40, "{mode}\n{}", out.dump());
+    }
+}
+
+#[test]
 fn exit_codes_are_propagated() {
     require!();
     let dir = tmp_dir("exit");
     let cfg = write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
     assert_eq!(run(&cfg, &[], &["sh", "-c", "exit 7"], &[]).code, 7);
-    assert_eq!(run(&cfg, &[], &["sh", "-c", "kill -9 $$"], &[]).code, 128 + 9);
+    // Killed by a signal, the program has proxytun end by the same one: a
+    // shell or service manager sees what it would without proxytun.
+    for sig in [libc::SIGKILL, libc::SIGTERM, libc::SIGINT, libc::SIGSEGV] {
+        let out = run(&cfg, &[], &["sh", "-c", &format!("kill -{sig} $$")], &[]);
+        assert_eq!(out.code, -sig, "{}", out.dump());
+    }
     let out = run(&cfg, &[], &["/nonexistent/program"], &[]);
     assert_eq!(out.code, 127, "{}", out.dump());
     assert!(out.stderr.contains("cannot execute"), "{}", out.dump());
@@ -1312,6 +1402,25 @@ fn sigterm_reaches_the_program_exactly_once() {
     assert_eq!(code, Some(3), "{out}");
 }
 
+#[test]
+fn pkill_proxytun_reaches_the_program_exactly_once() {
+    require!("python3", "pkill");
+    let dir = tmp_dir("pkill");
+    let script = dir.join("term.py");
+    std::fs::write(&script, PY_SIGNAL).unwrap();
+    // pkill (killall, pidof) by name: proxytun, not its signal witness,
+    // which would make it look like a group signal the program has too.
+    let (code, out) = interrupt_run(&script, &["SIGTERM"], |pid| {
+        let st = Command::new("pkill")
+            .args(["-TERM", "-g", &pid.to_string(), "proxytun"])
+            .status()
+            .unwrap();
+        assert!(st.success(), "pkill found nothing");
+    });
+    assert!(out.contains("handled 1"), "{out}");
+    assert_eq!(code, Some(3), "{out}");
+}
+
 /// SigIgn mask of the program, from its /proc status.
 fn ignored_mask(out: &str) -> u64 {
     let hex = out
@@ -1332,9 +1441,11 @@ fn signals_ignored_by_the_caller_stay_ignored_in_the_program() {
     // What `cmd &` in a script (SIGINT, SIGQUIT) and nohup (SIGHUP) do.
     let mut cmd = Command::new(BIN);
     cmd.arg("-c").arg(&cfg).args(["--", "cat", "/proc/self/status"]);
+    // `trap '' PIPE` too (SIGPIPE, which Rust's runtime ignores for itself
+    // before proxytun can see how its caller left it).
     unsafe {
         cmd.pre_exec(|| {
-            for s in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] {
+            for s in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGPIPE] {
                 libc::signal(s, libc::SIG_IGN);
             }
             Ok(())
@@ -1346,6 +1457,7 @@ fn signals_ignored_by_the_caller_stay_ignored_in_the_program() {
         ("SIGINT", libc::SIGINT),
         ("SIGQUIT", libc::SIGQUIT),
         ("SIGHUP", libc::SIGHUP),
+        ("SIGPIPE", libc::SIGPIPE),
     ] {
         assert!(ign & bit(sig) != 0, "{name} must stay ignored\n{out}");
     }
@@ -1392,7 +1504,11 @@ fn ctrl_c_stops_proxytun_once_the_main_program_has_exited() {
         assert!(Instant::now() < deadline, "Ctrl+C did nothing: proxytun keeps waiting");
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(status.code(), Some(130), "{status:?}");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGINT),
+        "ended by the signal, as the program would have been\n{status:?}"
+    );
     // Unlike proxyhook, the tree is not killed (DESIGN.md 5): it keeps
     // running, cut off from the network.
     assert!(alive(orphan), "the background child must survive proxytun");
@@ -2380,7 +2496,7 @@ rng, pgrp, inherit = {
     "late": ("198.18.0.0/15", os.getpgrp(), "-"),
 }[case]
 marker = os.path.join(d, "ran-" + case)
-fields = ["2", rng, str(pgrp), "-", "22", inherit, "2", "touch", marker, "PATH=/usr/bin:/bin"]
+fields = ["3", rng, str(pgrp), "-", "22", "0", inherit, "2", "touch", marker, "PATH=/usr/bin:/bin"]
 cwd = os.open(d, os.O_PATH)
 socket.send_fds(c, [b"".join(f.encode() + b"\0" for f in fields)], [0, 1, 2, cwd])
 print("got:", c.recv(4096)[:2].decode(errors="replace"), flush=True)
@@ -2587,10 +2703,10 @@ fn under_sudo_the_program_keeps_the_users_limits_umask_and_fds() {
     // while they are put in place, so none may end up on another's number.
     std::fs::write(
         dir.join("parity.sh"),
-        r#"ulimit -Sn 777; ulimit -Sc 1024; umask 002; exec 775<"$D/five" 776>&1
+        r#"ulimit -Sn 777; ulimit -Sc 1024; umask 002; trap '' PIPE; exec 775<"$D/five" 776>&1
 for n in $(seq 20 60); do eval "exec $n<\"\$D/f$n\""; done
 exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; ulimit -Sc; umask; cat <&775; echo to-776 >&776;
-  for n in $(seq 20 60); do cat <&$n; done; echo; grep -c fake-sudo-root /proc/keys;
+  for n in $(seq 20 60); do cat <&$n; done; echo; grep -c fake-sudo-root /proc/keys; grep SigIgn /proc/self/status;
   ls /proc/self/fd | sort -n | tr "\n" " "'
 "#,
     )
@@ -2602,7 +2718,7 @@ exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; ulimit -Sc; umas
     assert_eq!(plain.code, 0, "{}", plain.dump());
     assert!(!plain.stderr.contains("asking sudo"), "{}", plain.dump());
     let lines: Vec<&str> = plain.stdout.lines().collect();
-    assert_eq!(lines.len(), 9, "{}", plain.dump());
+    assert_eq!(lines.len(), 10, "{}", plain.dump());
     assert_eq!(lines[0], "777", "{}", plain.dump());
     let band: Vec<String> = (20..=60).map(|n| n.to_string()).collect();
     assert_eq!(
@@ -2614,9 +2730,16 @@ exec "$PT" -c "$D/cfg.toml" -- bash -c 'ulimit -Sn; ulimit -Hn; ulimit -Sc; umas
             "to-776".into(),
             format!("{},", band.join(",")),
             "0".into(),
+            lines[8].to_string(),
             format!("0 1 2 3 {} 775 776 ", band.join(" ")),
         ],
         "{}",
+        plain.dump()
+    );
+    assert_ne!(
+        ignored_mask(lines[8]) & (1 << (libc::SIGPIPE - 1)),
+        0,
+        "SIGPIPE stays ignored\n{}",
         plain.dump()
     );
     // Through sudo, the same. (A copy of proxytun: the user cannot reach our
@@ -2673,6 +2796,13 @@ fn under_sudo_use_pty_the_program_survives_sudo_and_still_gets_ctrl_c() {
     assert!(out.stderr.contains("session of its own"), "{}", out.dump());
     assert!(out.stdout.contains("handled 1"), "{}", out.dump());
     assert!(out.stdout.starts_with("exit 3"), "{}", out.dump());
+
+    // Ctrl+C reaches the whole pipeline there, not only its shell: else
+    // `sleep` would go on, and proxytun with it, waiting for it.
+    let user = "FAKE_SUDO_USE_PTY=1 python3 \"$D/press_ctrl_c.py\" \"$D/pt\" -c \"$D/cfg.toml\" -- \
+                sh -c 'echo ready; sleep 30 | cat'";
+    let out = sh_like_centos7(&dir, "cp \"$BIN\" \"$D/pt\"", user);
+    assert!(out.stdout.starts_with("exit -2"), "{}", out.dump());
 }
 
 #[test]

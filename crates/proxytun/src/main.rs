@@ -125,9 +125,85 @@ impl Cli {
     }
 }
 
+/// stderr for our log lines, which never blocks and never fails: a reader
+/// that stalls (Ctrl+S, a pipe nobody reads) must not freeze every relay
+/// with it, nor one that is gone (`2>&1 | head`, a hung-up terminal) turn
+/// each log line into a panic. A line that cannot be written at once is
+/// dropped. Pipes and terminals get a description of their own, opened
+/// non-blocking (the program shares the one on fd 2: switching that would
+/// change it for the program too); sockets (the journal) are sent to
+/// without waiting; anything else (a file) is written as it is.
+#[derive(Clone, Copy)]
+struct LogSink {
+    fd: std::os::fd::RawFd,
+    socket: bool,
+}
+
+impl LogSink {
+    fn stderr() -> LogSink {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat fills a local struct.
+        let kind = if unsafe { libc::fstat(2, &mut st) } == 0 {
+            st.st_mode & libc::S_IFMT
+        } else {
+            0
+        };
+        if kind == libc::S_IFSOCK {
+            return LogSink { fd: 2, socket: true };
+        }
+        if kind == libc::S_IFIFO || kind == libc::S_IFCHR {
+            let flags = libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+            // SAFETY: plain open; the fd is ours for good (logging lasts as
+            // long as the process).
+            let fd = unsafe { libc::open(c"/proc/self/fd/2".as_ptr(), flags) };
+            if fd >= 0 {
+                return LogSink { fd, socket: false };
+            }
+        }
+        LogSink { fd: 2, socket: false }
+    }
+}
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut rest = buf;
+        while !rest.is_empty() {
+            // SAFETY: plain writes of our own buffer.
+            let n = unsafe {
+                if self.socket {
+                    libc::send(
+                        self.fd,
+                        rest.as_ptr().cast(),
+                        rest.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                } else {
+                    libc::write(self.fd, rest.as_ptr().cast(), rest.len())
+                }
+            };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if n <= 0 {
+                break; // full, or nobody reading: the rest is dropped
+            }
+            rest = &rest[n as usize..];
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn init_logging(filter: &str, file: Option<&Path>) -> Result<()> {
     let filter = EnvFilter::try_new(filter).with_context(|| format!("bad log filter {filter:?}"))?;
-    let fmt = tracing_subscriber::fmt().with_env_filter(filter);
+    // A write that fails is not reported on stderr in turn: that would panic
+    // when stderr is what failed.
+    let fmt = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .log_internal_errors(false);
     match file {
         // Only our own writer moves: stderr stays as it was, and std opens the
         // file close-on-exec, so the program inherits neither.
@@ -152,7 +228,8 @@ fn init_logging(filter: &str, file: Option<&Path>) -> Result<()> {
         }
         None => {
             let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-            fmt.with_ansi(color).with_writer(std::io::stderr).init();
+            let sink = LogSink::stderr();
+            fmt.with_ansi(color).with_writer(move || sink).init();
         }
     }
     Ok(())
@@ -213,7 +290,7 @@ fn main() -> Result<()> {
     }
 
     let to_file = cli.log_file.is_some();
-    let code = app::run(Args {
+    let exit = app::run(Args {
         config: cli.config,
         proxy: cli.proxy,
         no_sudo: cli.no_sudo,
@@ -226,7 +303,7 @@ fn main() -> Result<()> {
             tracing::error!("{e:#}");
         }
     })?;
-    std::process::exit(code);
+    app::finish(exit);
 }
 
 #[cfg(test)]

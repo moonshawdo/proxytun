@@ -67,6 +67,8 @@ struct Request {
     forwards: Vec<SocketAddr>,
     /// proxytun's umask, for the program.
     umask: libc::mode_t,
+    /// Whether proxytun's caller ignored SIGPIPE, for the program.
+    sigpipe_ignored: bool,
     /// The fds the program inherits, by their numbers in proxytun. They
     /// follow the four fixed ones in the message, in this order.
     inherit: Vec<RawFd>,
@@ -75,19 +77,21 @@ struct Request {
 }
 
 impl Request {
-    /// NUL-separated: version, range, pgrp, forwards, umask (octal), inherited
-    /// fds ("-" for none), argc, argv..., env...
+    /// NUL-separated: version, range, pgrp, forwards, umask (octal), SIGPIPE
+    /// ignored ("1") or not ("0"), inherited fds ("-" for none), argc,
+    /// argv..., env...
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut field = |b: &[u8]| {
             out.extend_from_slice(b);
             out.push(0);
         };
-        field(b"2");
+        field(b"3");
         field(self.fake_range.to_string().as_bytes());
         field(self.pgrp.to_string().as_bytes());
         field(netns::join_addrs(&self.forwards).as_bytes());
         field(format!("{:o}", self.umask).as_bytes());
+        field(if self.sigpipe_ignored { b"1" } else { b"0" });
         let inherit: Vec<String> = self.inherit.iter().map(|n| n.to_string()).collect();
         field(
             if inherit.is_empty() {
@@ -110,13 +114,18 @@ impl Request {
     fn decode(b: &[u8]) -> Option<Request> {
         let mut fields = b.strip_suffix(&[0])?.split(|&c| c == 0);
         let mut text = || std::str::from_utf8(fields.next()?).ok().map(str::to_owned);
-        if text()? != "2" {
+        if text()? != "3" {
             return None;
         }
         let fake_range = text()?.parse().ok()?;
         let pgrp = text()?.parse().ok()?;
         let forwards = netns::split_addrs(&text()?)?;
         let umask = libc::mode_t::from_str_radix(&text()?, 8).ok()?;
+        let sigpipe_ignored = match text()?.as_str() {
+            "1" => true,
+            "0" => false,
+            _ => return None,
+        };
         let inherit = match text()?.as_str() {
             "-" => Vec::new(),
             list => list.split(',').map(|n| n.parse().ok()).collect::<Option<_>>()?,
@@ -134,6 +143,7 @@ impl Request {
             pgrp,
             forwards,
             umask,
+            sigpipe_ignored,
             inherit,
             argv,
             env,
@@ -443,6 +453,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
             libc::umask(m);
             m
         },
+        sigpipe_ignored: netns::sigpipe_was_ignored(),
         inherit,
         argv: s.argv.clone(),
         env: std::env::vars_os()
@@ -949,7 +960,7 @@ fn become_program(
             return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
         }
     }
-    let code = netns::exec(&req.argv);
+    let code = netns::exec(&req.argv, req.sigpipe_ignored);
     unsafe { libc::_exit(code) }
 }
 
@@ -964,6 +975,7 @@ mod tests {
             pgrp: 4242,
             forwards: vec!["127.0.0.1:5432".parse().unwrap(), "[::1]:80".parse().unwrap()],
             umask: 0o027,
+            sigpipe_ignored: true,
             inherit: vec![3, 7, 250],
             argv: vec![
                 "curl".into(),
@@ -982,29 +994,36 @@ mod tests {
             pgrp: 1,
             forwards: vec![],
             umask: 0,
+            sigpipe_ignored: false,
             inherit: vec![],
             argv: vec!["true".into()],
             env: vec![],
         };
         let mut other_version = no_env.encode();
         assert_eq!(Request::decode(&no_env.encode()), Some(no_env));
-        other_version[0] = b'1';
+        other_version[0] = b'2';
         assert_eq!(Request::decode(&other_version), None, "another version");
         assert_eq!(
-            Request::decode(b"2\x0010.0.0.0/8\x001\0-\x0022\0-\x000\0"),
+            Request::decode(b"3\x0010.0.0.0/8\x001\0-\x0022\x000\0-\x000\0"),
             None,
             "no program"
         );
         assert_eq!(
-            Request::decode(b"2\x0010.0.0.0/8\x001\0-\x0022\0-\x005\0a\0"),
+            Request::decode(b"3\x0010.0.0.0/8\x001\0-\x0022\x000\0-\x005\0a\0"),
             None,
             "argv cut short"
         );
         assert_eq!(
-            Request::decode(b"2\x0010.0.0.0/8\x001\0-\x009\0-\x001\0true\0"),
+            Request::decode(b"3\x0010.0.0.0/8\x001\0-\x009\x000\0-\x001\0true\0"),
             None,
             "umask not octal"
         );
+        assert_eq!(
+            Request::decode(b"3\x0010.0.0.0/8\x001\0-\x0022\0yes\0-\x001\0true\0"),
+            None,
+            "SIGPIPE neither 0 nor 1"
+        );
+        assert!(Request::decode(b"3\x0010.0.0.0/8\x001\0-\x0022\x001\0-\x001\0true\0").is_some());
     }
 
     const STATUS: &str =
@@ -1051,6 +1070,7 @@ mod tests {
             pgrp,
             forwards: forwards.iter().map(|a| a.parse().unwrap()).collect(),
             umask: 0o022,
+            sigpipe_ignored: false,
             inherit: vec![],
             argv: vec!["true".into()],
             env: vec![],

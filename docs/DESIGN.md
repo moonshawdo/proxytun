@@ -143,6 +143,10 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
   - 假 IP 映射最多 100 万条(约 150 MB),再大的 `fake_ip_range` 也一样,超出后按原规则回收;池满时的 error 日志每 10 秒最多一条。
   - accept 失败(fd 用尽)、地址改写表满、假 IP 池满:日志都限速为每 10 秒最多一条(`proxytun_core::throttle`),计数照常。
   - 统计日志先取出地址改写表的大小再写:在 `tracing` 宏里取锁会持锁到整行写完,stderr 被暂停(Ctrl+S、分页器)时 TUN 线程会跟着卡住。
+  - 第五轮复查:写 stderr 的日志本身也不再阻塞、不再失败。原先 tokio worker 和主线程同步写 stderr,读端停住时所有写日志的线程
+    (中继、DNS、信号处理)一起卡住;读端关掉时 tracing 默认用 `eprintln!` 报告写失败,而它本身失败就 panic,于是每个新中继被重置、
+    两次 SIGTERM 停不掉、退出码变成 101。现在关掉 `log_internal_errors`,stderr 是管道或终端时另开一个非阻塞的打开文件描述
+    (`/proc/self/fd/2`,不改程序共用的那个),是 socket 时 `send(MSG_DONTWAIT)`,写不下的日志行丢弃;普通文件照常写。
   - 地址改写表:监听侧回了 SYN-ACK 的条目进入"排队"状态(accept 因 fd 用尽长时间失败时,程序那端已是 established,
     条目删掉后它永远收不到关闭);监听侧在 accept 前发 RST 则结束该条目。第四轮复查补正:排队最多 30 秒(用户定),到期向程序发 RST,
     序号取监听侧 SYN-ACK 的序号 + 1(established 状态下内核只接受序号正好等于期望值的 RST),程序得到 ECONNRESET;
@@ -214,16 +218,31 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字,最�
 
 ## 5. 运行时行为
 
-- 与 proxyhook 一致:proxytun 是 subreaper,等整棵进程树结束才退出;退出码透传(信号终止为 128+信号);
+- 与 proxyhook 一致:proxytun 是 subreaper,等整棵进程树结束才退出;退出码透传。第五轮复查起(用户决定 A),程序被信号杀死时
+  proxytun 不再以 `128+信号` 正常退出,而是关掉 core、恢复默认处置后对自己发同一信号(`timeout`、sudo、strace 的做法):
+  bash 的"等待并协同退出"只在子进程 WIFSIGNALED 时停下循环,systemd 停止服务时 `128+15` 会被记为失败。proxytun 自己因信号退出
+  (程序已退出后的 Ctrl+C、连发两次 SIGTERM)同样以该信号结束;
   Ctrl+C 交给程序;只发给 proxytun 的 TERM/INT/QUIT 转发给程序,发给整个进程组的不重复;SIGHUP 热加载;SIGUSR1 打印统计。
 - **"发给整个进程组的不重复"怎么做到**(M2 实现时确定):proxyhook 靠 ptrace 看见程序收到信号;proxytun 没有 ptrace,
   而 `kill <pid>` 与 `kill -- -<pgid>`/`kill %1`/systemd 逐进程发送,在 proxytun 看来都是 `SI_USER`。为此启动一个**见证进程**:
   与 proxytun 同一进程组、屏蔽 INT/QUIT/TERM(其余信号一律忽略,终端挂断或 Ctrl+Z 不会杀死/停住它)。
-  proxytun 收到 `SI_USER` 信号后等 50 ms,读 `/proc/<见证>/status` 的待处理信号:见证也收到且程序仍在本进程组 → 程序已有一份,不转发;
+  proxytun 收到 `SI_USER` 信号后等 50 ms,问见证有哪些待处理信号:见证也收到且程序仍在本进程组 → 程序已有一份,不转发;
   否则转发。每次判断后清空见证的待处理信号。见证 double-fork(不是 proxytun 的子进程,不影响"等整棵树退出"),管道断开即退出。
+  第五轮复查补正:见证改名为 `signal-witness`(`comm` 与命令行都改,命令行就地覆写),否则 `pkill proxytun`、`killall`、`pidof`
+  会同时选中它,看起来像整组信号而不转发,程序什么也收不到;待处理信号改经管道问见证(`q` → 8 字节掩码),不再读
+  `/proc/<见证>/status`:`hidepid`(`ProtectProc=invisible`)下 non-dumpable 的见证看不到,整组信号会重复送达;
+  proxytun 是 pid 命名空间的 1 号进程(容器没加 `--init`)或预先被设为 subreaper 时,孤儿见证会被过继回来,
+  所以程序被回收后关闭见证的管道,让它退出、被回收,否则 proxytun 等它等到永远。
   比 proxyhook 多覆盖一种情况:用 `sigwait`/`signalfd` 收信号的程序被整组 kill 时也不会收到两次。
   程序自己离开了 proxytun 的进程组(`setsid`、shell 作业控制,或 sudo `use_pty` 下的 sudo 模式)时,整组信号到不了它,照常转发;
-  终端发的 `SI_KERNEL` 信号同理:程序还在本进程组就不转发(它已有一份),不在就转发。
+  终端发的 `SI_KERNEL` 信号同理:程序还在本进程组就不转发(它已有一份),不在就转发。第五轮复查起,程序自成一组(是组长)时
+  整组信号转给它的整个进程组,而不只是它自己:sudo `use_pty` 下 Ctrl+C 原先只到 `sh -c 'a | b'` 的 sh,管道里的进程继续运行。
+  已知的、分不出来的情况(写在 README):程序不在本进程组时,逐进程发送(systemd、`kill -1`、`pkill -u`)会让它收到两份;
+  50 ms 内连发两次 SIGTERM 时第二次让 proxytun 立即退出,程序可能一份也没收到;50 ms 内两次同类整组信号会多转发一次
+  (见证只记"有没有",不记次数);见证启动前的几毫秒里收到的整组信号不转发。
+- SIGPIPE:Rust 运行时在 `main` 之前把它设为忽略,原先 exec 前一律恢复默认,调用方 `trap '' PIPE` 时程序里却不再忽略
+  (与"启动时被忽略的信号保持忽略"不符)。第五轮复查起用 ELF 构造函数(`.init_array`,在运行时之前执行)记下进程映像启动时的处置:
+  userns 模式下准备进程 re-exec 前先设回调用方的处置,它自己的构造函数就能读到;sudo 模式下随请求传给助手(请求格式第 3 版)。
 - proxytun 异常退出(`kill -9`、崩溃):**不杀程序**。TUN 随 fd 关闭消失,程序只剩回环,等于断网,不会绕过代理直连;日志与文档写明。
 - 热加载范围同 proxyhook;主机端口转发、地址规划、`fake_ip_range`、`upstream_dns` 需要重启。
 - 凭据保护同 proxyhook:程序环境里去掉 `PROXYTUN_PROXY`(原值就地清零),proxytun 设为 non-dumpable;`--proxy` 带密码时 warn。

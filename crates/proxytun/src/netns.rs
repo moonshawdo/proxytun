@@ -24,6 +24,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const TUN_NAME: &CStr = c"tun0";
 /// Packets only travel between the namespace's kernel and proxytun, never
@@ -327,8 +328,9 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
     let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     let msg = b"proxytun: cannot re-execute itself for the namespace setup\n";
+    let sigpipe = sigpipe_disposition(sigpipe_was_ignored());
 
-    // SAFETY: the child only calls fcntl, execv, write and _exit.
+    // SAFETY: the child only calls fcntl, signal, execv, write and _exit.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         bail!("fork: {}", std::io::Error::last_os_error());
@@ -337,6 +339,9 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
         unsafe {
             // Our end of the socketpair must survive the exec; theirs (CLOEXEC) goes.
             libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0);
+            // The caller's SIGPIPE, for the setup process to find at its
+            // start (and give the program) instead of our runtime's.
+            libc::signal(libc::SIGPIPE, sigpipe);
             libc::execv(exe.as_ptr(), ptrs.as_ptr());
             libc::write(2, msg.as_ptr() as *const _, msg.len());
             libc::_exit(127);
@@ -380,7 +385,7 @@ pub fn setup_main(args: &[OsString]) -> ! {
     drop(ns);
     wait_go(&ctl);
     drop(ctl);
-    std::process::exit(exec(&s.argv))
+    std::process::exit(exec(&s.argv, sigpipe_was_ignored()))
 }
 
 /// Block until proxytun serves the TUN device; exit if it went away instead.
@@ -558,12 +563,46 @@ fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
     .context("bind-mount /etc/resolv.conf")
 }
 
+/// Was SIGPIPE ignored when this process image started, as whoever started
+/// it left it? Rust's runtime ignores it for itself before `main`; only a
+/// constructor, run before the runtime, still sees the caller's.
+static SIGPIPE_WAS_IGNORED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn note_sigpipe() {
+    // SAFETY: reads the disposition into a local struct.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) == 0 {
+            SIGPIPE_WAS_IGNORED.store(old.sa_sigaction == libc::SIG_IGN, Ordering::Relaxed);
+        }
+    }
+}
+
+#[used]
+#[link_section = ".init_array"]
+static NOTE_SIGPIPE: extern "C" fn() = note_sigpipe;
+
+/// SIGPIPE as our caller left it: ignored (`trap '' PIPE`), or not.
+pub fn sigpipe_was_ignored() -> bool {
+    SIGPIPE_WAS_IGNORED.load(Ordering::Relaxed)
+}
+
+fn sigpipe_disposition(ignored: bool) -> libc::sighandler_t {
+    if ignored {
+        libc::SIG_IGN
+    } else {
+        libc::SIG_DFL
+    }
+}
+
 /// Become the program. Undo what our runtime changed, as std::process::Command
-/// does: Rust ignores SIGPIPE at startup and an ignored disposition survives
-/// exec; proxytun blocked some signals for its signalfd. Signals the caller
-/// ignored (nohup, `cmd &`) stay ignored by themselves: dispositions survive
-/// both execs and proxytun installs its own handlers only after the fork.
-pub fn exec(argv: &[OsString]) -> i32 {
+/// does: Rust ignores SIGPIPE at startup, and an ignored disposition survives
+/// exec, so it goes back to what the caller had (`sigpipe_ignored`, see
+/// `sigpipe_was_ignored`); proxytun blocked some signals for its signalfd.
+/// Other signals the caller ignored (nohup, `cmd &`) stay ignored by
+/// themselves: dispositions survive both execs and proxytun installs its
+/// own handlers only after the fork.
+pub fn exec(argv: &[OsString], sigpipe_ignored: bool) -> i32 {
     let argv: Vec<CString> = match argv.iter().map(|a| CString::new(a.as_bytes())).collect() {
         Ok(v) => v,
         Err(_) => return 127, // checked by proxytun before we got here
@@ -572,7 +611,7 @@ pub fn exec(argv: &[OsString]) -> i32 {
     ptrs.push(std::ptr::null());
     // SAFETY: plain syscalls on prepared, NUL-terminated buffers.
     unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::signal(libc::SIGPIPE, sigpipe_disposition(sigpipe_ignored));
         let mut empty: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut empty);
         libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());

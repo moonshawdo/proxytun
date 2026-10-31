@@ -88,7 +88,7 @@ pub fn load_config(path: &Path, proxy_override: Option<&str>) -> Result<Config> 
     Ok(cfg)
 }
 
-pub fn run(args: Args) -> Result<i32> {
+pub fn run(args: Args) -> Result<Exit> {
     // The program's name only: its arguments may hold secrets (curl -u user:pass).
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -114,6 +114,7 @@ pub fn run(args: Args) -> Result<i32> {
             .map(Arc::new),
         None => None,
     };
+    let tree_witness = witness.clone();
     let cfg = load_config(&args.config, proxy_override.as_deref()).context("load config")?;
     // A load from a missing file only succeeds through the --proxy fallback.
     if args.config.exists() {
@@ -259,16 +260,52 @@ pub fn run(args: Args) -> Result<i32> {
     tracing::info!(tun = %addrs.tun, dns = %addrs.dns, "namespace up");
     child.go()?;
 
-    let code = wait_tree(child.pid, &main_pid);
+    let exit = wait_tree(child.pid, &main_pid, tree_witness.as_deref());
     rt.shutdown_background();
-    Ok(code)
+    Ok(exit)
+}
+
+/// How proxytun ends: as the program did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Code(i32),
+    /// Killed by this signal.
+    Signal(libc::c_int),
+}
+
+/// End the process as `exit` says. Killed by a signal, the program has us
+/// end by the same one, as timeout(1) and sudo do: a shell sees WIFSIGNALED
+/// (bash stops a loop on Ctrl+C only then), and a service stopped with
+/// SIGTERM counts as stopped, not failed. Without a core dump of ours.
+pub fn finish(exit: Exit) -> ! {
+    let sig = match exit {
+        Exit::Code(c) => std::process::exit(c),
+        Exit::Signal(sig) => sig,
+    };
+    // SAFETY: plain syscalls on our own process.
+    unsafe {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
+        libc::signal(sig, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(sig);
+    }
+    // A signal whose default is not to end a process (SIGCHLD, SIGWINCH).
+    std::process::exit(128 + sig)
 }
 
 /// Wait until every process of the program's tree is gone (we are their
-/// subreaper) and return the program's own exit code: its status, or 128 +
-/// the signal that killed it.
-fn wait_tree(main: libc::pid_t, main_pid: &AtomicI32) -> i32 {
-    let mut code = 1;
+/// subreaper) and return how the program itself ended. Once it has, the
+/// witness is let go: should it be our child too (we are a pid namespace's
+/// init, or were made a subreaper), it is part of what we wait for.
+fn wait_tree(main: libc::pid_t, main_pid: &AtomicI32, witness: Option<&Witness>) -> Exit {
+    let (mut main, mut exit) = (Some(main), Exit::Code(1));
     loop {
         let mut status = 0;
         // SAFETY: plain syscall.
@@ -277,16 +314,21 @@ fn wait_tree(main: libc::pid_t, main_pid: &AtomicI32) -> i32 {
             if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return code; // ECHILD: nobody left
+            return exit; // ECHILD: nobody left
         }
-        if pid == main {
-            code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
+        // Once only: its pid may be reused by a later child of the tree.
+        if main == Some(pid) {
+            main = None;
+            exit = if libc::WIFEXITED(status) {
+                Exit::Code(libc::WEXITSTATUS(status))
             } else {
-                128 + libc::WTERMSIG(status)
+                Exit::Signal(libc::WTERMSIG(status))
             };
             main_pid.store(0, Ordering::SeqCst);
-            tracing::info!(code, "program exited");
+            tracing::info!(?exit, "program exited");
+            if let Some(w) = witness {
+                w.stop();
+            }
         }
     }
 }
@@ -377,11 +419,11 @@ fn fd_target(now: libc::rlimit, nr_open: Option<libc::rlim_t>) -> Option<libc::r
 
 #[derive(Debug, PartialEq, Eq)]
 enum ExitSignal {
-    /// Exit now with this code. The program's tree keeps running, cut off
-    /// from the network (the TUN device goes with us).
-    Exit(i32),
+    /// End now, by the signal received. The program's tree keeps running,
+    /// cut off from the network (the TUN device goes with us).
+    Exit,
     /// From the terminal, to our whole foreground group: pass it on only if
-    /// the program is not in that group (see `already_delivered`).
+    /// the program is not in that group (see `forward_to`).
     Terminal,
     /// From a process: pass it on unless it got it too.
     Forward,
@@ -394,7 +436,7 @@ fn on_exit_signal(sig: libc::c_int, code: i32, program_running: bool, terms: u32
     // Nobody left to decide (e.g. only a background child keeps us waiting),
     // or a second SIGTERM: whoever sent it wants us gone.
     if !program_running || (sig == libc::SIGTERM && terms >= 2) {
-        return ExitSignal::Exit(128 + sig);
+        return ExitSignal::Exit;
     }
     // Sent by the kernel: the terminal's Ctrl+C / Ctrl+\ signals the whole
     // foreground group, the program included if it is still in it.
@@ -406,11 +448,23 @@ fn on_exit_signal(sig: libc::c_int, code: i32, program_running: bool, terms: u32
     ExitSignal::Forward
 }
 
-/// Did a signal reach the program as well as us? It did if it was sent to
-/// our whole group (by the terminal, or the witness has it) and the program
-/// is still in that group.
-fn already_delivered(to_group: bool, program_pgrp: Option<libc::pid_t>, our_pgrp: libc::pid_t) -> bool {
-    to_group && program_pgrp == Some(our_pgrp)
+/// Where to pass on a signal we got, if anywhere (a pid, or minus a process
+/// group). Sent to our whole group (by the terminal, or the witness has it),
+/// the program has it too if it is still in that group. If it left to lead
+/// a group of its own (sudo's `use_pty` gave it a session of its own), that
+/// whole group gets it, as ours did: a pipeline or a child is no less
+/// interrupted by Ctrl+C there. Sent to proxytun alone: the program.
+fn forward_to(
+    to_group: bool,
+    program: libc::pid_t,
+    program_pgrp: Option<libc::pid_t>,
+    our_pgrp: libc::pid_t,
+) -> Option<libc::pid_t> {
+    match program_pgrp {
+        Some(p) if to_group && p == our_pgrp => None,
+        Some(p) if to_group && p == program => Some(-p),
+        _ => Some(program),
+    }
 }
 
 /// How long to wait before asking the witness: a group-wide signal is
@@ -442,9 +496,9 @@ fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option
             }
             let pid = main_pid.load(Ordering::SeqCst);
             let action = on_exit_signal(sig, info.ssi_code, pid > 0, terms);
-            if let ExitSignal::Exit(code) = action {
-                tracing::info!(sig, code, "exiting on a signal");
-                std::process::exit(code)
+            if action == ExitSignal::Exit {
+                tracing::info!(sig, "exiting on a signal");
+                finish(Exit::Signal(sig))
             }
             let (witness, main_pid) = (witness.clone(), main_pid.clone());
             tokio::spawn(async move {
@@ -456,9 +510,9 @@ fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option
                 let group = action == ExitSignal::Terminal || witness.as_ref().is_some_and(|w| w.saw(sig));
                 // SAFETY: plain syscall.
                 let ours = unsafe { libc::getpgrp() };
-                if !already_delivered(group, witness::pgrp_of(pid), ours) {
-                    tracing::debug!(sig, pid, "forwarding the signal to the program");
-                    unsafe { libc::kill(pid, sig) };
+                if let Some(to) = forward_to(group, pid, witness::pgrp_of(pid), ours) {
+                    tracing::debug!(sig, to, "forwarding the signal to the program");
+                    unsafe { libc::kill(to, sig) };
                 }
                 if let Some(w) = witness {
                     w.clear();
@@ -518,15 +572,12 @@ mod tests {
             assert_eq!(on_exit_signal(sig, SI_USER, true, 1), ExitSignal::Forward);
             // Main program gone (a background child keeps us waiting): exit,
             // or Ctrl+C would do nothing at all.
-            assert_eq!(on_exit_signal(sig, SI_USER, false, 1), ExitSignal::Exit(128 + sig));
-            assert_eq!(
-                on_exit_signal(sig, libc::SI_KERNEL, false, 1),
-                ExitSignal::Exit(128 + sig)
-            );
+            assert_eq!(on_exit_signal(sig, SI_USER, false, 1), ExitSignal::Exit);
+            assert_eq!(on_exit_signal(sig, libc::SI_KERNEL, false, 1), ExitSignal::Exit);
         }
         assert_eq!(
             on_exit_signal(libc::SIGTERM, SI_USER, true, 2),
-            ExitSignal::Exit(143),
+            ExitSignal::Exit,
             "second SIGTERM"
         );
         assert_eq!(
@@ -538,15 +589,20 @@ mod tests {
 
     #[test]
     fn a_signal_is_only_held_back_when_the_program_shares_our_group() {
+        // Program 50; our group 7.
         // Sent to the group, and the program is in it: it has its own copy.
-        assert!(already_delivered(true, Some(7), 7));
+        assert_eq!(forward_to(true, 50, Some(7), 7), None);
         // Sent to proxytun alone.
-        assert!(!already_delivered(false, Some(7), 7));
-        // Sent to our group, but the program moved to its own (setsid, a
-        // shell's job control): the group signal never reached it.
-        assert!(!already_delivered(true, Some(9), 7));
+        assert_eq!(forward_to(false, 50, Some(7), 7), Some(50));
+        // Sent to our group, but the program leads one of its own (sudo's
+        // use_pty, setsid): that whole group gets it, its pipeline too.
+        assert_eq!(forward_to(true, 50, Some(50), 7), Some(-50));
+        // ... or moved into someone else's: the program alone.
+        assert_eq!(forward_to(true, 50, Some(9), 7), Some(50));
         // Program already gone: nothing to hold back for.
-        assert!(!already_delivered(true, None, 7));
+        assert_eq!(forward_to(true, 50, None, 7), Some(50));
+        // Sent to proxytun alone, the program leading its own group: only it.
+        assert_eq!(forward_to(false, 50, Some(50), 7), Some(50));
     }
 
     #[test]

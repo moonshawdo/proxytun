@@ -106,7 +106,8 @@ proxytun -v --log-file proxytun.log -c proxytun.toml curl https://example.com
 ```
 
 proxytun 自己的选项写在程序名**之前**,从程序名起的参数原样交给程序;程序名前的 `--` 可写可不写。
-proxytun 的退出码就是程序的退出码(信号终止为 `128+信号`)。只要程序的进程树里还有进程在运行,proxytun 就继续运行。
+proxytun 的退出码就是程序的退出码;程序被信号杀死时,proxytun 也以同一信号结束(与 `timeout`、sudo 相同:shell 循环里按 Ctrl+C
+会停下,systemd 停止服务时不算失败),不留 core。只要程序的进程树里还有进程在运行,proxytun 就继续运行。
 
 ### 命令行参数
 
@@ -168,15 +169,15 @@ proxytun -c proxytun.toml ltrace -f ./prog
 
 | 操作 | 效果 |
 |---|---|
-| Ctrl+C(终端发给整个前台进程组) | 程序自己处理;proxytun 不重复转发,等程序退出后随之退出 |
-| `kill <proxytun pid>`(只发给 proxytun) | 转发给程序,恰好一次 |
-| `kill %1`、`kill -- -<pgid>`、systemd 逐进程发送 | 程序已经收到,不重复转发(靠一个"见证进程"判断,见 DESIGN.md 5) |
-| 连发两次 `SIGTERM` | proxytun 立即退出 |
+| Ctrl+C(终端发给整个前台进程组) | 程序自己处理;proxytun 不重复转发,等程序退出后随之退出。程序自成一组时(sudo `use_pty`),proxytun 转给它的整个进程组,管道里的其他进程也收到 |
+| `kill <proxytun pid>`、`pkill proxytun`、`killall proxytun`(只发给 proxytun) | 转发给程序,恰好一次(见证进程叫 `signal-witness`,不会被这些命令选中) |
+| `kill %1`、`kill -- -<pgid>`、systemd 逐进程发送 | 程序已经收到,不重复转发(靠一个"见证进程"判断,见 DESIGN.md 5)。程序不在 proxytun 的进程组时(sudo `use_pty`),逐进程发送会让它收到两份:分不出来 |
+| 连发两次 `SIGTERM` | proxytun 立即以 SIGTERM 结束 |
 | `kill -HUP <pid>` | 重新加载规则、localnet、代理和分组;配置有错则保留旧配置 |
 | `kill -USR1 <pid>` | 打印统计:假 IP 数、地址改写表大小、连接数、DNS 查询数、被拒的 UDP 数、各代理的健康与延迟 |
 | proxytun 被 `kill -9` 或崩溃 | 程序**不会被杀**,继续运行但断网(TUN 已随 proxytun 消失),不会绕过代理直连 |
 
-启动时被忽略的信号(`nohup`、脚本里的 `cmd &`)在程序里保持忽略。
+启动时被忽略的信号(`nohup`、脚本里的 `cmd &`、`trap '' PIPE`)在程序里保持忽略。
 
 ### 日志
 
@@ -194,6 +195,8 @@ conn{id=1 target=Domain("example.com", 443)}: closed ms=812 dial_ms=35 via=clash
 `up`、`down` 是两个方向的字节数。失败时写成 `closed: <原因>`,被规则拦下写成 `closed: blocked by a rule`。
 `-v` 另外记下每条 DNS 查询(`dns: A -> fake ip`、`dns: forwarding upstream`、上游耗时)和代理重试的原因;
 `-vv` 记下 TUN 上的每个 SYN 和它改写用的端口,可以从 SYN 一直跟到连接结束。日志不记录是哪个进程发起的连接。
+写 stderr 从不阻塞也不报错:读端停住(Ctrl+S、没人读的管道)时写不下的日志行直接丢弃,读端关掉(`2>&1 | head`、终端断开)时日志丢失,
+proxytun 和程序照常运行。要完整的日志请用 `--log-file`。
 
 `kill -USR1 <pid>` 打印三类信息:累计计数(`stats`)、距上次打印的速率(`rates since the previous stats`)、每个代理的健康状态与延迟。
 
