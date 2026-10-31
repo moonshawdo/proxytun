@@ -29,8 +29,8 @@
 //!     only the fake-ip range, the host ports, the process group, the argv,
 //!     the environment, the umask and the inherited fd numbers, and is
 //!     checked again here, since anyone may write their own client;
-//!   * gives up after `HELPER_TIMEOUT` (and a little) on a client, or a
-//!     program side, that does not talk;
+//!   * gives up after `helper::HELPER_TIMEOUT` (and a little) on a client,
+//!     or a program side, that does not talk;
 //!   * fills the namespaces, puts the program in proxytun's process group
 //!     (or, when sudo gave it a terminal session of its own, `use_pty`, has
 //!     it leave that session before it ends and hangs the program up),

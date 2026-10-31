@@ -7,6 +7,7 @@ use crate::netns::{self, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nix::sys::socket::{accept4, bind, getsockopt, listen, sockopt, Backlog, SockFlag, UnixAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::time::Duration;
 
 /// The fds a program started by us inherits: 3 and up, open without
@@ -33,10 +34,25 @@ fn inheritable_fds() -> Result<Vec<RawFd>> {
 /// `use_pty`).
 pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
     let dir = TempDir::new()?;
-    let path = dir.path().join("ctl");
+    let ctl = start_helper(&dir.path().join("ctl"))?;
+    send_request(&ctl, s)?;
+    let handover = recv_setup(&ctl, None)?;
+    let report = &handover.report;
+    let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
+    let pid = value("pid=")
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| anyhow!("bad report from the helper: {report:?}"))?;
+    let joined = value("pgrp=") == Some("joined");
+    drop(dir);
+    Ok((Child::new(pid, ctl), handover, joined))
+}
+
+/// Listen on `path`, have sudo start the helper on it and take the
+/// helper's connection, made as us.
+fn start_helper(path: &Path) -> Result<OwnedFd> {
     // Non-blocking: while waiting we must notice sudo giving up.
     let l = seqpacket(SockFlag::SOCK_NONBLOCK)?;
-    let addr = UnixAddr::new(&path).with_context(|| {
+    let addr = UnixAddr::new(path).with_context(|| {
         format!(
             "the helper socket {} is too long a path: set TMPDIR to a shorter directory",
             path.display()
@@ -50,7 +66,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
         .arg("--")
         .arg(&exe)
         .arg(HELPER_ARG)
-        .arg(&path)
+        .arg(path)
         .spawn()
         .context("run sudo")?;
     let ctl = loop {
@@ -79,7 +95,12 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
         "the helper socket was answered by uid {}, not on our behalf",
         cred.uid()
     );
+    Ok(ctl)
+}
 
+/// Send the request, with our stdio, working directory and inheritable
+/// fds, on `ctl`.
+fn send_request(ctl: &OwnedFd, s: &Setup) -> Result<()> {
     let inherit = inheritable_fds()?;
     ensure!(
         inherit.len() <= MAX_INHERIT,
@@ -115,19 +136,12 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
     if cwd < 0 {
         bail!("open the working directory: {}", std::io::Error::last_os_error());
     }
+    // SAFETY: open just returned it (not -1: checked above), and nothing
+    // else owns it.
     let cwd = unsafe { OwnedFd::from_raw_fd(cwd) };
     let fds: Vec<RawFd> = [0, 1, 2, cwd.as_raw_fd()]
         .into_iter()
         .chain(req.inherit.iter().copied())
         .collect();
-    send_with_fds(&ctl, &req.encode(), &fds).context("send the request to the helper (environment too large?)")?;
-    let handover = recv_setup(&ctl, None)?;
-    let report = &handover.report;
-    let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
-    let pid = value("pid=")
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| anyhow!("bad report from the helper: {report:?}"))?;
-    let joined = value("pgrp=") == Some("joined");
-    drop(dir);
-    Ok((Child::new(pid, ctl), handover, joined))
+    send_with_fds(ctl, &req.encode(), &fds).context("send the request to the helper (environment too large?)")
 }

@@ -138,6 +138,81 @@ fn tell(to_parent: OwnedFd, kind: u8, body: &[u8]) {
     }
 }
 
+/// In the forked child, after `adopt_limits` (which needs root): drop from
+/// root to the user for good. Groups, then gid and uid (real, effective and
+/// saved), checked to leave no way back to root; a session keyring the user
+/// may have (`own_session_keyring`); no capability left; and no_new_privs.
+/// The error says why it failed.
+fn drop_to_user(who: &Identity) -> std::result::Result<(), String> {
+    // SAFETY: plain syscalls on our own credentials; the helper is
+    // single-threaded, so the child may use the allocator.
+    unsafe {
+        if libc::setgroups(who.groups.len(), who.groups.as_ptr()) != 0
+            || libc::setresgid(who.gid, who.gid, who.gid) != 0
+            || libc::setresuid(who.uid, who.uid, who.uid) != 0
+        {
+            return Err(format!(
+                "dropping to uid {}: {}",
+                who.uid,
+                std::io::Error::last_os_error()
+            ));
+        }
+        let (mut r, mut e, mut s) = (0, 0, 0);
+        libc::getresuid(&mut r, &mut e, &mut s);
+        if (r, e, s) != (who.uid, who.uid, who.uid) || libc::setuid(0) == 0 {
+            return Err("privileges were not dropped".into());
+        }
+        own_session_keyring(who.uid)?;
+        if !capabilities_gone(std::fs::read_to_string("/proc/self/status").ok().as_deref()) {
+            return Err("capabilities survived the drop to the user, or cannot be checked".into());
+        }
+        // The network in here is the user's: a setuid program (sudo, su,
+        // anything PAM authenticates over the network) must not regain
+        // root in it.
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1
+        {
+            return Err(format!("setting no_new_privs: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+/// Put the inherited fds (`fds`, as received) back at the numbers they had
+/// in proxytun (`numbers`). Each is first copied to the lowest free number
+/// that is no one's target (a target may be held by one of them, or by ctl,
+/// done with now), staying under the caller's fd limit as userns mode
+/// would; the copies close on exec.
+fn restore_inherited(numbers: &[RawFd], fds: &[RawFd]) -> std::result::Result<(), String> {
+    let targets: std::collections::HashSet<RawFd> = numbers.iter().copied().collect();
+    let mut moved = Vec::new();
+    for (&n, &fd) in numbers.iter().zip(fds) {
+        let mut from = 3;
+        let m = loop {
+            // SAFETY: plain syscalls on fds we hold.
+            let m = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, from) };
+            if m < 0 {
+                return Err(format!("passing on fd {n}: {}", std::io::Error::last_os_error()));
+            }
+            if !targets.contains(&m) {
+                break m;
+            }
+            // SAFETY: m is the copy fcntl just made, held by nothing else;
+            // its number is a target, so it must not stay.
+            unsafe { libc::close(m) };
+            from = m + 1;
+        };
+        moved.push((n, m));
+    }
+    for (n, m) in moved {
+        // SAFETY: as above.
+        if unsafe { libc::dup2(m, n) } < 0 {
+            return Err(format!("passing on fd {n}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
 /// In the forked child, still root: leave sudo's session if asked
 /// (`detach`), take the caller's limits, drop to the user (groups, gid, uid,
 /// keyring; no capability may survive) and set no_new_privs, so no setuid
@@ -174,38 +249,12 @@ pub(super) fn become_program(
             }
             libc::write(w.as_raw_fd(), b"s".as_ptr().cast(), 1);
         }
-        if let Err(e) = adopt_limits(limits) {
-            return fail(e);
-        }
-        if libc::setgroups(who.groups.len(), who.groups.as_ptr()) != 0
-            || libc::setresgid(who.gid, who.gid, who.gid) != 0
-            || libc::setresuid(who.uid, who.uid, who.uid) != 0
-        {
-            return fail(format!(
-                "dropping to uid {}: {}",
-                who.uid,
-                std::io::Error::last_os_error()
-            ));
-        }
-        let (mut r, mut e, mut s) = (0, 0, 0);
-        libc::getresuid(&mut r, &mut e, &mut s);
-        if (r, e, s) != (who.uid, who.uid, who.uid) || libc::setuid(0) == 0 {
-            return fail("privileges were not dropped".into());
-        }
-        if let Err(e) = own_session_keyring(who.uid) {
-            return fail(e);
-        }
-        if !capabilities_gone(std::fs::read_to_string("/proc/self/status").ok().as_deref()) {
-            return fail("capabilities survived the drop to the user, or cannot be checked".into());
-        }
-        // The network in here is the user's: a setuid program (sudo, su,
-        // anything PAM authenticates over the network) must not regain
-        // root in it.
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-            || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1
-        {
-            return fail(format!("setting no_new_privs: {}", std::io::Error::last_os_error()));
-        }
+    }
+    if let Err(e) = adopt_limits(limits) {
+        return fail(e);
+    }
+    if let Err(e) = drop_to_user(who) {
+        return fail(e);
     }
     let mut buf = vec![0u8; REQUEST_MAX];
     let (n, fds) = match recv_with_fds(ctl, &mut buf) {
@@ -258,35 +307,13 @@ pub(super) fn become_program(
         }
     }
     wait_go(ctl);
-    // The inherited fds at the numbers they had in proxytun. Each is first
-    // copied to the lowest free number that is no one's target (a target
-    // may be held by one of them, or by ctl, done with now), staying under
-    // the caller's fd limit as userns mode would; the copies close on exec.
-    let targets: std::collections::HashSet<RawFd> = req.inherit.iter().copied().collect();
-    let mut moved = Vec::new();
-    for (&n, &fd) in req.inherit.iter().zip(inherit) {
-        let mut from = 3;
-        let m = loop {
-            // SAFETY: plain syscalls on fds we hold.
-            let m = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, from) };
-            if m < 0 {
-                return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
-            }
-            if !targets.contains(&m) {
-                break m;
-            }
-            unsafe { libc::close(m) };
-            from = m + 1;
-        };
-        moved.push((n, m));
-    }
-    for (n, m) in moved {
-        // SAFETY: as above.
-        if unsafe { libc::dup2(m, n) } < 0 {
-            return format!("passing on fd {n}: {}", std::io::Error::last_os_error());
-        }
+    if let Err(why) = restore_inherited(&req.inherit, inherit) {
+        return why;
     }
     let code = netns::exec(&req.argv, req.sigpipe_ignored);
+    // SAFETY: _exit has no preconditions; exec failed and said why. Not
+    // exit: this forked child must run nothing inherited from the helper
+    // (atexit handlers, buffered output).
     unsafe { libc::_exit(code) }
 }
 

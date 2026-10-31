@@ -129,7 +129,8 @@ fn ancestor_within(
 /// to come back.
 fn as_caller<T>(uid: libc::uid_t, gid: libc::gid_t, f: impl FnOnce() -> T) -> Result<T> {
     const KEEP: u32 = u32::MAX; // -1: leave this id as it is
-                                // SAFETY: plain syscalls on our own credentials.
+
+    // SAFETY: plain syscalls on our own credentials.
     unsafe {
         if libc::setgroups(0, std::ptr::null()) != 0
             || libc::setresgid(KEEP, gid, KEEP) != 0
@@ -163,7 +164,7 @@ pub fn helper_main(args: &[OsString]) -> ! {
 }
 
 /// Tell the client why, then fail.
-fn refuse(ctl: &OwnedFd, e: anyhow::Error) -> Result<()> {
+fn refuse<T>(ctl: &OwnedFd, e: anyhow::Error) -> Result<T> {
     send_error(
         ctl,
         &SetupError {
@@ -211,10 +212,7 @@ fn helper(args: &[OsString]) -> Result<()> {
         bail!("the socket was not created by the process that ran sudo");
     }
     let status = std::fs::read_to_string(format!("/proc/{}/status", cred.pid())).unwrap_or_default();
-    let who = match identity(sudo_uid, cred.uid(), cred.gid(), &status) {
-        Ok(w) => w,
-        Err(e) => return refuse(&ctl, e),
-    };
+    let who = identity(sudo_uid, cred.uid(), cred.gid(), &status).or_else(|e| refuse(&ctl, e))?;
     // sudoers may run its command in another security context (ROLE/TYPE, an
     // AppArmor profile): the program would carry it. Only the caller's will do.
     let label = |p: String| std::fs::read(format!("/proc/{p}/attr/current")).ok();
@@ -225,15 +223,10 @@ fn helper(args: &[OsString]) -> Result<()> {
         );
     }
     let own = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    if let Err(e) = same_confinement(&own, &status) {
-        return refuse(&ctl, e);
-    }
+    same_confinement(&own, &status).or_else(|e| refuse(&ctl, e))?;
     let caller = crate::procfs::proc_stat(cred.pid());
     let caller_pgrp = caller.map_or(-1, |s| s.pgrp);
-    let limits = match limits_of(cred.pid()) {
-        Ok(l) => l,
-        Err(e) => return refuse(&ctl, e),
-    };
+    let limits = limits_of(cred.pid()).or_else(|e| refuse(&ctl, e))?;
 
     // The namespaces first, still empty: the program is forked into them
     // before anything the client sends reaches a process of ours. The
@@ -267,6 +260,9 @@ fn helper(args: &[OsString]) -> Result<()> {
         if !why.is_empty() {
             eprintln!("proxytun (sudo helper): {why}");
         }
+        // SAFETY: _exit has no preconditions. Not exit: this forked child
+        // must run nothing inherited from the helper (atexit handlers,
+        // buffered output).
         unsafe { libc::_exit(126) };
     }
     drop((detach, to_parent)); // EOF should the program side die
@@ -276,13 +272,8 @@ fn helper(args: &[OsString]) -> Result<()> {
             // SAFETY: plain read into a local buffer.
             unsafe { libc::read(left.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
         }
-        let req = match read_report(&from_program) {
-            Ok(r) => r,
-            Err(e) => return refuse(&ctl, e),
-        };
-        if let Err(e) = validate(&req, caller_pgrp) {
-            return refuse(&ctl, e);
-        }
+        let req = read_report(&from_program).or_else(|e| refuse(&ctl, e))?;
+        validate(&req, caller_pgrp).or_else(|e| refuse(&ctl, e))?;
         let ns = match netns::configure_namespace(req.fake_range, false, &req.forwards) {
             Ok(v) => v,
             Err(e) => {

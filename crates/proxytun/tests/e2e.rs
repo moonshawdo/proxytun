@@ -2619,7 +2619,8 @@ fn under_sudo_a_setuid_program_cannot_regain_root() {
 }
 
 /// A client of the root helper that is not proxytun: it runs sudo itself
-/// and then misbehaves, or is merely slow, as `case` says.
+/// and then misbehaves, is merely slow, or looks at the program side
+/// (`dropped`), as `case` says.
 const PY_HELPER_CLIENT: &str = r#"
 import os, socket, struct, subprocess, sys, time
 binary, d, case = sys.argv[1:4]
@@ -2750,6 +2751,47 @@ if case == "silent":
     rc = p.wait(timeout=30)
     print(f"rc={rc} after {time.monotonic() - start:.0f}s", flush=True)
     sys.exit()
+if case == "dropped":
+    # Nothing sent yet, so the program side (the helper's child) has read
+    # nothing: it must be us already, give or take the time it takes to
+    # drop. Not found within 5 s fails too.
+    helper_pid = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+
+    def children():
+        for e in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                with open(f"/proc/{e}/stat") as f:
+                    if int(f.read().rsplit(")", 1)[1].split()[1]) == helper_pid:
+                        yield e
+            except OSError:
+                pass  # gone meanwhile
+
+    def state(pid):
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                st = dict(l.split(":", 1) for l in f.read().splitlines() if ":" in l)
+        except OSError:
+            return None
+        return (f"Uid {' '.join(st['Uid'].split())}, Gid {' '.join(st['Gid'].split())}, "
+                f"CapPrm {int(st['CapPrm'], 16)}, CapEff {int(st['CapEff'], 16)}, "
+                f"NoNewPrivs {st['NoNewPrivs'].strip()}")
+
+    me = f"Uid {' '.join([str(os.getuid())] * 4)}, Gid {' '.join([str(os.getgid())] * 4)}, "
+    want = me + "CapPrm 0, CapEff 0, NoNewPrivs 1"
+    seen = "not found"
+    deadline = time.monotonic() + 5
+    while seen != want and time.monotonic() < deadline:
+        for k in children():
+            seen = state(k) or seen
+            if seen == want:
+                break
+        else:
+            time.sleep(0.02)
+    print("program side:", seen, flush=True)
+    c.send(b"junk\0")
+    print("got:", c.recv(4096)[:2].decode(errors="replace"), flush=True)
+    print(f"rc={p.wait()}", flush=True)
+    sys.exit()
 rng, pgrp, inherit = {
     "range": ("10.0.0.0/30", os.getpgrp(), "-"),
     "pgrp": ("198.18.0.0/15", 1, "-"),
@@ -2849,6 +2891,29 @@ fn the_helper_trusts_neither_the_socket_nor_the_request() {
     for c in ["range", "pgrp", "fds"] {
         assert!(!dir.join(format!("ran-{c}")).exists(), "{c}: nothing may run");
     }
+}
+
+#[test]
+fn the_program_side_is_the_user_without_capabilities_and_with_no_new_privs_before_it_reads_the_request() {
+    require_centos7!("python3");
+    let dir = shared_dir("helper-dropped");
+    std::fs::write(dir.join("client.py"), PY_HELPER_CLIENT).unwrap();
+    let user = "python3 \"$D/client.py\" \"$BIN\" \"$D\" dropped > \"$D/out\" 2>&1";
+    let out = sh_like_centos7(&dir, "true", user);
+    let got = std::fs::read_to_string(dir.join("out")).unwrap();
+    assert_eq!(out.code, 0, "{got}\n{}", out.dump());
+    // Whatever a client sends lands in a process of the user's, which no
+    // setuid program in the user's network can take back to root.
+    assert!(
+        got.contains(
+            "program side: Uid 1000 1000 1000 1000, Gid 1000 1000 1000 1000, CapPrm 0, CapEff 0, NoNewPrivs 1\n"
+        ),
+        "{got}"
+    );
+    assert!(got.contains("malformed request"), "{got}");
+    // The helper's own complaint goes to the same file and may land before
+    // or after the client's "got" line.
+    assert!(got.contains("got: ER\n") && got.ends_with("rc=1\n"), "{got}");
 }
 
 /// Join a session keyring named argv[1], then run argv[2:].
