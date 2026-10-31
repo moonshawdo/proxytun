@@ -554,7 +554,7 @@ fn helper(args: &[OsString]) -> Result<()> {
     // SAFETY: plain syscall.
     let parent = unsafe { libc::getppid() };
     // Anyone else's socket learns nothing from us, not even why.
-    if !ancestor_within(parent, cred.pid(), 4, |p| crate::witness::proc_stat(p).map(|s| s.ppid)) {
+    if !ancestor_within(parent, cred.pid(), 4, |p| crate::procfs::proc_stat(p).map(|s| s.ppid)) {
         bail!("the socket was not created by the process that ran sudo");
     }
     let status = std::fs::read_to_string(format!("/proc/{}/status", cred.pid())).unwrap_or_default();
@@ -575,7 +575,7 @@ fn helper(args: &[OsString]) -> Result<()> {
     if let Err(e) = same_confinement(&own, &status) {
         return refuse(&ctl, e);
     }
-    let caller = crate::witness::proc_stat(cred.pid());
+    let caller = crate::procfs::proc_stat(cred.pid());
     let caller_pgrp = caller.map_or(-1, |s| s.pgrp);
     let limits = match limits_of(cred.pid()) {
         Ok(l) => l,
@@ -641,7 +641,7 @@ fn helper(args: &[OsString]) -> Result<()> {
         // cannot exec (and so make setpgid fail) before the go-ahead, which
         // follows our report.
         // SAFETY: plain syscall.
-        let joined = unsafe { libc::setpgid(pid, req.pgrp) } == 0 || crate::witness::pgrp_of(pid) == Some(req.pgrp);
+        let joined = unsafe { libc::setpgid(pid, req.pgrp) } == 0 || crate::procfs::pgrp_of(pid) == Some(req.pgrp);
         let report = format!("pid={pid} pgrp={}", if joined { "joined" } else { "alone" });
         netns::send_ok(&ctl, &ns, &report)
     })();

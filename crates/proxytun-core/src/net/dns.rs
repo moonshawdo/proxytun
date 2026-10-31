@@ -11,7 +11,7 @@
 //! There is no listening server here: queries arrive as captured packets
 //! (UDP, see `respond`) or captured connections to port 53 (TCP, `serve_tcp`).
 
-use crate::net::fakeip::FakePool;
+use crate::net::fakeip::{FakePool, FAKE_TTL};
 use anyhow::{anyhow, ensure, Context, Result};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{rdata, DNSClass, RData, Record, RecordType};
@@ -49,9 +49,6 @@ impl Default for DnsStats {
         }
     }
 }
-
-/// Fake answers live this long in the program's resolver cache.
-pub const FAKE_TTL: u32 = 60;
 
 /// What to do with a query after local processing.
 #[derive(Debug, PartialEq, Eq)]
@@ -222,7 +219,7 @@ pub async fn respond(
                 }
                 // Our own shortage (no fd for a socket): not the upstream's
                 // doing, and no reason to doubt upstream_dns.
-                Err(e) if crate::proxy::is_local_shortage(&e) => {
+                Err(e) if crate::errno::is_local_shortage(&e) => {
                     tracing::debug!(%upstream, ?via, "dns: cannot forward for lack of local resources: {e:#}");
                     None
                 }

@@ -613,7 +613,7 @@ fn sigpipe_disposition(ignored: bool) -> libc::sighandler_t {
 /// ours, and the program would bypass our DNS; since, it goes underneath.
 /// There: private, the host's later mounts staying out.
 fn propagation(release: &str) -> nix::mount::MsFlags {
-    match crate::doctor::parse_kernel(release) {
+    match crate::procfs::parse_kernel(release) {
         Some(v) if v >= (4, 11) => nix::mount::MsFlags::MS_SLAVE,
         _ => nix::mount::MsFlags::MS_PRIVATE,
     }

@@ -24,10 +24,13 @@ use std::time::{Duration, Instant};
 /// otherwise let random subdomains grow the table to gigabytes.
 pub const MAX_ENTRIES: u32 = 1 << 20;
 
+/// Fake answers live this long in the program's resolver cache.
+pub(crate) const FAKE_TTL: u32 = 60;
+
 /// How long a mapping stays out of reach of recycling after its last use:
 /// twice the TTL our DNS answers carry, for caches that keep an answer a
 /// while past it (serving it stale while they refresh).
-pub const REUSE_AFTER: Duration = Duration::from_secs(2 * super::dns::FAKE_TTL as u64);
+pub const REUSE_AFTER: Duration = Duration::from_secs(2 * FAKE_TTL as u64);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PoolFull;
@@ -298,7 +301,7 @@ mod tests {
         // Within the TTL of our answer, a.com's address may still be in the
         // program's cache: handing it to c.com would send that traffic there.
         // So it may a little past it, in a cache serving stale answers.
-        let ttl = Duration::from_secs(super::super::dns::FAKE_TTL as u64);
+        let ttl = Duration::from_secs(FAKE_TTL as u64);
         assert_eq!(p.alloc_at("c.com", t + ttl + Duration::from_secs(1)), Err(PoolFull));
         assert_eq!(p.alloc_at("c.com", t + REUSE_AFTER / 2), Err(PoolFull));
         // Asked again meanwhile: the clock restarts.

@@ -4,11 +4,12 @@
 //! group / straight out / nowhere.
 
 use crate::balancer::Registry;
-use crate::config::{env_proxies, Config};
-use crate::policy::Policy;
+use crate::config::Config;
+use crate::net::fakeip::FakeGuard;
+use crate::policy::{env_proxies, Policy};
 use crate::proxy;
 use crate::sniff::{self, Sniffed};
-use crate::types::{Decision, Pending, Target};
+use crate::types::{Decision, Target};
 use anyhow::{anyhow, Result};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -113,6 +114,13 @@ pub fn log_closed(start: Instant, dial: Duration, via: &str, moved: &Transfer, r
         Ok(()) => tracing::info!(ms, dial_ms, via = %via, up, down, "closed"),
         Err(e) => tracing::info!(ms, dial_ms, via = %via, up, down, "closed: {e:#}"),
     }
+}
+
+/// One captured connection handed to the relay: where the program meant to go.
+pub struct Pending {
+    pub target: Target,
+    /// Keeps the fake-ip mapping pinned (un-evictable) while the connection lives.
+    pub guard: Option<FakeGuard>,
 }
 
 /// Carry one accepted connection to its target and log how it ended.
@@ -380,8 +388,8 @@ async fn dial_direct(t: &Target) -> Result<TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{env_proxies, Config};
-    use crate::types::Pending;
+    use crate::config::Config;
+    use crate::policy::env_proxies;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

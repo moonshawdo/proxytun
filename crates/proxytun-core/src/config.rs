@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use ipnet::{IpNet, Ipv4Net};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 
 pub const DEFAULT_GROUP: &str = "default";
@@ -597,78 +597,6 @@ pub fn parse_proxy_url(url: &str) -> Result<ProxyCfg> {
     })
 }
 
-/// Proxy endpoints named by the program's own environment (`http_proxy`,
-/// `https_proxy`, `all_proxy`, any case). Connections to these must never be
-/// intercepted a second time.
-#[derive(Debug, Default, PartialEq, Eq, Clone)]
-pub struct EnvProxies {
-    pub ips: Vec<(IpAddr, u16)>,
-    pub domains: Vec<(String, u16)>,
-}
-
-pub fn env_proxies<I>(vars: I) -> EnvProxies
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    const KEYS: [&str; 3] = ["http_proxy", "https_proxy", "all_proxy"];
-    let mut out = EnvProxies::default();
-    for (k, v) in vars {
-        if !KEYS.contains(&k.to_ascii_lowercase().as_str()) || v.is_empty() {
-            continue;
-        }
-        let Some((host, ports)) = proxy_endpoint(&v) else {
-            continue;
-        };
-        for port in ports {
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                if !out.ips.contains(&(ip, port)) {
-                    out.ips.push((ip, port));
-                }
-            } else {
-                let host = host.to_ascii_lowercase();
-                if !out.domains.contains(&(host.clone(), port)) {
-                    out.domains.push((host, port));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Extract the host and the ports it may be reached on from values like
-/// `http://u:p@10.0.0.1:8080/`, `socks5h://[::1]:1080`, or a bare
-/// `host:port`.
-fn proxy_endpoint(v: &str) -> Option<(String, Vec<u16>)> {
-    let (scheme, rest) = match v.split_once("://") {
-        Some((s, r)) => (Some(s.to_ascii_lowercase()), r),
-        None => (None, v),
-    };
-    let rest = rest.split('/').next()?;
-    let hostport = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
-    // Without a port, clients disagree: curl and git go to 1080 for any
-    // scheme, Python, Go, wget, npm and apt to 80 for http:// (443 for
-    // https://). Either is the program's own proxy.
-    let default_ports = match scheme.as_deref() {
-        Some("https") => vec![443],
-        Some("socks5" | "socks5h" | "socks4" | "socks4a" | "socks") => vec![1080],
-        _ => vec![80, 1080],
-    };
-    if let Some(stripped) = hostport.strip_prefix('[') {
-        let (h, tail) = stripped.split_once(']')?;
-        let ports = match tail.strip_prefix(':') {
-            Some(p) => vec![p.parse().ok()?],
-            None => default_ports,
-        };
-        return Some((h.to_string(), ports));
-    }
-    match hostport.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() => Some((h.to_string(), vec![p.parse().ok()?])),
-        Some(_) => None,
-        None if !hostport.is_empty() => Some((hostport.to_string(), default_ports)),
-        None => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,60 +956,6 @@ mod tests {
         assert_eq!(c.proxies[0].kind, ProxyKind::Http);
         assert_eq!(c.groups.len(), 1);
         assert!(c.override_proxy("socks5://not-an-addr").is_err());
-    }
-
-    fn env(pairs: &[(&str, &str)]) -> EnvProxies {
-        env_proxies(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
-    }
-
-    #[test]
-    fn env_proxy_extraction() {
-        let e = env(&[
-            ("http_proxy", "http://user:pw@10.0.0.5:8080/"),
-            ("HTTPS_PROXY", "http://10.0.0.5:8080"),
-            ("ALL_PROXY", "socks5h://[::1]:1081"),
-            ("no_proxy", "localhost"),
-            ("FOO", "http://9.9.9.9:1"),
-        ]);
-        assert_eq!(
-            e.ips,
-            vec![("10.0.0.5".parse().unwrap(), 8080), ("::1".parse().unwrap(), 1081)],
-            "deduplicated, unrelated vars ignored"
-        );
-        assert!(e.domains.is_empty());
-    }
-
-    #[test]
-    fn env_proxy_hostname_and_default_ports() {
-        let e = env(&[
-            ("http_proxy", "Proxy.Corp.Example"),
-            ("HTTP_PROXY", "http://plain.example"),
-            ("https_proxy", "https://secure.example"),
-            ("all_proxy", "socks5://s.example"),
-        ]);
-        // Where curl and git connect (1080), and where pip, Go, wget, npm
-        // and apt do (80): both.
-        assert_eq!(
-            e.domains,
-            vec![
-                ("proxy.corp.example".to_string(), 80),
-                ("proxy.corp.example".to_string(), 1080),
-                ("plain.example".to_string(), 80),
-                ("plain.example".to_string(), 1080),
-                ("secure.example".to_string(), 443),
-                ("s.example".to_string(), 1080)
-            ]
-        );
-    }
-
-    #[test]
-    fn env_proxy_garbage_is_ignored() {
-        let e = env(&[
-            ("http_proxy", ""),
-            ("https_proxy", "http://:80"),
-            ("all_proxy", "host:notaport"),
-        ]);
-        assert_eq!(e, EnvProxies::default());
     }
 
     #[test]

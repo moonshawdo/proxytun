@@ -11,6 +11,7 @@ mod nat;
 mod netcfg;
 mod netns;
 mod packet;
+mod procfs;
 mod sudo;
 mod witness;
 

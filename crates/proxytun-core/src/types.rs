@@ -1,7 +1,6 @@
 //! Shared types passed between traffic capture (the TUN side) and the async
 //! relay/DNS side.
 
-use crate::net::fakeip::FakeGuard;
 use std::net::Ipv4Addr;
 
 /// The *real* target the relay should connect to, after fake-ip reverse lookup.
@@ -39,11 +38,4 @@ pub enum Decision {
     Direct,
     /// Drop the connection.
     Block,
-}
-
-/// One captured connection handed to the relay: where the program meant to go.
-pub struct Pending {
-    pub target: Target,
-    /// Keeps the fake-ip mapping pinned (un-evictable) while the connection lives.
-    pub guard: Option<FakeGuard>,
 }

@@ -14,9 +14,9 @@ use crate::packet::{self, Packet, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_RST, TCP_SY
 use anyhow::{anyhow, bail, Result};
 use proxytun_core::net::dns::{self, DnsStats, Transport};
 use proxytun_core::net::fakeip::{FakeGuard, FakePool};
-use proxytun_core::net::relay::{self, Live, Traffic};
+use proxytun_core::net::relay::{self, Live, Pending, Traffic};
 use proxytun_core::throttle;
-use proxytun_core::types::{Pending, Target};
+use proxytun_core::types::Target;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};

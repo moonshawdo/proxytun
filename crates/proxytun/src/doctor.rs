@@ -6,6 +6,7 @@
 
 use crate::hostports;
 use crate::netns::{self, Setup, UsernsUnusable};
+use crate::procfs::parse_kernel;
 use proxytun_core::balancer::Node;
 use proxytun_core::config::Config;
 use proxytun_core::health;
@@ -65,14 +66,6 @@ fn check_arch() -> Check {
     } else {
         check("architecture", Status::Warn, "only x86-64 is tested")
     }
-}
-
-/// Parse "3.10.0-1160.el7.x86_64" -> (3, 10).
-pub fn parse_kernel(release: &str) -> Option<(u32, u32)> {
-    let mut it = release.split(|c: char| !c.is_ascii_digit());
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next()?.parse().ok()?;
-    Some((major, minor))
 }
 
 fn check_kernel() -> Check {
@@ -260,15 +253,6 @@ fn check_proxies(cfg: &Config) -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn kernel_release_parsing() {
-        assert_eq!(parse_kernel("3.10.0-1160.el7.x86_64"), Some((3, 10)));
-        assert_eq!(parse_kernel("6.18.54.1-microsoft-standard-WSL2"), Some((6, 18)));
-        assert_eq!(parse_kernel("5.4"), Some((5, 4)));
-        assert_eq!(parse_kernel("garbage"), None);
-        assert_eq!(parse_kernel(""), None);
-    }
 
     #[test]
     fn report_exit_code_reflects_failures() {

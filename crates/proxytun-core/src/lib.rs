@@ -6,6 +6,7 @@
 
 pub mod balancer;
 pub mod config;
+pub(crate) mod errno;
 pub mod health;
 pub mod net;
 pub mod policy;

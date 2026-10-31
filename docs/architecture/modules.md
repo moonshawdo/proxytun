@@ -25,6 +25,10 @@ flowchart LR
         SUDO --> NETNS
         CAP --> NAT["nat.rs<br/>地址改写表"]
         CAP --> PKT["packet.rs<br/>包解析与改写"]
+        APP --> PFS["procfs.rs<br/>/proc 解析"]
+        SUDO --> PFS
+        NETNS --> PFS
+        DOC --> PFS
     end
     subgraph CORE["crates/proxytun-core"]
         RELAY["net/relay.rs<br/>route, pump"]
@@ -36,6 +40,7 @@ flowchart LR
         HEA["health.rs<br/>探测"]
         SNF["sniff.rs<br/>SNI / Host"]
         CFG["config.rs<br/>配置"]
+        ERR["errno.rs<br/>按 errno 分类"]
     end
     CAP --> RELAY
     CAP --> DNS
@@ -48,6 +53,9 @@ flowchart LR
     PRX --> BAL
     HEA --> BAL
     HEA --> PRX
+    PRX --> ERR
+    HEA --> ERR
+    DNS --> ERR
     CAP --> FAKE
     HP --> CAP
     MAIN --> NETNS
@@ -71,20 +79,22 @@ flowchart LR
 | `hostports.rs` | 启动时扫描主机上回环与通配地址的监听(`/proc/net/tcp`、`tcp6`),算出命名空间里要开的地址(监听由准备进程或特权助手绑定);accept 后把连接转到主机 |
 | `witness.rs` | 见证进程:double-fork、改名为 `signal-witness`、屏蔽 INT/QUIT/TERM,经管道回答"有哪些待处理信号" |
 | `doctor.rs` | `--doctor`:按真实路径建一次命名空间跑 `true`,报告模式、TUN、Yama、主机端口、每个代理 |
+| `procfs.rs` | 解析 `/proc/<pid>/stat` 里的父进程、进程组、会话(从最后一个 `)` 往后数，程序名含空格和括号也不错位)与内核版本号;信号转发、sudo 助手(校验调用者、加入进程组)、挂载传播方式、自检都用它 |
 
 ### 4.3 `crates/proxytun-core` 各模块
 
 | 文件 | 职责 |
 |---|---|
-| `config.rs` | 配置文件的解析、规范化与校验;`--proxy` 覆盖;程序环境变量里的代理地址 |
-| `policy.rs` | 直连判定(`localnet`、程序自己的代理)与规则匹配，纯逻辑 |
+| `config.rs` | 配置文件的解析、规范化与校验;`--proxy` 覆盖 |
+| `policy.rs` | 程序环境变量里的代理地址;直连判定(`localnet`、程序自己的代理)与规则匹配，纯逻辑 |
 | `balancer.rs` | 代理节点(健康、活跃连接数、延迟)与代理组，六种选择策略，只读原子量、不加锁 |
 | `health.rs` | 并发的主动健康探测(TCP 连接 + SOCKS5 问候，含认证) |
 | `proxy/` | SOCKS5(ATYP=3 域名)与 HTTP CONNECT 握手，失败分类(代理的问题 / 目标的问题 / 本机资源不足),组内换成员重试 |
 | `sniff.rs` | 从首包里取 TLS SNI 或 HTTP Host,纯函数 |
-| `net/fakeip.rs` | 假 IP 池:LRU、连接期间钉住、120 秒内不回收、最多 100 万条 |
+| `net/fakeip.rs` | 假 IP 池:应答的 TTL(60 秒)、LRU、连接期间钉住、120 秒内不回收、最多 100 万条 |
 | `net/dns.rs` | 假 DNS 应答(A / AAAA / HTTPS / SVCB / localhost)、向上游转发(UDP、TCP)与应答校验、转发并发上限(256) |
-| `net/relay.rs` | `route`:嗅探、规则、拨号(代理组或直连)、双向拷贝、出错时两端 RST、出站 keepalive;direct 规则的域名解析上限 |
+| `net/relay.rs` | `Pending`(捕获侧交来的连接：目标与钉住假 IP 的守卫);`route`:嗅探、规则、拨号(代理组或直连)、双向拷贝、出错时两端 RST、出站 keepalive;direct 规则的域名解析上限 |
+| `errno.rs` | 按错误链里的 errno 判断失败原因：本机资源不足(fd、缓冲区、内存、本地端口)不算代理或上游的问题;拨号、健康探测、DNS 转发都用它 |
 | `throttle.rs` | 会按包、按查询、按 accept 频率重复的日志，限速为每 10 秒一条 |
 | `types.rs` | 捕获侧与中继侧之间传递的类型(目标、规则判定结果) |
 

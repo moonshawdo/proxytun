@@ -7,8 +7,8 @@
 use crate::capture::{self, Shared, Snapshot, Stats};
 use crate::nat::Nat;
 use crate::netns::{self, Addrs, Setup, UsernsUnusable};
-use crate::witness::{self, Witness};
-use crate::{hostports, sudo};
+use crate::witness::Witness;
+use crate::{hostports, procfs, sudo};
 use anyhow::{Context, Result};
 use ipnet::Ipv4Net;
 use proxytun_core::config::{url_has_credentials, Config};
@@ -547,7 +547,7 @@ fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option
                 };
                 // SAFETY: plain syscall.
                 let ours = unsafe { libc::getpgrp() };
-                if let Some(to) = forward_to(terminal || saw, terminal, pid, witness::pgrp_of(pid), ours) {
+                if let Some(to) = forward_to(terminal || saw, terminal, pid, procfs::pgrp_of(pid), ours) {
                     tracing::debug!(sig, to, "forwarding the signal to the program");
                     unsafe { libc::kill(to, sig) };
                 }
