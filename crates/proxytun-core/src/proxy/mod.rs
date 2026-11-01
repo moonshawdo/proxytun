@@ -237,7 +237,7 @@ pub(crate) mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The default `connect_timeout_ms`.
-    const CT: Duration = Duration::from_secs(5);
+    const CT: Duration = Duration::from_secs(10);
 
     /// A listener whose accept queue is full: the kernel drops further SYNs,
     /// so a connect to it hangs, as to a stuck service or a host that never
@@ -614,7 +614,7 @@ pub(crate) mod tests {
         let took = start.elapsed();
         assert!(
             took < Duration::from_secs(3),
-            "the configured 200 ms, not 5 s: {took:?}"
+            "the configured 200 ms, not the default 10 s: {took:?}"
         );
         assert!(format!("{e:#}").contains("connect to proxy h timed out"), "{e:#}");
         assert!(!g.nodes[0].is_healthy(), "a proxy that never accepts is failing");

@@ -166,8 +166,11 @@ fn default_sniff_timeout() -> u64 {
 fn default_retries() -> u32 {
     2
 }
+// Upstream proxies may take their time (their own timeouts towards the
+// destination are often long): what we wait for from them defaults to 10 s,
+// as the fixed handshake timeout (`proxy::HANDSHAKE_TIMEOUT`) does.
 fn default_connect_timeout() -> u64 {
-    5000
+    10_000
 }
 fn yes() -> bool {
     true
@@ -264,7 +267,7 @@ fn default_fail_threshold() -> u32 {
     3
 }
 fn default_probe_timeout() -> u64 {
-    3000
+    10_000
 }
 
 impl Default for HealthCfg {
@@ -547,7 +550,9 @@ mod tests {
         assert_eq!(c.fake_ip_range, "198.18.0.0/15");
         assert!(c.localnet.is_empty(), "127.0.0.0/8 never reaches proxytun");
         assert_eq!(c.retries, 2);
-        assert_eq!(c.connect_timeout_ms, 5000);
+        // What we wait for from an upstream proxy: 10 s by default.
+        assert_eq!(c.connect_timeout_ms, 10_000);
+        assert_eq!(c.health.timeout_ms, 10_000);
         assert_eq!(c.upstream_dns, None, "the host's resolver unless set");
         assert!(c.host_ports_forward);
         assert!(c.direct_to_proxies);
@@ -779,15 +784,19 @@ mod tests {
     }
 
     #[test]
-    fn the_example_names_the_real_connect_timeout_key_with_its_default() {
+    fn the_example_names_the_real_timeout_keys_with_their_defaults() {
         let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proxytun.toml")).unwrap();
-        let line = text
-            .lines()
-            .find(|l| l.starts_with("# connect_timeout_ms"))
-            .expect("documented in the example");
-        let c = Config::parse(&format!("{}\n{MINIMAL}", &line[2..])).unwrap();
+        let line = |key: &str| -> String {
+            let l = text.lines().find(|l| l.starts_with(&format!("# {key} ="))).expect(key);
+            l[2..].to_owned()
+        };
+        let default = Config::parse(MINIMAL).unwrap();
+        let c = Config::parse(&format!("{}\n{MINIMAL}", line("connect_timeout_ms"))).unwrap();
         assert!(c.ignored_keys.is_empty(), "{:?}", c.ignored_keys);
-        assert_eq!(c.connect_timeout_ms, Config::parse(MINIMAL).unwrap().connect_timeout_ms);
+        assert_eq!(c.connect_timeout_ms, default.connect_timeout_ms);
+        let c = Config::parse(&format!("{MINIMAL}\n[health]\n{}", line("timeout_ms"))).unwrap();
+        assert!(c.ignored_keys.is_empty(), "{:?}", c.ignored_keys);
+        assert_eq!(c.health.timeout_ms, default.health.timeout_ms);
     }
 
     #[test]

@@ -140,7 +140,7 @@ sniff_ports = [80, 443, 8443]
 host_ports_forward = true        # 主机的回环监听转发进命名空间
 host_ports_exclude = []          # 程序要自己监听的端口
 retries = 2                      # 代理握手失败时再换几个出口
-connect_timeout_ms = 5000        # 连代理 / 直连 / 主机端口的建连超时, 超时向程序发 RST
+connect_timeout_ms = 10000       # 连代理 / 直连 / 主机端口的建连超时, 超时向程序发 RST
 
 [[proxies]]
 name = "clash"

@@ -210,7 +210,7 @@ mod tests {
             tokio::io::AsyncReadExt::read(&mut c, &mut [0u8; 1]),
         )
         .await
-        .expect("given up after the configured 200 ms, not 5 s or the kernel's two minutes");
+        .expect("given up after the configured 200 ms, not the default 10 s or the kernel's two minutes");
         assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
     }
 

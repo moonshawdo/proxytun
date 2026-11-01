@@ -266,7 +266,9 @@ fn check_proxies(cfg: &Config) -> Vec<Check> {
         .iter()
         .map(|p| {
             let name = format!("{} {}", p.name, p.addr);
-            let r = Node::new(p.clone()).and_then(|n| rt.block_on(health::probe(&n, Duration::from_secs(3))));
+            // As the health checker would judge it.
+            let within = Duration::from_millis(cfg.health.timeout_ms);
+            let r = Node::new(p.clone()).and_then(|n| rt.block_on(health::probe(&n, within)));
             match r {
                 Ok(rtt) => check(
                     "upstream proxy",
@@ -282,6 +284,35 @@ fn check_proxies(cfg: &Config) -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxies_are_judged_with_the_health_probe_timeout() {
+        // Takes the connection (the kernel does) and never greets.
+        let mute = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = Config::parse(&format!(
+            "[[proxies]]\nname=\"m\"\ntype=\"socks5\"\naddr=\"{}\"\n[health]\ntimeout_ms = 200\n",
+            mute.local_addr().unwrap()
+        ))
+        .unwrap();
+        let start = std::time::Instant::now();
+        let checks = check_proxies(&cfg);
+        let took = start.elapsed();
+        assert!(
+            matches!(
+                checks[..],
+                [Check {
+                    status: Status::Fail,
+                    ..
+                }]
+            ),
+            "{:?}",
+            checks.len()
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "the configured 200 ms, not a fixed timeout: {took:?}"
+        );
+    }
 
     #[test]
     fn report_exit_code_reflects_failures() {

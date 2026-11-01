@@ -50,8 +50,10 @@
 # hanging (on its own the kernel retries for about two minutes, all the while
 # holding a relay slot), and a proxy that did not accept counts as failing:
 # the next group member is tried (see retries). Range 100 to 60000; taken up
-# on SIGHUP. Too short, and connections to distant proxies fail.
-# connect_timeout_ms = 5000
+# on SIGHUP. Too short, and connections to distant proxies fail. The default
+# is 10 s, as for everything we wait for from an upstream proxy (its
+# handshake replies, health probes): proxies may take their time.
+# connect_timeout_ms = 10000
 
 # --- upstream proxy -------------------------------------------------------
 # The address can be overridden at run time with --proxy URL or $PROXYTUN_PROXY.
@@ -76,7 +78,7 @@ addr = "172.25.32.1:7897"
 # [health]
 # interval_secs = 10
 # fail_threshold = 3
-# timeout_ms = 3000
+# timeout_ms = 10000
 
 # --- rules, first match wins ------------------------------------------------
 # proxytun's own routing; with Clash deciding for you, usually none are needed.

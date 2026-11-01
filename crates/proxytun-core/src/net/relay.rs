@@ -422,7 +422,7 @@ mod tests {
         let SocketAddr::V4(hole) = hole else { unreachable!() };
         let mut c = relay_pending(&live, pending(Target::V4(*hole.ip(), hole.port()))).await;
         let r = tokio::time::timeout(Duration::from_secs(3), c.read(&mut [0u8; 1])).await;
-        let r = r.expect("given up after the configured 200 ms, not 5 s");
+        let r = r.expect("given up after the configured 200 ms, not the default 10 s");
         assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
         assert!(seen.lock().unwrap().is_empty(), "no fallback to the proxy");
     }
@@ -437,7 +437,7 @@ mod tests {
         let live = Arc::new(Live::new(&cfg, EnvProxies::default()).unwrap());
         let mut c = relay_pending(&live, pending(Target::Domain("x.example".into(), 443))).await;
         let r = tokio::time::timeout(Duration::from_secs(3), c.read(&mut [0u8; 1])).await;
-        let r = r.expect("given up after the configured 200 ms, not 5 s");
+        let r = r.expect("given up after the configured 200 ms, not the default 10 s");
         assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
     }
 
