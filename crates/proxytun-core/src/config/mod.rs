@@ -51,6 +51,13 @@ pub struct Config {
     #[serde(default = "default_retries")]
     pub retries: u32,
 
+    /// How long a TCP connect out may take (to a proxy, to a destination
+    /// reached directly, to a forwarded host port) before the connection is
+    /// given up: the program's side is reset, and a proxy that never accepts
+    /// counts as failing (another member is tried).
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_ms: u64,
+
     /// Recover the hostname of connections to a literal IP by peeking the first
     /// bytes (TLS SNI / HTTP Host). Catches programs that bypass our DNS
     /// (Chrome's DoH, hard-coded IPs). Default true.
@@ -158,6 +165,9 @@ fn default_sniff_timeout() -> u64 {
 }
 fn default_retries() -> u32 {
     2
+}
+fn default_connect_timeout() -> u64 {
+    5000
 }
 fn yes() -> bool {
     true
@@ -453,6 +463,10 @@ impl Config {
         if self.sniff_timeout_ms == 0 || self.sniff_timeout_ms > 10_000 {
             bail!("sniff_timeout_ms must be between 1 and 10000");
         }
+        // Too short, and even a healthy remote proxy could not be reached.
+        if self.connect_timeout_ms < 100 || self.connect_timeout_ms > 60_000 {
+            bail!("connect_timeout_ms must be between 100 and 60000");
+        }
         let net: Ipv4Net = self
             .fake_ip_range
             .parse()
@@ -533,6 +547,7 @@ mod tests {
         assert_eq!(c.fake_ip_range, "198.18.0.0/15");
         assert!(c.localnet.is_empty(), "127.0.0.0/8 never reaches proxytun");
         assert_eq!(c.retries, 2);
+        assert_eq!(c.connect_timeout_ms, 5000);
         assert_eq!(c.upstream_dns, None, "the host's resolver unless set");
         assert!(c.host_ports_forward);
         assert!(c.direct_to_proxies);
@@ -542,6 +557,25 @@ mod tests {
         assert_eq!(c.sniff_timeout_ms, 300);
         assert_eq!(c.sniff_skip_domains, vec!["cloudflare-ech.com"]);
         assert!(c.sniff_override_destination);
+    }
+
+    #[test]
+    fn connect_timeout_parses_and_stays_within_its_range() {
+        let c = Config::parse(&format!("connect_timeout_ms = 1500\n{MINIMAL}")).unwrap();
+        assert_eq!(c.connect_timeout_ms, 1500);
+        for ok in [100, 60_000] {
+            assert!(
+                Config::parse(&format!("connect_timeout_ms = {ok}\n{MINIMAL}")).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [0, 99, 60_001] {
+            let e = Config::parse(&format!("connect_timeout_ms = {bad}\n{MINIMAL}")).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("connect_timeout_ms must be between 100 and 60000"),
+                "{bad}: {e:#}"
+            );
+        }
     }
 
     #[test]
@@ -742,6 +776,18 @@ mod tests {
             "example uses unknown keys: {:?}",
             c.ignored_keys
         );
+    }
+
+    #[test]
+    fn the_example_names_the_real_connect_timeout_key_with_its_default() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proxytun.toml")).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("# connect_timeout_ms"))
+            .expect("documented in the example");
+        let c = Config::parse(&format!("{}\n{MINIMAL}", &line[2..])).unwrap();
+        assert!(c.ignored_keys.is_empty(), "{:?}", c.ignored_keys);
+        assert_eq!(c.connect_timeout_ms, Config::parse(MINIMAL).unwrap().connect_timeout_ms);
     }
 
     #[test]

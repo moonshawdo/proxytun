@@ -69,9 +69,11 @@ pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: 
             tracing::info!(ms = start.elapsed().as_millis() as u64, "closed: blocked by a rule");
             return Ok(());
         }
-        Decision::Direct => dial_direct(target).await.map(|s| (s, None, "direct".to_string())),
+        Decision::Direct => dial_direct(target, live.connect_timeout)
+            .await
+            .map(|s| (s, None, "direct".to_string())),
         Decision::Proxy { group } => match live.registry.group(&group) {
-            Some(g) => proxy::dial_group(g, target, live.retries, live.fail_threshold)
+            Some(g) => proxy::dial_group(g, target, live.retries, live.fail_threshold, live.connect_timeout)
                 .await
                 .map(|(s, conn, node)| (s, Some(conn), node)),
             None => Err(anyhow!("rule names unknown group '{group}'")),
@@ -209,14 +211,14 @@ async fn lookup(
 
 /// Direct connect. For a domain we must resolve it ourselves now, because the
 /// program was handed a *fake* IP; the real one was never resolved on its side.
-async fn dial_direct(t: &Target) -> Result<TcpStream> {
+async fn dial_direct(t: &Target, timeout: Duration) -> Result<TcpStream> {
     let fut = async {
         match t {
             Target::Domain(d, p) => TcpStream::connect(&lookup(&LOOKUPS, d, *p).await?[..]).await,
             Target::V4(ip, p) => TcpStream::connect((*ip, *p)).await,
         }
     };
-    Ok(tokio::time::timeout(proxy::CONNECT_TIMEOUT, fut)
+    Ok(tokio::time::timeout(timeout, fut)
         .await
         .map_err(|_| anyhow!("direct connect to {t:?} timed out"))??)
 }
@@ -404,6 +406,39 @@ mod tests {
         );
         assert_eq!(got, b"hello from the lan");
         assert!(seen.lock().unwrap().is_empty(), "localnet never reaches the proxy");
+    }
+
+    #[tokio::test]
+    async fn a_direct_destination_that_never_answers_is_reset_after_the_connect_timeout() {
+        let (proxy, seen) = echo_socks5().await;
+        let (_l, _queued, hole) = crate::proxy::tests::black_hole();
+        let cfg = Config::parse(&format!(
+            "connect_timeout_ms = 200\n[proxy]\ntype=\"socks5\"\naddr=\"{proxy}\"\n\
+             [[rules]]\nmatch=\"ip-cidr\"\nvalue=\"{}/32\"\naction=\"direct\"",
+            hole.ip()
+        ))
+        .unwrap();
+        let live = Arc::new(Live::new(&cfg, EnvProxies::default()).unwrap());
+        let SocketAddr::V4(hole) = hole else { unreachable!() };
+        let mut c = relay_pending(&live, pending(Target::V4(*hole.ip(), hole.port()))).await;
+        let r = tokio::time::timeout(Duration::from_secs(3), c.read(&mut [0u8; 1])).await;
+        let r = r.expect("given up after the configured 200 ms, not 5 s");
+        assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
+        assert!(seen.lock().unwrap().is_empty(), "no fallback to the proxy");
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_never_accepts_resets_the_program_after_the_connect_timeout() {
+        let (_l, _queued, hole) = crate::proxy::tests::black_hole();
+        let cfg = Config::parse(&format!(
+            "connect_timeout_ms = 200\n[proxy]\ntype=\"socks5\"\naddr=\"{hole}\"\n"
+        ))
+        .unwrap();
+        let live = Arc::new(Live::new(&cfg, EnvProxies::default()).unwrap());
+        let mut c = relay_pending(&live, pending(Target::Domain("x.example".into(), 443))).await;
+        let r = tokio::time::timeout(Duration::from_secs(3), c.read(&mut [0u8; 1])).await;
+        let r = r.expect("given up after the configured 200 ms, not 5 s");
+        assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
     }
 
     #[tokio::test]

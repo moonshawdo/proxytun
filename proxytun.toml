@@ -43,6 +43,16 @@
 # Other group members to try when a proxy handshake fails.
 # retries = 2
 
+# --- connecting out --------------------------------------------------------
+# How long a TCP connect may take, in milliseconds: to a proxy, to a
+# destination reached directly (direct rules, localnet), and to a forwarded
+# host port. Past it the program's connection is reset rather than left
+# hanging (on its own the kernel retries for about two minutes, all the while
+# holding a relay slot), and a proxy that did not accept counts as failing:
+# the next group member is tried (see retries). Range 100 to 60000; taken up
+# on SIGHUP. Too short, and connections to distant proxies fail.
+# connect_timeout_ms = 5000
+
 # --- upstream proxy -------------------------------------------------------
 # The address can be overridden at run time with --proxy URL or $PROXYTUN_PROXY.
 # proxytun dials it from the host, so 127.0.0.1 here means the host.

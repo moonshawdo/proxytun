@@ -33,6 +33,7 @@
 | `host_ports_forward` | 布尔 | `true` | | 重启 |
 | `host_ports_exclude` | 端口数组 | `[]` | 0 ~ 65535 | 重启 |
 | `retries` | 整数 | `2` | ≥ 0 | 热加载 |
+| `connect_timeout_ms` | 整数(毫秒) | `5000` | 100 ~ 60000 | 热加载 |
 | `[health] interval_secs` | 整数(秒) | `10` | 1 ~ 3600 | 热加载 |
 | `[health] fail_threshold` | 整数 | `3` | 1 ~ 100 | 热加载 |
 | `[health] timeout_ms` | 整数(毫秒) | `3000` | 100 ~ 60000 | 热加载 |
@@ -203,11 +204,23 @@ systemd-resolved 的 unix socket 解析),proxytun 先看一眼程序发出的第
 - 类型：非负整数;默认 `2`;可热加载。
 - 与代理握手失败时，最多再换几个组内成员重试。总尝试次数 = `retries` + 1,且不超过组内健康成员的数量。`0` 表示不换。
 - 只在握手阶段重试：这时程序的数据一个字节都还没发出，重试是安全的。
-- 会换成员重试：连不上代理、连接超时(5 秒)、问候超时、代理回复"一般性失败"或访问控制拒绝(SOCKS5 0x01、0x02,HTTP 403、500、503 等)、
+- 会换成员重试：连不上代理、连接超时(`connect_timeout_ms`,默认 5 秒,见 3.6)、问候超时、代理回复"一般性失败"或访问控制拒绝(SOCKS5 0x01、0x02,HTTP 403、500、503 等)、
   SOCKS5 代理收下请求后直接断开(`ssh -D` 连不上目标时就是这样)、本机临时端口耗尽。
 - 不重试：代理明确回复目标拒绝、不可达(SOCKS5 0x03 ~ 0x06,HTTP 502、504),或代理等目标超时(换一个代理也会是同样的结果)。
   本机 fd / 内存不足，或目标域名为空、超过 255 字节(SOCKS5 编码不了)时也直接失败。
 - 所有尝试都失败时向程序发 RST 关闭连接，**不会回落到直连**。
+
+### 3.6 建连超时
+
+#### `connect_timeout_ms`
+
+- 类型：整数，毫秒;默认 `5000`;范围 100 ~ 60000;可热加载(之后新建的连接生效)。
+- proxytun 向外建立 TCP 连接最多等多久，三种都算：连代理、直连(`direct` 规则、`localnet`、`direct_to_proxies`)、连主机端口转发的本机服务。
+- 超时后向程序发 RST,程序马上得到连接被重置，而不是挂着：只靠内核自己重试 SYN 要约 2 分钟，这期间一直占着一个中继名额
+  (主机上的服务卡住、accept 队列满时就是这样)。
+- 连代理超时算代理的问题：计入健康(连续失败 `[health] fail_threshold` 次标为 DOWN),并按 `retries` 换组内其他成员。
+- 只管 TCP 建连这一步。代理握手(问候、等目标)有各自固定的超时，健康探测用 `[health] timeout_ms`。
+- 设得太小，连远端代理会频繁失败;只有本机代理时可以调小，让失败更快暴露。
 
 ## 4. `[health]` 健康检查
 
@@ -507,6 +520,7 @@ addr = "127.0.0.1:7890"
 | ``no group named 'default' (rules without `group` use it)`` | 写了 `[[groups]]` 但没有 `default` 组 |
 | `health.interval_secs must be between 1 and 3600` 等 | `[health]` 的值超出范围 |
 | `sniff_timeout_ms must be between 1 and 10000` | 同上 |
+| `connect_timeout_ms must be between 100 and 60000` | 同上 |
 | `bad fake_ip_range …` / `fake_ip_range prefix must be between /8 and /22 …` | 不是 IPv4 CIDR,或前缀长度超出范围(proxyhook 配置里比 /22 更窄的段要放宽) |
 | `bad upstream_dns …` | 不是 `IP:端口` |
 | `bad localnet entry …` | 不是合法的 CIDR |

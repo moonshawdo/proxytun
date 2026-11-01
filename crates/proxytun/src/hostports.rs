@@ -123,11 +123,16 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
                 let _relaying = Relaying::new(&sh, None);
                 tracing::info!("routing to the host's own port");
                 let start = Instant::now();
-                let dialed = TcpStream::connect(addr).await;
+                // Bounded as relayed connections are: a stuck service (its
+                // accept queue full) would hold a relay slot for minutes.
+                let dialed = match tokio::time::timeout(sh.live().connect_timeout, TcpStream::connect(addr)).await {
+                    Ok(r) => r.map_err(Into::into),
+                    Err(_) => Err(anyhow::anyhow!("connect to the host's {addr} timed out")),
+                };
                 let dial = start.elapsed();
                 // As for relayed connections, an abort is a reset: a host port
                 // closed since startup looks refused, not empty.
-                let _ = pump::finish(inbound, dialed.map_err(Into::into), &sh.traffic, start, dial, "host").await;
+                let _ = pump::finish(inbound, dialed, &sh.traffic, start, dial, "host").await;
             }
             .instrument(span),
         );
@@ -169,6 +174,43 @@ mod tests {
         tokio::spawn(serve(l, gone, sh));
         let mut c = TcpStream::connect(inside).await.unwrap();
         let r = tokio::io::AsyncReadExt::read(&mut c, &mut [0u8; 1]).await;
+        assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
+    }
+
+    #[tokio::test]
+    async fn a_host_port_that_never_answers_resets_the_program_after_the_connect_timeout() {
+        use std::os::fd::AsRawFd;
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inside = l.local_addr().unwrap();
+        let SocketAddr::V4(listen) = inside else { unreachable!() };
+        let sh = Arc::new(crate::state::tests::shared(listen));
+        let cfg = proxytun_core::config::Config::parse(
+            "connect_timeout_ms = 200\n[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        *sh.live.write().unwrap() = Arc::new(proxytun_core::live::build_live(&cfg).unwrap());
+        // A stuck host service: its accept queue is full (backlog 0, one
+        // connection queued), so the kernel drops our SYNs.
+        let stuck = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // SAFETY: plain syscalls; listen again only resizes the backlog.
+        assert_eq!(unsafe { libc::listen(stuck.as_raw_fd(), 0) }, 0);
+        let host = stuck.local_addr().unwrap();
+        let _queued = std::net::TcpStream::connect(host).unwrap();
+        let mut p = libc::pollfd {
+            fd: stuck.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: plain syscall on a local pollfd.
+        assert_eq!(unsafe { libc::poll(&mut p, 1, 5000) }, 1, "the queued connection");
+        tokio::spawn(serve(l, host, sh));
+        let mut c = TcpStream::connect(inside).await.unwrap();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::io::AsyncReadExt::read(&mut c, &mut [0u8; 1]),
+        )
+        .await
+        .expect("given up after the configured 200 ms, not 5 s or the kernel's two minutes");
         assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
     }
 

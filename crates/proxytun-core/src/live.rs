@@ -33,6 +33,9 @@ pub struct Live {
     pub(crate) retries: u32,
     pub(crate) fail_threshold: u32,
     pub(crate) sniff: SniffCfg,
+    /// The most each TCP connect out may take: to a proxy, direct, or to a
+    /// forwarded host port.
+    pub connect_timeout: Duration,
 }
 
 impl Live {
@@ -50,6 +53,7 @@ impl Live {
                 timeout: Duration::from_millis(cfg.sniff_timeout_ms),
                 override_destination: cfg.sniff_override_destination,
             },
+            connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
         })
     }
 }

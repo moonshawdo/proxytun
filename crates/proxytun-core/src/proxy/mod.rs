@@ -21,8 +21,6 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// The proxy answered properly but did not connect to the destination (a SOCKS5
 /// reply code or HTTP CONNECT status saying so), or got no answer from it in
 /// time, or the destination cannot be asked for at all. The proxy is up and
@@ -70,7 +68,7 @@ pub(crate) async fn greet(s: &mut TcpStream, cfg: &ProxyCfg) -> Result<()> {
 /// the proxy's own doing counts against it: reaching it, and its greeting.
 /// Proxies answer a connect request once the destination has (squid, ssh -D,
 /// dante), so a request left unanswered is about the destination.
-async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
+async fn dial_node(node: &Node, t: &Target, connect_timeout: Duration) -> Result<TcpStream> {
     let user = node.cfg.username.as_deref();
     let pass = node.cfg.password.as_deref();
     match node.cfg.kind {
@@ -83,7 +81,7 @@ async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
                 about_target: true,
                 answered: false,
             })?;
-            let mut s = connect(node).await?;
+            let mut s = connect(node, connect_timeout).await?;
             // Each phase its own time: a slow greeting is the proxy's, and must
             // not shorten the wait for the destination.
             tokio::time::timeout(HANDSHAKE_TIMEOUT, socks5_greet(&mut s, creds))
@@ -93,7 +91,7 @@ async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
             Ok(s)
         }
         ProxyKind::Http => {
-            let mut s = connect(node).await?;
+            let mut s = connect(node, connect_timeout).await?;
             wait_for_target(node, t, http_handshake(&mut s, t, user, pass)).await?;
             Ok(s)
         }
@@ -101,8 +99,8 @@ async fn dial_node(node: &Node, t: &Target) -> Result<TcpStream> {
 }
 
 /// The TCP connection to the proxy itself.
-async fn connect(node: &Node) -> Result<TcpStream> {
-    let s = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(node.addr))
+async fn connect(node: &Node, timeout: Duration) -> Result<TcpStream> {
+    let s = tokio::time::timeout(timeout, TcpStream::connect(node.addr))
         .await
         .map_err(|_| anyhow!("connect to proxy {} timed out", node.name))?
         .with_context(|| format!("connect to proxy {} ({})", node.name, node.addr))?;
@@ -172,6 +170,7 @@ pub(crate) async fn dial_group(
     t: &Target,
     retries: u32,
     fail_threshold: u32,
+    connect_timeout: Duration,
 ) -> Result<(TcpStream, ConnGuard, String)> {
     let key = t.host_key();
     let mut tried: Vec<usize> = Vec::new();
@@ -180,7 +179,7 @@ pub(crate) async fn dial_group(
         let Some(i) = group.select(&key, &tried) else { break };
         tried.push(i);
         let node = &group.nodes[i];
-        let e = match dial_node(node, t).await {
+        let e = match dial_node(node, t, connect_timeout).await {
             Ok(s) => {
                 // Health only: this round trip includes the proxy reaching the
                 // destination, so it is not a sample of the proxy hop latency
@@ -233,9 +232,34 @@ pub(crate) async fn dial_group(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The default `connect_timeout_ms`.
+    const CT: Duration = Duration::from_secs(5);
+
+    /// A listener whose accept queue is full: the kernel drops further SYNs,
+    /// so a connect to it hangs, as to a stuck service or a host that never
+    /// answers. All three are kept for as long as that should last.
+    pub(crate) fn black_hole() -> (std::net::TcpListener, std::net::TcpStream, std::net::SocketAddr) {
+        use std::os::fd::AsRawFd;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // SAFETY: plain syscall; on a listening socket it only resizes the
+        // backlog, here to the one connection queued next.
+        assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+        let addr = l.local_addr().unwrap();
+        let queued = std::net::TcpStream::connect(addr).unwrap();
+        // Queued for accept, not just under way: from now on SYNs are dropped.
+        let mut p = libc::pollfd {
+            fd: l.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: plain syscall on a local pollfd.
+        assert_eq!(unsafe { libc::poll(&mut p, 1, 5000) }, 1, "the queued connection");
+        (l, queued, addr)
+    }
 
     pub(super) fn dom(d: &str, p: u16) -> Target {
         Target::Domain(d.into(), p)
@@ -370,7 +394,7 @@ mod tests {
             )
             .unwrap();
             for _ in 0..5 {
-                assert!(dial_group(&g, &dom("dead.example", 443), 2, 3).await.is_err());
+                assert!(dial_group(&g, &dom("dead.example", 443), 2, 3, CT).await.is_err());
             }
             assert!(g.nodes.iter().all(|n| n.is_healthy()), "nodes must stay UP");
             assert_eq!(g.nodes[0].stats().fail_total + g.nodes[1].stats().fail_total, 0);
@@ -400,7 +424,7 @@ mod tests {
                 vec![node_at("a", a, kind), node_at("b", b, kind)],
             )
             .unwrap();
-            let e = dial_group(&g, &dom("black.hole", 443), 2, 1)
+            let e = dial_group(&g, &dom("black.hole", 443), 2, 1, CT)
                 .await
                 .err()
                 .expect("must fail");
@@ -424,7 +448,7 @@ mod tests {
         let mute = async {
             let (m, _) = scripted_proxy(Reply::Mute).await;
             let g = Group::new("g", Strategy::RoundRobin, vec![node_at("m", m, ProxyKind::Socks5)]).unwrap();
-            assert!(dial_group(&g, &dom("x.example", 443), 0, 1).await.is_err());
+            assert!(dial_group(&g, &dom("x.example", 443), 0, 1, CT).await.is_err());
             assert!(!g.nodes[0].is_healthy(), "a silent proxy is marked down");
         };
         let [socks, http] = cases;
@@ -445,7 +469,7 @@ mod tests {
         )
         .unwrap();
         for _ in 0..6 {
-            dial_group(&g, &dom("x.example", 443), 2, 1).await.unwrap();
+            dial_group(&g, &dom("x.example", 443), 2, 1, CT).await.unwrap();
         }
         assert!(g.nodes[0].is_healthy(), "hanging up is not a broken proxy");
         assert_eq!(g.nodes[0].stats().ok_total, 0, "nor a success it reported");
@@ -455,7 +479,7 @@ mod tests {
         let (c, _) = scripted_proxy(Reply::SocksHangsUp).await;
         let g = Group::new("g", Strategy::RoundRobin, vec![node_at("c", c, ProxyKind::Socks5)]).unwrap();
         for _ in 0..3 {
-            assert!(dial_group(&g, &dom("x.example", 443), 2, 1).await.is_err());
+            assert!(dial_group(&g, &dom("x.example", 443), 2, 1, CT).await.is_err());
         }
         assert!(g.nodes[0].is_healthy());
     }
@@ -465,7 +489,7 @@ mod tests {
         let (a, hits) = scripted_proxy(Reply::Socks(0)).await;
         let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]).unwrap();
         for d in ["", &"x".repeat(256)] {
-            let e = dial_group(&g, &dom(d, 80), 2, 1).await.err().expect("must fail");
+            let e = dial_group(&g, &dom(d, 80), 2, 1, CT).await.err().expect("must fail");
             assert!(
                 e.downcast_ref::<TargetRefused>().is_some_and(|r| r.about_target),
                 "{e:#}"
@@ -482,7 +506,7 @@ mod tests {
         // one HANDSHAKE_TIMEOUT, but each phase is within its own.
         let (a, _) = scripted_proxy(Reply::SlowGreeting).await;
         let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]).unwrap();
-        assert!(dial_group(&g, &dom("slow.example", 443), 0, 1).await.is_ok());
+        assert!(dial_group(&g, &dom("slow.example", 443), 0, 1, CT).await.is_ok());
     }
 
     #[tokio::test]
@@ -500,7 +524,7 @@ mod tests {
         )
         .unwrap();
         for _ in 0..3 {
-            dial_group(&g, &dom("ok.example", 443), 2, 3).await.unwrap();
+            dial_group(&g, &dom("ok.example", 443), 2, 3, CT).await.unwrap();
         }
         assert!(!g.nodes[0].is_healthy(), "repeated 407 marks the entry down");
         assert_eq!(good_hits.load(Ordering::SeqCst), 3);
@@ -509,7 +533,7 @@ mod tests {
         let dead = crate::testutil::refused();
         let n = node_at("dead", dead.addr, ProxyKind::Socks5);
         let g = Group::new("g", Strategy::RoundRobin, vec![n]).unwrap();
-        assert!(dial_group(&g, &dom("x.example", 443), 0, 1).await.is_err());
+        assert!(dial_group(&g, &dom("x.example", 443), 0, 1, CT).await.is_err());
         assert!(!g.nodes[0].is_healthy());
     }
 
@@ -539,7 +563,7 @@ mod tests {
             )
             .unwrap();
             for _ in 0..6 {
-                dial_group(&g, &dom("x.example", 443), 2, 1)
+                dial_group(&g, &dom("x.example", 443), 2, 1, CT)
                     .await
                     .expect("fails over to the member that gets through");
             }
@@ -571,7 +595,7 @@ mod tests {
             )
             .unwrap();
             for _ in 0..3 {
-                dial_group(&g, &dom("x.example", 443), 2, 1).await.unwrap();
+                dial_group(&g, &dom("x.example", 443), 2, 1, CT).await.unwrap();
             }
             assert!(!g.nodes[0].is_healthy(), "marked down");
             assert_eq!(b_hits.load(Ordering::SeqCst), 3);
@@ -579,10 +603,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_proxy_that_never_accepts_is_given_up_after_the_connect_timeout_and_blamed() {
+        let (_l, _queued, hole) = black_hole();
+        let g = Group::new("g", Strategy::RoundRobin, vec![node_at("h", hole, ProxyKind::Socks5)]).unwrap();
+        let start = std::time::Instant::now();
+        let e = dial_group(&g, &dom("x.example", 443), 0, 1, Duration::from_millis(200))
+            .await
+            .err()
+            .expect("must fail");
+        let took = start.elapsed();
+        assert!(
+            took < Duration::from_secs(3),
+            "the configured 200 ms, not 5 s: {took:?}"
+        );
+        assert!(format!("{e:#}").contains("connect to proxy h timed out"), "{e:#}");
+        assert!(!g.nodes[0].is_healthy(), "a proxy that never accepts is failing");
+    }
+
+    #[tokio::test]
     async fn successful_connections_do_not_feed_the_latency_estimate() {
         let (a, _) = scripted_proxy(Reply::Socks(0)).await;
         let g = Group::new("g", Strategy::RoundRobin, vec![node_at("a", a, ProxyKind::Socks5)]).unwrap();
-        dial_group(&g, &dom("x.example", 443), 0, 3).await.unwrap();
+        dial_group(&g, &dom("x.example", 443), 0, 3, CT).await.unwrap();
         assert_eq!(g.nodes[0].latency_us(), 0, "only health probes measure the proxy hop");
         assert_eq!(g.nodes[0].stats().ok_total, 1);
     }
@@ -601,7 +643,7 @@ mod tests {
             let host = format!("h{i}.example");
             let want = &g.nodes[g.select(&host, &[]).unwrap()].name;
             for port in [80, 443] {
-                let (_, _, via) = dial_group(&g, &dom(&host, port), 0, 1).await.unwrap();
+                let (_, _, via) = dial_group(&g, &dom(&host, port), 0, 1, CT).await.unwrap();
                 assert_eq!(&via, want, "{host}:{port}");
             }
         }
