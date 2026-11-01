@@ -28,20 +28,24 @@ flowchart LR
         SIG --> WIT
         MAIN --> DOC["doctor.rs<br/>自检"]
         DOC --> APP
+        DOC --> NETNS
+        DOC --> HP
         NETNS --> NETCFG["netcfg.rs<br/>ioctl 配网"]
         SUDO --> NETNS
         CAP --> STATE
         ACC --> STATE
         HP --> ACC
         CAP --> NAT["nat.rs<br/>地址改写表"]
+        ACC --> NAT
         STATE --> NAT
         NETNS --> NAT
+        APP --> NAT
         CAP --> PKT["packet.rs<br/>包解析与改写"]
         SIG --> PFS["procfs.rs<br/>/proc 解析"]
         SUDO --> PFS
         NETNS --> PFS
         DOC --> PFS
-        SIG --> SYS["sys.rs<br/>pipe, sigset"]
+        SIG --> SYS["sys.rs<br/>pipe, sigset, readable_within"]
         SUDO --> SYS
         WIT --> SYS
         NETNS --> SYS
@@ -49,6 +53,7 @@ flowchart LR
         NETNS --> CTL
         SUDO --> CTL
         HP --> CTL
+        CTL --> SYS
     end
     subgraph CORE["crates/proxytun-core"]
         RELAY["net/relay.rs<br/>route"]
@@ -89,6 +94,8 @@ flowchart LR
     APP --> CFG
     APP --> LIVE
     APP --> HEA
+    APP --> FAKE
+    DOC --> HEA
 ```
 
 ### 4.2 `crates/proxytun` 各模块
@@ -104,15 +111,15 @@ flowchart LR
 | `netcfg.rs` | 用 ioctl 配网(不依赖 `ip` 命令和 netlink):建 TUN、地址与 MTU、链路 up、默认路由、绑定监听 |
 | `sudo/` | sudo 模式，按进程身份分文件(见 [5.2](privilege.md#52-sudo-模式的流程)):`mod.rs`:请求的编码与解码、程序的身份 `Identity`、几方共用的常量与 socket 设置、拒绝经 sudo / setuid 以 root 运行(`root_refusal`);`client.rs`:proxytun 一侧，以用户身份运行(私有目录里的 unix socket、调 sudo、发请求和 fd);`helper.rs`:root 助手(校验调用者、安全上下文与资源限制，建空的命名空间并 fork 出程序一侧，重新校验请求，配置命名空间并交回);`program.rs`:fork 出的程序一侧(从 root 降为用户，再接收请求和 fd、转交助手，放行后 exec 程序) |
 | `capture.rs` | tun 线程的包循环(TCP 按方向改写：捕获监听回给程序的包、程序发出的包;UDP 53 派给假 DNS、其他 UDP 回 ICMP),改写表清扫 |
-| `accept.rs` | 捕获监听 accept 之后：accept 循环与中继槽位(主机端口转发共用,超出上限立即 RST)、按改写表找回目标、假 IP 反查并钉住、TCP DNS 分派、交给 `relay::route`;中继中的连接(捕获的与主机端口的)各有一个守卫 `Relaying`,无论怎样结束都退出 `active` 计数、关闭改写表条目 |
-| `state.rs` | 共享状态 `Shared`(见 [4.4](#44-共享状态与线程))、同时中继的上限 `MAX_RELAYS`、统计计数(`Stats`),SIGUSR1 时打印总数与速率 |
+| `accept.rs` | 捕获监听 accept 之后：accept 循环与中继槽位(主机端口转发共用,超出上限立即 RST)、按改写表找回目标、假 IP 反查并钉住、TCP DNS 分派、交给 `relay::route`;中继中的连接(捕获的与主机端口的)各有一个守卫 `Relaying`,无论怎样结束都退出 `active` 计数;捕获的连接还会关闭它的改写表条目(主机端口转发的连接没有条目) |
+| `state.rs` | 共享状态 `Shared`(见 [4.4](#44-共享状态与线程))、同时中继的上限 `MAX_RELAYS`、统计计数(`Stats`),SIGUSR1 时打印总数、速率和每个代理节点的统计 |
 | `nat.rs` | 地址改写表：键的分配与回收、条目状态机、到期队列、分批清扫 |
 | `packet.rs` | IPv4 / TCP / UDP 头的解析、地址改写与增量校验和，构造 RST、UDP 应答、ICMP 端口不可达 |
 | `hostports.rs` | 启动时扫描主机上回环与通配地址的监听(`/proc/net/tcp`、`tcp6`),算出命名空间里要开的地址(监听由准备进程或特权助手绑定);accept 后把连接转到主机 |
 | `witness.rs` | 见证进程:double-fork、改名为 `signal-witness`、屏蔽 INT/QUIT/TERM,经管道回答"有哪些待处理信号" |
-| `doctor.rs` | `--doctor`:配置读不了或有错时记一项 FAIL,仍用默认设置检查主机;按真实路径建一次命名空间跑 `true`,报告模式、TUN、Yama、主机端口、每个代理 |
+| `doctor.rs` | `--doctor`:配置读不了或有错时记一项 FAIL,仍用默认设置检查主机;按真实路径建一次命名空间跑 `true`,报告架构、内核版本、TUN、模式(user namespace 不可用时报告 sudo 模式能否用)、Yama、主机端口、每个代理(按 `[health] timeout_ms` 探测) |
 | `procfs.rs` | 解析 `/proc/<pid>/stat` 里的父进程、进程组、会话(从最后一个 `)` 往后数，程序名含空格和括号也不错位)与内核版本号;信号转发、sudo 助手(校验调用者、加入进程组)、挂载传播方式、自检都用它 |
-| `sys.rs` | 几个模块共用的 libc 薄封装:close-on-exec 的管道(sudo 助手、见证进程)、由信号列表构造 `sigset_t`(signals、见证进程) |
+| `sys.rs` | 几个模块共用的 libc 薄封装:close-on-exec 的管道(sudo 助手、见证进程)、由信号列表构造 `sigset_t`(signals、见证进程、准备进程 exec 前恢复屏蔽)、限时等 fd 可读 `readable_within`(控制通道的 `recv_setup`、sudo 助手) |
 
 ### 4.3 `crates/proxytun-core` 各模块
 
@@ -121,17 +128,18 @@ flowchart LR
 | `config/` | `mod.rs`:配置文件的解析、规范化与校验(按代理、代理组、各项取值、规则分开校验),运行时用到的查询(上游 DNS 地址、文件权限提醒);`proxy_url.rs`:`--proxy` / `PROXYTUN_PROXY` 的 URL 解析与覆盖，消息里隐去凭据 |
 | `policy.rs` | 程序环境变量里的代理地址;直连判定(`localnet`、程序自己的代理)与规则匹配，纯逻辑 |
 | `balancer.rs` | 代理节点(健康、活跃连接数、延迟)与代理组，六种选择策略，只读原子量、不加锁 |
-| `live.rs` | `Live`:一代配置的规则、代理组与嗅探设置，中继每条连接读一次,SIGHUP 时整体替换;`Live::new` 只由配置和给定的环境变量构造,`build_live` 读本进程的环境变量后调用它 |
+| `live.rs` | `Live`:一代配置的规则、代理组、嗅探设置与拨号参数(重试次数、失败阈值、`connect_timeout_ms` / `handshake_timeout_ms`),中继与主机端口转发每条连接读一次,SIGHUP 时整体替换;`Live::new` 只由配置和给定的环境变量构造,`build_live` 读本进程的环境变量后调用它 |
 | `health.rs` | 并发的主动健康探测:TCP 连接，再做代理自己那部分握手(`proxy::greet`:SOCKS5 问候，含认证;HTTP 没有),不涉及协议细节 |
 | `proxy/` | `socks5.rs`(ATYP=3 域名、用户名密码认证)与 `http.rs`(CONNECT,逐字节读应答头)两种握手;`mod.rs`:连一个节点(按协议穷尽 `match`,连接、问候、请求各自计时)、健康探测的问候、组内换成员重试，失败由 `Blame` 归类(目标的问题 / 说不清或代理自己的规则 / 本机端口耗尽 / 本机资源不足 / 代理的问题，见 [7.2](operations.md#72-握手与失败分类)) |
 | `sniff.rs` | 从首包里取 TLS SNI 或 HTTP Host,纯函数 |
-| `net/fakeip.rs` | 假 IP 池:应答的 TTL(60 秒)、LRU、连接期间钉住、120 秒内不回收、最多 100 万条 |
+| `net/fakeip.rs` | 假 IP 池:应答的 TTL(60 秒)、LRU、连接期间钉住、120 秒内不回收、最多 2^20(约 105 万)条 |
 | `net/dns.rs` | 假 DNS 应答(A / AAAA / HTTPS / SVCB / localhost)、向上游转发(UDP、TCP)与应答校验、转发并发上限(256) |
 | `net/relay.rs` | `Pending`(捕获侧交来的连接：目标与钉住假 IP 的守卫);`route`:嗅探、规则、拨号(代理组或直连)、出站 keepalive,再交给 `pump::finish`;direct 规则的域名解析上限 |
 | `net/pump.rs` | `finish`(`route` 与主机端口转发共用的收尾):双向拷贝并计数(`Traffic`)、出错时两端 RST、结束汇总 |
 | `errno.rs` | 按错误链里的 errno 判断失败原因：本机资源不足(fd、缓冲区、内存、本地端口)不算代理或上游的问题;拨号、健康探测、DNS 转发都用它 |
 | `throttle.rs` | 会按包、按查询、按 accept 频率重复的日志，限速为每 10 秒一条 |
 | `types.rs` | 捕获侧与中继侧之间传递的类型(目标、规则判定结果) |
+| `lib.rs`、`net/mod.rs` | 只做模块声明(`lib.rs` 另有测试用的 `testutil`) |
 
 ### 4.4 共享状态与线程
 
@@ -139,9 +147,9 @@ proxytun 进程里各部分通过一个 `Shared` 结构(`state.rs`)共享状态�
 
 | 状态 | 类型 | 谁在用 |
 |---|---|---|
-| 地址改写表 `nat` | `Mutex<Nat>` | tun 线程(每个 TCP 包)、中继 accept、清扫 |
+| 地址改写表 `nat` | `Mutex<Nat>` | tun 线程(每个 TCP 包)、中继(accept 时查目标、结束时关闭条目)、清扫 |
 | 假 IP 池 `pool` | 内部 `Mutex` | 假 DNS(分配)、中继(反查并钉住) |
-| 规则与代理组 `live` | `RwLock<Arc<Live>>` | 中继每条连接读一次;SIGHUP 时整体替换 |
+| 规则、代理组与拨号参数 `live` | `RwLock<Arc<Live>>` | 中继每条连接读一次，主机端口转发每条连接读 `connect_timeout`;SIGHUP 时整体替换 |
 | 统计 `stats`、`dns`、`traffic` | 原子计数(`dns` 里还有转发上游的并发信号量) | 各处累加,SIGUSR1 读出 |
 | 中继槽位 `relay_slots` | `Arc<Semaphore>` | 中继与主机端口转发 accept 时各取一个 |
 

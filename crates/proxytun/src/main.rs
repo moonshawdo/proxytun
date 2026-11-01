@@ -53,7 +53,7 @@ enum LogLevel {
                   Environment:\n  \
                   PROXYTUN_PROXY  Upstream proxy URL, as --proxy but hidden from `ps`\n  \
                   PROXYTUN_LOG    Log filter when no -q, -v or --log-level is given: a level,\n                  \
-                  or per-module filters (proxytun=info,proxytun::capture=trace)"
+                  or per-module filters (proxytun=info,proxytun::capture=trace,proxytun::accept=trace)"
 )]
 struct Cli {
     /// Path to the TOML config.
@@ -81,7 +81,7 @@ struct Cli {
     #[arg(short, long, conflicts_with_all = ["verbose", "log_level"])]
     quiet: bool,
 
-    /// Log more: -v for debug, -vv for trace (every captured connection's packets).
+    /// Log more: -v for debug, -vv for trace (each captured SYN, the connection that takes it, dropped packets).
     #[arg(short, long, action = ArgAction::Count, conflicts_with = "log_level")]
     verbose: u8,
 

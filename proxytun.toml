@@ -1,7 +1,8 @@
-# proxytun config. Only [[proxies]] is required; everything else is shown
-# commented out with its default. A proxyhook.toml works as is: keys proxytun
-# has no use for are reported at start-up and ignored. The one exception is a
-# fake_ip_range narrower than /22 (see below).
+# proxytun config. Only [[proxies]] is required; the main keys are shown
+# commented out, with their default or an example (every key: docs/CONFIG.md).
+# A proxyhook.toml works as is: keys proxytun has no use for are reported at
+# start-up and ignored. The one exception is a fake_ip_range narrower than
+# /22 (see below).
 # Top-level keys must come before any [table] in TOML, so they are all here.
 
 # --- fake-ip DNS ---------------------------------------------------------
@@ -10,14 +11,16 @@
 # own addresses (TUN device, DNS server), so the prefix must be /8 to /22.
 # fake_ip_range = "198.18.0.0/15"
 
-# Where MX/TXT/PTR/... queries (everything but A records) are forwarded, from
-# the host. Default: the first nameserver of the host's /etc/resolv.conf.
+# Where MX/TXT/PTR/... queries are forwarded, from the host (A queries get a
+# fake IP; AAAA, HTTPS and SVCB an empty answer). Default: the first
+# nameserver of the host's /etc/resolv.conf; for example:
 # upstream_dns = "1.1.1.1:53"
 
 # --- direct instead of proxied -------------------------------------------
 # Literal-IP destinations reached straight from the host, no rules, no proxy
 # (like proxychains' localnet). The proxies named in the program's own
-# http_proxy / https_proxy / all_proxy are added automatically. Default empty.
+# http_proxy / https_proxy / all_proxy go straight out too, but only on their
+# own port. Default empty.
 # localnet = ["10.0.0.0/8", "192.168.0.0/16"]
 
 # The program's own connections to one of the [[proxies]] below (same ip and
@@ -50,11 +53,11 @@
 # connection is through, its data has no timeout: idle ones are never cut.
 #
 # 1. The TCP connect: to a proxy, to a destination reached directly (direct
-#    rules, localnet), and to a forwarded host port. Past it the program's
-#    connection is reset rather than left hanging (on its own the kernel
-#    retries for about two minutes, all the while holding a relay slot); a
-#    proxy that did not accept counts as failing, and the next group member
-#    is tried (see retries).
+#    rules, localnet; a direct domain's lookup included), and to a forwarded
+#    host port. Past it the program's connection is reset rather than left
+#    hanging (on its own the kernel retries for about two minutes, all the
+#    while holding a relay slot); a proxy that did not accept counts as
+#    failing, and the next group member is tried (see retries).
 # connect_timeout_ms = 10000
 #
 # 2. Then, through a proxy, each step of its handshake, each step its own
@@ -83,7 +86,7 @@ addr = "172.25.32.1:7897"
 # [[groups]]
 # name = "default"
 # strategy = "round-robin"
-# members = ["clash", "backup"]
+# members = ["clash", "backup"]   # "backup": another [[proxies]] entry
 #
 # Health checks, used to skip proxies that are down:
 # [health]

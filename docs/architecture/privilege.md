@@ -48,11 +48,11 @@ sequenceDiagram
     PT->>SU: sudo -- proxytun __proxytun_root_setup socket
     SU->>H: 以 root 运行 (real 与 effective uid 都是 0)
     H->>PT: 以调用者的有效 uid/gid 连接 socket
+    PT->>C: 请求 + fd (stdio, 工作目录, 继承的 fd)<br/>连上就发, 在 socket 里排队
     Note over H: 检查: socket 的创建者是自己 4 层以内的祖先且属于 SUDO_UID<br/>uid/gid 取自 SO_PEERCRED, 附加组取自它的 /proc<br/>安全上下文、seccomp 与调用者相同, 自己未被跟踪<br/>读出调用者的 16 项资源限制
     H->>H: 建空的网络 + 挂载命名空间
     H->>C: fork (此时还是 root)
-    Note over C: use_pty 时先 setsid 离开 sudo 的会话<br/>资源限制设为调用者的值<br/>降为调用者: 附加组, gid, uid<br/>会话 keyring: root 的换新的<br/>确认没有能力, 设 no_new_privs
-    PT->>C: 请求 + fd (stdio, 工作目录, 继承的 fd)
+    Note over C: use_pty 时先 setsid 离开 sudo 的会话<br/>资源限制设为调用者的值<br/>降为调用者: 附加组, gid, uid<br/>会话 keyring: root 的换新的<br/>确认没有能力, 设 no_new_privs<br/>降权之后才读排队的请求与 fd
     C->>H: 请求原文 (只有字节, 经管道)
     Note over C: umask, stdio, 工作目录, 环境
     Note over H: 逐项重新校验请求<br/>配置命名空间: resolv.conf, TUN, 地址, 路由, 监听<br/>把程序放进 proxytun 的进程组
@@ -70,7 +70,7 @@ sequenceDiagram
 - **身份只来自内核。** 程序的 uid、gid 取自 socket 的 `SO_PEERCRED`,附加组取自创建者的 `/proc/<pid>/status`,不信任请求里自报的内容。
   socket 创建者必须是助手的祖先进程(还活着，pid 没被复用),否则直接断开、不发任何消息;还必须属于 `SUDO_UID` 且不是 root,否则回一条错误后退出。
 - **请求逐项重新校验**:假 IP 段 /8–/22,进程组必须是调用者自己的，转发地址只能是回环、端口非 0 非 53、不重复、最多 250 个,
-  继承的 fd 最多 249 个、编号小于 2^20。
+  umask 不超过 0777,继承的 fd 最多 249 个、编号不小于 3 且小于 2^20、不重复。
 - **超时。** 客户端 10 秒不说话，助手退出;等程序一侧回报最多再加 5 秒(那时它已是用户的进程，用户可以把它停住),
   等它离开 sudo 的会话最多 10 秒。proxytun 一侧等命名空间建好最多 60 秒。
 - **程序的进程属性与 userns 模式一致**:调用者的资源限制(不带进 PAM / sudo 给 root 的不同限制)、umask、工作目录、环境变量、

@@ -31,7 +31,7 @@ flowchart LR
         PROG["程序及其全部子进程<br/>(原用户身份)"]
         KNS["命名空间内核网络栈<br/>tun0 = 198.19.255.1, 默认路由"]
         LIS["捕获监听 socket"]
-        HPL["主机端口的监听 socket<br/>127.x.x.x:P"]
+        HPL["主机端口的监听 socket<br/>127.x.x.x:P / [::1]:P"]
         RCF["/etc/resolv.conf<br/>(bind mount, 指向 .53)"]
         PROG --> KNS
         KNS <--> LIS
@@ -52,7 +52,7 @@ flowchart LR
         subgraph SH["共享状态"]
             NAT[("Nat<br/>地址改写表")]
             POOL[("FakePool<br/>域名 ↔ 假 IP")]
-            LIVE[("Live: 规则 + 代理组<br/>SIGHUP 时整体替换")]
+            LIVE[("Live: 规则 + 代理组 + 拨号超时<br/>SIGHUP 时整体替换")]
         end
     end
 
@@ -73,6 +73,9 @@ flowchart LR
     RLY --> LIVE
     RLY -- "域名保留的握手 + 拷贝" --> UP
     HPF --> HOSTSVC
+    HPF --> LIVE
+    DNS -. "应答直接写 tun0 fd" .-> KNS
+    SWP -. "RST 直接写 tun0 fd" .-> KNS
     SWP --> NAT
     HC --> LIVE
     SIG -. "问: 整组信号?" .-> WIT

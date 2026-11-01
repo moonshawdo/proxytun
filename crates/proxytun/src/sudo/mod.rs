@@ -10,8 +10,9 @@
 //!     whatever listens there sees them, not root), and serves only the
 //!     process that ran sudo: the socket's creator must be one of its own
 //!     ancestors (alive, so its pid cannot have been reused) and belong to
-//!     SUDO_UID; the program's gid and groups are read from that process in
-//!     /proc (kernel-provided), never from the request;
+//!     SUDO_UID; the program's uid and gid are the socket's credentials
+//!     (SO_PEERCRED) and its groups are read from that process in /proc
+//!     (all kernel-provided), never from the request;
 //!   * refuses when sudo would run it in another security context than the
 //!     caller's (sudoers ROLE/TYPE), traced, or under a syscall filter of its
 //!     own (sudoers intercept, log_subcmds): the program would carry them;

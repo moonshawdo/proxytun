@@ -74,7 +74,7 @@
 
 | 热加载生效 | 需要重启 |
 |---|---|
-| `[[rules]]`、`localnet`、`direct_to_proxies`、`[[proxies]]` / `[proxy]`、`[[groups]]`、`retries`、`sniff*` 全部、`[health]` 全部 | `fake_ip_range`、`upstream_dns`、`host_ports_forward`、`host_ports_exclude` |
+| `[[rules]]`、`localnet`、`direct_to_proxies`、`[[proxies]]` / `[proxy]`、`[[groups]]`、`retries`、`connect_timeout_ms`、`handshake_timeout_ms`、`sniff*` 全部、`[health]` 全部 | `fake_ip_range`、`upstream_dns`、`host_ports_forward`、`host_ports_exclude` |
 
 - 已经建立的连接不受影响，之后的新连接使用新配置。
 - 重载后各代理的健康状态和统计从头开始(全部视为健康),健康检查按新的 `[health]` 立即重新开始。
@@ -93,7 +93,7 @@
 - 类型:IPv4 CIDR 字符串;默认 `"198.18.0.0/15"`;前缀长度 /8 ~ /22;修改需重启。
 - **最后一个 /24 留给命名空间自己**:默认 `198.19.255.0/24` 里,`.1` 是 TUN 设备,`.53` 是假 DNS,`.2`–`.17` 是地址改写用的源地址。
   所以前缀至少 /22(proxyhook 允许到 /30,比 /22 更窄的段要放宽，报错里会说明)。
-- 其余地址分给域名。映射最多 100 万条，再大的网段也一样;DNS 应答的 TTL 为 60 秒。地址用完后，回收最久未使用、
+- 其余地址分给域名。映射最多 2^20(约 105 万)条，再大的网段也一样;DNS 应答的 TTL 为 60 秒。地址用完后，回收最久未使用、
   且当前没有连接在用、距上次应答或使用超过 120 秒的映射;回收不了时新的查询得到 `SERVFAIL`,不会覆盖正在使用的映射。映射只在内存里，重启后失效。
 - **选段要求：不能与程序真正要访问的地址重叠。** 默认的 198.18.0.0/15 是 RFC 2544 规定的基准测试保留段，公网上不会出现，通常不需要改。
 - 只有 IPv4。程序的 AAAA 查询得到空应答，会退回到 IPv4。
@@ -220,10 +220,11 @@ systemd-resolved 的 unix socket 解析),proxytun 先看一眼程序发出的第
 | 与代理建立 TCP 连接 | `connect_timeout_ms`,默认 10 秒 | 代理:计入健康，换组内其他成员 |
 | SOCKS5 问候与认证的读写 | `handshake_timeout_ms`,默认 10 秒 | 代理:计入健康，换组内其他成员 |
 | 发出 SOCKS5 请求 / HTTP CONNECT 后等代理回复(代理在连目标) | `handshake_timeout_ms`,默认 10 秒 | 目标：不计入健康，不换代理重试 |
-| 健康探测(建连 + SOCKS5 问候),以及 `proxytun doctor` 的代理检查 | `[health] timeout_ms`,默认 10 秒 | 代理 |
+| 健康探测(建连 + SOCKS5 问候),以及 `proxytun --doctor` 的代理检查 | `[health] timeout_ms`,默认 10 秒 | 代理 |
 
 连上之后(握手完成)的中继读写没有超时，空闲多久都不断，死链靠 TCP keepalive 发现。
-所以经代理的一条连接，最坏要等 `connect_timeout_ms` + 2 × `handshake_timeout_ms`(默认 30 秒)才失败。
+所以经代理的一条连接，每试一个成员最坏要等 `connect_timeout_ms` + 2 × `handshake_timeout_ms`(默认 30 秒);按 `retries` 换成员时重新计时，
+最坏是 (`retries` + 1) × 这个时间(默认 `retries = 2`、组内至少 3 个健康成员时为 90 秒)。
 
 #### `connect_timeout_ms`
 
@@ -232,7 +233,7 @@ systemd-resolved 的 unix socket 解析),proxytun 先看一眼程序发出的第
 - 超时后向程序发 RST,程序马上得到连接被重置，而不是挂着：只靠内核自己重试 SYN 要约 2 分钟，这期间一直占着一个中继名额
   (主机上的服务卡住、accept 队列满时就是这样)。
 - 连代理超时算代理的问题：计入健康(连续失败 `[health] fail_threshold` 次标为 DOWN),并按 `retries` 换组内其他成员。
-- 只管 TCP 建连这一步。
+- 只管建连这一步(`direct` 规则的目标是域名时，也包括用系统解析器解析它的时间)。
 - 设得太小，连远端代理会频繁失败;只有本机代理时可以调小，让失败更快暴露。
 
 #### `handshake_timeout_ms`
@@ -259,12 +260,12 @@ timeout_ms = 10000
 |---|---|---|---|
 | `interval_secs` | `10` | 1 ~ 3600 | 两轮探测之间的间隔。启动时立即探测一轮，每轮并发探测所有代理 |
 | `fail_threshold` | `3` | 1 ~ 100 | 连续失败多少次标为 DOWN。主动探测失败和真实连接里代理自己的失败都计数;目标的问题、本机资源不足不计 |
-| `timeout_ms` | `10000` | 100 ~ 60000 | 单次探测的超时(`proxytun doctor` 检查代理也用它)。设得太小会把正常代理都标成 DOWN |
+| `timeout_ms` | `10000` | 100 ~ 60000 | 单次探测的超时(`proxytun --doctor` 检查代理也用它)。设得太小会把正常代理都标成 DOWN |
 
 - 探测内容：与代理建立 TCP 连接;SOCKS5 代理再做一次与真实连接相同的问候(含用户名密码认证),被拒或不接受任何方法都算失败;
   HTTP 代理只建 TCP 连接。测的是到代理这一跳，不包括代理到目标。
 - 探测往返时间做指数加权平均(新样本占 0.3),供 `least-latency` 策略使用。
-- 被标为 DOWN 的代理不再被选中，只有探测成功才恢复为健康。
+- 被标为 DOWN 的代理不再被选中，所以要等健康探测成功才会恢复为健康(标 DOWN 之前已发起的连接后来成功或得到代理作答时也会恢复)。
 - 组内成员全部 DOWN 时，走这个组的连接直接失败(`no healthy proxy available`),不会直连。
 - 本机资源不足(打开文件数、内存、临时端口用尽)时探测跳过，不计为失败。
 - 日志：健康探测把代理标为 DOWN 时记 warn(`proxy marked DOWN`),由真实连接的失败标为 DOWN 时只有那次的 `dial failed` warn;恢复记 info,单次探测失败记 debug。`kill -USR1 <proxytun pid>` 打印各代理的状态和计数。
@@ -548,10 +549,11 @@ addr = "127.0.0.1:7890"
 | `bad upstream_dns …` | 不是 `IP:端口` |
 | `bad localnet entry …` | 不是合法的 CIDR |
 | `rule #N: bad ip-cidr …` | `ip-cidr` 的值不是 CIDR(比如漏了 `/32`) |
-| ``rule #N: `value` is required for …``(… 是规则类型的内部名，如 `DomainSuffix`) | 非 `final` 规则缺 `value` |
+| ``rule #N: `value` is required for …``(… 是规则类型的内部名，如 `DomainSuffix`) | `domain-suffix` / `domain-keyword` / `domain` 规则缺 `value`(`ip-cidr` 缺 `value` 报上面的 `bad ip-cidr`) |
 | ``rule #N: `group` only applies to action = "proxy"`` | `direct` / `block` 规则写了 `group` |
 | `rule #N: unknown group '…'` | 引用了不存在的组 |
 | `unsupported proxy scheme …` | `--proxy` / `PROXYTUN_PROXY` 的 scheme 不是 `socks5`、`socks5h`、`http` |
 | `proxy url "…" needs a scheme (socks5:// or http://)` | `--proxy` / `PROXYTUN_PROXY` 没写 `socks5://` 或 `http://` |
 | `bad percent-escape in proxy url credentials` | 代理 URL 里用户名或密码的 `%XX` 转义写错 |
+| `proxy url credentials are not valid UTF-8` | 代理 URL 里用户名或密码的 `%XX` 解码后不是 UTF-8 |
 | `seeding the random strategy from /dev/urandom` | 有 `random` 策略的组，但读不到 `/dev/urandom`(没有 `/dev`、fd 用尽):拒绝启动或这次重载，不退回固定种子 |

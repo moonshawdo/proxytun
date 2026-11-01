@@ -37,7 +37,7 @@ flowchart LR
 要点:
 
 - **假 IP 从头到尾不会出现在网络上。** 程序发往假 IP 的包只到 TUN,被改写后交给命名空间里的监听 socket;发往假 IP 的 UDP 得到 ICMP 端口不可达。
-- **改写用的源地址也不出命名空间**,它们只是命名空间内核里 TCP 连接的一端。16 个地址 × 64512 个端口，约 100 万条(见 3.4)。
+- **改写用的源地址也不出命名空间**,它们只是命名空间内核里 TCP 连接的一端。16 个地址 × 64512 个端口，约 103 万条(见 3.4)。
 - 程序看到的对端地址就是它连的地址(`curl -w '%{remote_ip}'` 打印 `198.18.0.1`),因为改写在包头层完成，程序的 socket 不知道这回事。
 
 一次真实运行的日志节选(`proxytun -vv --proxy socks5://... curl https://www.baidu.com`,略去时间戳和与本节无关的行),对应上面的流程:
@@ -67,7 +67,7 @@ sequenceDiagram
 
     Note over PT: 设 non-dumpable, 清除 PROXYTUN_PROXY<br/>记下调用方忽略的信号<br/>用 signalfd 接管 INT / QUIT / TERM
     PT->>W: double-fork 见证进程 (同一进程组)<br/>INT / QUIT / TERM 都被调用方忽略时不建
-    Note over PT: 读配置, 建假 IP 池、规则与代理组<br/>设为 subreaper
+    Note over PT: 读配置, 建假 IP 池、规则与代理组<br/>设为 subreaper, 扫描主机端口
     PT->>S: fork, 立即 execv(/proc/self/exe, __proxytun_setup)
     S->>K: unshare(USER | NET | NS), 写 uid_map / gid_map
     S->>K: bind mount resolv.conf, lo up<br/>建 tun0, 地址与 MTU, 默认路由<br/>建捕获监听, 绑定主机端口的监听

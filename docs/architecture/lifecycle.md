@@ -21,7 +21,7 @@ flowchart TD
 
 - **subreaper。** proxytun 设了 `PR_SET_CHILD_SUBREAPER`,程序的孤儿进程过继给它;主线程 `waitpid(-1)` 一直等到整棵进程树都结束
   (`ECHILD`),只要树里还有进程在运行,proxytun 就继续服务。
-- **见证进程**double-fork 出来，不是 proxytun 的子进程，不影响"等整棵树";管道断开即退出。它改名为 `signal-witness`
+- **见证进程**double-fork 出来，不是 proxytun 的子进程，不影响"等整棵树";除了屏蔽着的这三个信号，其余信号一律忽略;管道断开即退出。它改名为 `signal-witness`
   (`comm` 与命令行都改),所以 `pkill proxytun`、`killall proxytun`、`pidof proxytun` 不会选中它。
   proxytun 是 pid 命名空间的 1 号进程(容器没加 `--init`)或预先被设为 subreaper 时，孤儿见证会被过继回来，所以程序被回收后
   proxytun 关闭见证的管道，让它退出、被回收。
@@ -69,7 +69,8 @@ flowchart TD
   提问前先清掉管道里迟到的旧应答;提问放在阻塞线程池里，最多等 1 秒。每次判断后清空见证的待处理信号。
 - **已知的、分不出来的情况**:程序不在 G 里时，逐进程发送(systemd、`kill -1`、`pkill -u`)会让它收到两份;50 ms 内连发两次 SIGTERM 时，
   第二次让 proxytun 立即退出，程序可能一份也没收到;50 ms 内两次同类整组信号会多转发一次(见证只记"有没有",不记次数);
-  见证启动前的几毫秒里收到的整组信号不转发。
+  启动最初几毫秒(屏蔽这三个信号之前)收到的按默认处置直接结束 proxytun;之后到程序 fork 出来之前
+  (读配置、扫描主机端口)收到的整组信号(终端的 Ctrl+C,或见证启动后由进程发给整组的)不转发：程序那时还不存在，却被当成已经收到。
 
 ### 6.3 退出
 
@@ -83,7 +84,7 @@ flowchart TD
 ### 6.4 被忽略的信号与 SIGPIPE
 
 调用方忽略的信号(`nohup` 忽略 SIGHUP,脚本里的 `cmd &` 忽略 SIGINT / SIGQUIT)在程序里保持忽略：处置跨 exec 保留，
-proxytun 自己的处理器在 fork 之后才装，准备进程 exec 程序前只恢复它自己改过的部分(信号屏蔽、SIGPIPE)。
+proxytun 自己的处理器在 fork 之后才装，准备进程 exec 程序前只改回它自己动过的两处：清空信号屏蔽(调用方原有的屏蔽不保留)、把 SIGPIPE 设回调用方的处置。
 INT / QUIT / TERM 若被调用方忽略,proxytun 也不接管它们。
 
 SIGPIPE 例外:Rust 运行时在 `main` 之前就把它设为忽略，所以 proxytun 用 ELF 构造函数(`.init_array`,在运行时之前执行)记下进程映像启动时的处置。

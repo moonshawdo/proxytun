@@ -46,7 +46,7 @@ proxytun --proxy socks5://HOST:PORT -- curl -sI https://example.com
 ```
 
 预期:
-- 先有一行 `WARN ... user namespaces are not usable here: ...; asking sudo to create the namespace`,然后 sudo 要密码;
+- 先有一行 `WARN ... user namespaces are not usable here: ...; asking sudo to create the namespace (--no-sudo refuses)`,然后 sudo 要密码;
 - curl 返回 `HTTP/... 200`;
 - 日志里有 `conn{id=1 target=Domain("example.com", 443)}`:代理收到的是域名。
 

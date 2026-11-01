@@ -127,7 +127,7 @@ systemd 停止服务时不算失败),不留 core。只要程序的进程树里�
 ### 配置文件
 
 带注释的示例见 [proxytun.toml](proxytun.toml)(只有必填的 `[[proxies]]`,其余大多以注释给出默认值);**每一项的说明(默认值、取值范围、能否热加载、常见报错)
-见 [docs/CONFIG.md](docs/CONFIG.md)**。格式与 proxyhook 相同,`proxyhook.toml` 可以直接用。要点:
+见 [docs/CONFIG.md](docs/CONFIG.md)**。格式与 proxyhook 相同,`proxyhook.toml` 可以直接用(`fake_ip_range` 比 /22 窄时要放宽)。要点:
 
 ```toml
 # 顶层键必须写在任何 [表] 之前 (TOML 规则)
@@ -140,7 +140,7 @@ sniff_ports = [80, 443, 8443]
 host_ports_forward = true        # 主机的回环监听转发进命名空间
 host_ports_exclude = []          # 程序要自己监听的端口
 retries = 2                      # 代理握手失败时再换几个出口
-connect_timeout_ms = 10000       # 连代理 / 直连 / 主机端口的建连超时, 超时向程序发 RST
+connect_timeout_ms = 10000       # 连代理 / 直连 / 主机端口的建连超时; 连代理超时换下一个成员, 无可换时向程序发 RST
 handshake_timeout_ms = 10000     # 与代理握手每一步的超时: SOCKS5 问候认证, 等代理回复请求 / CONNECT
 
 [[proxies]]
@@ -214,9 +214,9 @@ members = ["hk", "jp"]
 | `hash` | 按目标主机一致性哈希，出口下线时只迁移它负责的主机 |
 
 健康检查:每 `health.interval_secs` 秒并发探测所有代理(TCP 连接,SOCKS5 再做一次含认证的问候),连续 `fail_threshold` 次失败标记 DOWN,
-之后一次探测成功即恢复。代理应答失败时分三种：明确是目标的问题(SOCKS5 0x03~0x06、HTTP 502/504、请求超时)直接断开，不算代理故障也不重试;
+之后一次探测成功即恢复。代理应答失败时分三种：明确是目标的问题(SOCKS5 0x03~0x06、HTTP 502/504、等代理回复请求超时)直接断开，不算代理故障也不重试;
 说不清或是代理自己的规则(SOCKS5 0x01/0x02、HTTP 403/500/503 等，以及 SOCKS5 代理收下请求后直接断开)换别的成员再试，但不算代理故障;
-代理自己的问题(连不上、认证被拒、SOCKS5 0x07/0x08、HTTP 405/407、HTTP 代理回应前断开)算代理故障并换成员。细节见 [ARCHITECTURE 第 7 节](docs/architecture/operations.md)。
+代理自己的问题(连不上或建连超时、SOCKS5 问候 / 认证超时或被拒、SOCKS5 0x07/0x08、HTTP 405/407、HTTP 代理回应前断开)算代理故障并换成员。细节见 [ARCHITECTURE 第 7 节](docs/architecture/operations.md)。
 
 ### 运行模式
 
@@ -283,7 +283,7 @@ proxytun -c proxytun.toml ltrace -f ./prog
 | `kill -USR1 <pid>` | 打印统计：假 IP 数、地址改写表大小、连接数、流量、DNS 查询数、按原因分开的丢弃、各代理的健康与延迟 |
 | proxytun 被 `kill -9` 或崩溃 | 程序**不会被杀**,继续运行但断网(TUN 已随 proxytun 消失),不会绕过代理直连 |
 
-启动时被忽略的信号(`nohup`、脚本里的 `cmd &`、`trap '' PIPE`)在程序里保持忽略。`fake_ip_range`、`upstream_dns` 和主机端口转发需要重启才能改变。
+启动时被忽略的信号(`nohup`、脚本里的 `cmd &`、`trap '' PIPE`)在程序里保持忽略(sudo 模式下 SIGPIPE 一定如此，其他信号取决于 sudo 是否把原有处置留给命令)。`fake_ip_range`、`upstream_dns` 和主机端口转发需要重启才能改变。
 信号处理的细节与边界情况见 [ARCHITECTURE 第 6 节](docs/architecture/lifecycle.md)。
 
 ### 日志
@@ -297,15 +297,15 @@ proxytun -c proxytun.toml ltrace -f ./prog
 | `debug` | `-v` | 每条 DNS 查询(`dns: A -> fake ip`、`dns: forwarding upstream`、上游耗时)、嗅探结果、不计健康的代理重试原因(目标被拒、代理断开) |
 | `trace` | `-vv` | TUN 上的每个 SYN 与它改写用的地址，可以从 SYN 一直跟到连接结束 |
 
-- 没给级别选项时读环境变量 `PROXYTUN_LOG`:可以是一个级别，也可以按模块写，如 `proxytun=info,proxytun::capture=trace`。命令行选项优先。
-- **跟踪一条连接**:每条连接有一个递增编号，日志里写作 `conn{id=… target=…}`。默认级别下每条连接两行:
+- 没给级别选项时读环境变量 `PROXYTUN_LOG`:可以是一个级别，也可以按模块写，如 `proxytun=info,proxytun::capture=trace,proxytun::accept=trace`(TUN 上的 SYN,以及接走它的是哪条连接)。命令行选项优先。
+- **跟踪一条连接**:每条连接有一个递增编号，日志里写作 `conn{id=… target=…}`。默认级别下每条连接两行(下面省略了时间、级别和模块名):
 
   ```
   conn{id=1 target=Domain("example.com", 443)}: routing decision=Proxy { group: "default" }
   conn{id=1 target=Domain("example.com", 443)}: closed ms=812 dial_ms=35 via=clash up=812 down=153204
   ```
 
-  `ms` 是连接存活时长,`dial_ms` 是连上代理(或直连目标)用的时间,`via` 是用的代理节点(`direct` / `host` 表示直连 / 主机端口),
+  `ms` 是连接存活时长,`dial_ms` 是出站建连用的时间(经代理时含连代理、握手直到代理回复已连上目标，以及换成员重试;直连时含解析域名),`via` 是用的代理节点(`direct` / `host` 表示直连 / 主机端口),
   `up`、`down` 是两个方向的字节数。失败时写成 `closed: <原因>`,被规则拦下写成 `closed: blocked by a rule`。日志不记录是哪个进程发起的连接。
 - **写 stderr 从不阻塞也不报错**:读端停住(Ctrl+S、没人读的管道)时写不下的日志行直接丢弃，读端关掉(`2>&1 | head`、终端断开)时日志丢失，
   proxytun 和程序照常运行。要完整的日志请用 `--log-file`。
@@ -348,9 +348,9 @@ cargo test --release --test bench -- --ignored --nocapture --test-threads=1   # 
   (伪终端上真实的 Ctrl+C、`kill`、`pkill`、整组信号、`sigwait` 程序、被忽略的信号)、作为 pid 1 或 subreaper 运行、stderr 停住或断开、
   fd 耗尽、挂载传播、热加载、`--doctor`,以及**模拟 CentOS 7 的 sudo 模式**(用户身份、资源限制、umask、继承的 fd、会话 keyring、
   拒绝被跟踪或被过滤的 sudo、恶意的助手客户端)。
-- 端到端测试需要 `curl`、`python3`、`cc`、`strace`、`gdb`、`ltrace`、`dig`、`pkill`、`mount`、`unshare`(util-linux);sudo 模式的测试另需 `newuidmap`(uidmap 包)、`setpriv`、
-  支持 `--map-auto` 的 `unshare`(util-linux ≥ 2.38)和 `/etc/subuid` 里的区间。宿主机建不了 proxytun 的命名空间时，所有端到端用例都 SKIP。
-  缺少时对应用例打印 `SKIP`(用 `-- --nocapture` 才看得到)并按通过计。
+- 端到端测试需要 `curl`、`python3`、`cc`、`strace`、`gdb`、`ltrace`、`dig`、`pkill`、`mount`、`unshare`(util-linux);sudo 模式的测试和一个 stderr 用例
+  另需 `newuidmap`(uidmap 包)、`setpriv`、支持 `--map-auto` 的 `unshare`(util-linux ≥ 2.38)和 `/etc/subuid` 里的区间。宿主机建不了 proxytun 的命名空间时，所有端到端用例都 SKIP。
+  缺少时对应用例打印 `SKIP`(用 `-- --nocapture` 才看得到)并按通过计;例外是那个 stderr 用例，`unshare` 不支持 `--map-auto` 时它会失败而不是 SKIP。
 - 测试目录在 `$TMPDIR/proxytun-test-<pid>-*`,保留到下一次运行时尽量删除(只删本用户的、原进程已退出的),便于查看失败现场。
 
 ### 性能
@@ -393,7 +393,7 @@ cargo test --release --test bench -- --ignored --nocapture --test-threads=1   # 
 **功能**
 - 热加载(`SIGHUP`)不改变 `fake_ip_range`、`upstream_dns` 和主机端口转发。
 - fake-ip 映射不落盘，重启后失效。
-- 地址改写表最多约 100 万条(含关闭后保留 75 秒的),即持续每秒约 1.37 万条新连接;同时中继的连接最多 8192 条(fd 上限低时更少)。
+- 地址改写表最多约 103 万条(含关闭后保留 75 秒的),即持续每秒约 1.37 万条新连接;同时中继的连接最多 8192 条(fd 上限低时更少)。
   超出时新连接立即收到 RST,不会卡住重试。
 - 信号的几种边界情况(50 ms 内连发两次 SIGTERM 等)见 [ARCHITECTURE 第 6 节](docs/architecture/lifecycle.md)。
 - **CentOS 7 真机**尚未验证，见上文。
@@ -422,7 +422,7 @@ proxytun.toml          带注释的示例配置
 | `the helper socket ... is too long a path` | `$TMPDIR` 太长，换一个短的目录 |
 | `no healthy proxy available` | 代理已被标记 DOWN:检查代理地址与连通性,`kill -USR1` 看各代理状态 |
 | 某个连接失败 | info 级别的 `closed: <原因>`;`-v` 看代理重试经过 |
-| 慢 | `closed` 行:`dial_ms` 大是连代理慢;`dial_ms` 小而 `ms` 大、字节数不多，是代理或目标传得慢 |
+| 慢 | `closed` 行:`dial_ms` 大是连代理、代理连目标或直连慢(`-v` 看是否换过成员);`dial_ms` 小而 `ms` 大、字节数不多，是代理或目标传得慢 |
 | 吞吐上不去 | `kill -USR1` 的速率行;`top -H -p <pid>` 里名为 `tun` 的线程接近 100% 时，是到了 proxytun 本身的上限(约 1 GB/s),否则瓶颈在代理 |
 | 域名解析不了 / 很慢 | `-v` 的 `dns:` 行;统计里的 `dns_forward_failed`(上游第一次不应答时会 warn);检查 `upstream_dns` |
 | 代理端看到的是 IP 而不是域名 | 程序没有经过假 DNS(DoH、硬编码 IP、经 nscd / systemd-resolved 解析):端口在 `sniff_ports` 里吗?地址是内网地址或有 `ip-cidr` 规则吗(这两种不嗅探)? |

@@ -17,7 +17,7 @@
 
 ```mermaid
 flowchart TD
-    SEL["在健康、本连接没试过的成员里选一个"] --> D["连代理 (connect_timeout_ms, 默认 10 秒)<br/>SOCKS5 问候与认证 (handshake_timeout_ms)<br/>连接请求 (handshake_timeout_ms)"]
+    SEL["在健康、本连接没试过的成员里选一个"] --> D["连代理 (connect_timeout_ms, 默认 10 秒)<br/>SOCKS5 问候与认证 (handshake_timeout_ms, 默认 10 秒)<br/>连接请求 (handshake_timeout_ms, 另计)"]
     D --> RES{"结果"}
     RES -- "成功" --> OK["记成功, 开始双向拷贝"]
     RES -- "目标的问题<br/>SOCKS5 0x03-0x06, HTTP 502/504,<br/>请求超时" --> TGT["不换成员, 连接失败<br/>(代理回答过的记成功)"]
@@ -48,7 +48,7 @@ stateDiagram-v2
     [*] --> UP
     UP --> UP: 成功, 清零连续失败数
     UP --> DOWN: 连续 fail_threshold 次失败 (探测或真实连接)
-    DOWN --> UP: 一次探测成功
+    DOWN --> UP: 一次探测成功, 或标 DOWN 前已发起的连接成功 / 代理作答
 ```
 
 - 启动和热加载时立即探测一次，之后每轮结束后隔 `interval_secs` 秒再探测;每轮并发探测所有代理，一个不应答的代理只耗它自己的超时。探测：与代理建立 TCP 连接;SOCKS5 代理再做一次与真实连接相同的问候
@@ -80,8 +80,8 @@ stateDiagram-v2
 ### 8.3 日志
 
 每条连接一个递增编号，日志里写作 `conn{id=… target=…}`;info 级别下每条连接两行：开始时的选路结果，结束时的汇总
-(`closed ms dial_ms via up down`,失败时写原因)。代理故障引起的重试默认以 warn 记录;`-v` 增加每条 DNS 查询，以及目标被拒、代理断开等不计健康的重试原因;`-vv` 增加 TUN 上的每个 SYN 与它改写用的地址。
-会按包、按查询、按 accept 频率重复的告警(表满、池满、fd 用尽)限速为每 10 秒一条，计数照常。
+(`closed ms dial_ms via up down`,失败时写原因)。代理故障与本机临时端口耗尽(EADDRNOTAVAIL)引起的换成员默认以 warn 记录;`-v` 增加每条 DNS 查询，以及目标被拒(不换成员)、代理断开等不计健康的失败原因;`-vv` 增加 TUN 上的每个 SYN 与它改写用的地址。
+会按包、按查询、按 accept 频率重复的告警(表满、池满、fd 用尽)限速为每 10 秒一条;表满照常计入 `dropped_table_full`。
 
 ### 8.4 各类上限与耗尽时的行为
 
@@ -93,7 +93,7 @@ stateDiagram-v2
 | 排队等 accept 的连接 | 30 秒 | 向程序发 RST |
 | 同时处理的 DNS 查询 | 1024 | 丢弃(`dropped_dns_busy`),解析器重试 |
 | 同时转发上游的 DNS 查询 | 256,每个最长 3 秒 | 丢弃，解析器重试 |
-| 假 IP 映射 | 100 万条(约 280 MB) | 回收不了时答 SERVFAIL |
+| 假 IP 映射 | 2^20(约 105 万)条(约 280 MB) | 回收不了时答 SERVFAIL |
 | direct 规则的域名解析 | 同时 32 个 | 该连接立即失败 |
 | tokio 阻塞线程 | 64(都占用户的进程数额度) | 排队 |
 | 新网络命名空间的 `somaxconn` | root 与 sudo 模式调到 4096(5.4 以前的内核默认 128) | 内核丢 SYN,程序重传 |
