@@ -442,6 +442,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_connect_timeout_bounds_the_dial_only_never_an_idle_connection() {
+        let (proxy, _) = echo_socks5().await;
+        // An echoing origin for the direct route.
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(at) = origin.local_addr().unwrap() else {
+            unreachable!()
+        };
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+        let cfg = Config::parse(&format!(
+            "connect_timeout_ms = 200\n[proxy]\ntype=\"socks5\"\naddr=\"{proxy}\"\n\
+             [[rules]]\nmatch=\"ip-cidr\"\nvalue=\"{}/32\"\naction=\"direct\"",
+            at.ip()
+        ))
+        .unwrap();
+        let live = Arc::new(Live::new(&cfg, EnvProxies::default()).unwrap());
+        let via_proxy = relay_pending(&live, pending(Target::Domain("x.example".into(), 443))).await;
+        let direct = relay_pending(&live, pending(Target::V4(*at.ip(), at.port()))).await;
+        for (what, mut c) in [("proxied", via_proxy), ("direct", direct)] {
+            c.write_all(b"before").await.unwrap();
+            let mut b = [0u8; 6];
+            c.read_exact(&mut b).await.unwrap();
+            // Idle for five times the connect timeout, then talk again.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            c.write_all(b"after!").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), c.read_exact(&mut b))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: no echo after idling"))
+                .unwrap_or_else(|e| panic!("{what}: ended while idle: {e}"));
+            assert_eq!(&b, b"after!", "{what}");
+        }
+    }
+
+    #[tokio::test]
     async fn proxy_down_fails_closed() {
         // Nothing listens on this proxy address. The target is one a direct
         // dial would reach, and say so: it must not be dialed.

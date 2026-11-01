@@ -14,6 +14,7 @@ use std::io::{IoSlice, IoSliceMut};
 use std::net::{SocketAddr, TcpListener};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::str::FromStr;
+use std::time::Duration;
 
 /// `a,b,c`, or `-` for none (an empty argument is easy to lose).
 pub fn join_list<T: Display>(items: &[T]) -> String {
@@ -103,8 +104,17 @@ pub fn recv_with_fds(ctl: &OwnedFd, buf: &mut [u8]) -> Result<(usize, Vec<OwnedF
     Ok((msg.bytes, fds))
 }
 
-/// Read the setup's answer on `ctl`.
-pub fn recv_setup(ctl: &OwnedFd) -> Result<Handover> {
+/// The longest building the namespace may take. sudo's helper gives up on
+/// its own within about 15 s (`HELPER_TIMEOUT` and a little): past this,
+/// whoever builds it is stuck, not slow.
+pub const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Read the setup's answer on `ctl`, waiting `within` at most.
+pub fn recv_setup(ctl: &OwnedFd, within: Duration) -> Result<Handover> {
+    ensure!(
+        crate::sys::readable_within(ctl, within),
+        "namespace setup did not answer within {within:?}"
+    );
     let mut buf = vec![0u8; 16 * 1024];
     let (n, fds) = recv_with_fds(ctl, &mut buf).context("waiting for the namespace setup")?;
     let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
@@ -213,9 +223,30 @@ mod tests {
         let (a, _b) = pair();
         // One fd where the TUN device and the listener make two.
         send_with_fds(&theirs, b"OK fwd=-", &[a.as_raw_fd()]).unwrap();
-        let e = recv_setup(&ours).err().expect("refused").to_string();
+        let e = recv_setup(&ours, SETUP_TIMEOUT).err().expect("refused").to_string();
         assert!(e.contains("answered wrongly") && e.ends_with("fds attached: 1"), "{e}");
         assert!(!e.contains("exited"), "{e}");
+    }
+
+    #[test]
+    fn a_setup_that_never_answers_is_given_up_after_the_deadline() {
+        use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+        let (ours, _theirs) =
+            socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::SOCK_CLOEXEC).unwrap();
+        // In a thread: should it wait forever, this test fails instead of hanging.
+        let (done, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(
+                recv_setup(&ours, Duration::from_millis(100))
+                    .err()
+                    .map(|e| e.to_string()),
+            );
+        });
+        let e = got
+            .recv_timeout(Duration::from_secs(10))
+            .expect("recv_setup waited past its deadline")
+            .expect("refused");
+        assert!(e.contains("did not answer within 100ms"), "{e}");
     }
 
     #[test]

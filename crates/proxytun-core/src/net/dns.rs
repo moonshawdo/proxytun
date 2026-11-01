@@ -147,14 +147,14 @@ fn base_response(req: &Message, code: ResponseCode) -> Message {
 pub const TCP_IDLE: Duration = Duration::from_secs(5);
 
 /// Serve DNS over one TCP connection: 2-byte length prefix, possibly several
-/// queries. Returns when the client closes, misbehaves, or stays silent for
-/// `TCP_IDLE`.
+/// queries. Returns when the client closes, misbehaves, or stays silent (or
+/// stops reading its answers) for `TCP_IDLE`.
 pub async fn serve_tcp<S>(mut stream: S, pool: &FakePool, upstream: SocketAddr, stats: &DnsStats)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Every read has a deadline: a client that sends a length and then
-    // nothing must not keep the task forever.
+    // Every read and write has a deadline: a client that sends a length and
+    // then nothing, or never reads, must not keep the task forever.
     loop {
         let mut lenbuf = [0u8; 2];
         let read = tokio::time::timeout(TCP_IDLE, stream.read_exact(&mut lenbuf)).await;
@@ -171,7 +171,10 @@ where
         let Some(resp) = respond(&q, pool, upstream, Transport::Tcp, stats).await else {
             return;
         };
-        if stream.write_all(&tcp_framed(&resp)).await.is_err() {
+        if !matches!(
+            tokio::time::timeout(TCP_IDLE, stream.write_all(&tcp_framed(&resp))).await,
+            Ok(Ok(()))
+        ) {
             return;
         }
     }
@@ -749,6 +752,22 @@ mod tests {
         // Mixed case punycode is still one name.
         let m2 = parse(answer(&query("XN--MNCHEN-3YA.DE.", RecordType::A, DNSClass::IN), &p).unwrap());
         assert_eq!(a_ips(&m2), vec![ip]);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_reads_its_answers_is_dropped_after_the_idle_deadline() {
+        // A pipe with room for a query or two, not for the answers piling up.
+        let (mut client, server) = tokio::io::duplex(256);
+        let serving = tokio::spawn(async move {
+            serve_tcp(server, &pool(), "127.0.0.1:9".parse().unwrap(), &DnsStats::default()).await
+        });
+        let ask = tcp_framed(&query("ok.example.", RecordType::A, DNSClass::IN));
+        tokio::spawn(async move { while client.write_all(&ask).await.is_ok() {} });
+        let ended = tokio::time::timeout(TCP_IDLE + Duration::from_secs(2), serving).await;
+        assert!(
+            ended.is_ok(),
+            "a client that never reads must not keep the task forever"
+        );
     }
 
     #[tokio::test]

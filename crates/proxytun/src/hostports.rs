@@ -214,6 +214,41 @@ mod tests {
         assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
     }
 
+    #[tokio::test]
+    async fn the_connect_timeout_never_ends_an_idle_host_port_connection() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inside = l.local_addr().unwrap();
+        let SocketAddr::V4(listen) = inside else { unreachable!() };
+        let sh = Arc::new(crate::state::tests::shared(listen));
+        let cfg = proxytun_core::config::Config::parse(
+            "connect_timeout_ms = 200\n[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        *sh.live.write().unwrap() = Arc::new(proxytun_core::live::build_live(&cfg).unwrap());
+        // An echoing host service.
+        let service = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = service.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = service.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+        tokio::spawn(serve(l, host, sh));
+        let mut c = TcpStream::connect(inside).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        c.write_all(b"before").await.unwrap();
+        let mut b = [0u8; 6];
+        c.read_exact(&mut b).await.unwrap();
+        // Idle for five times the connect timeout, then talk again.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        c.write_all(b"after!").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), c.read_exact(&mut b))
+            .await
+            .expect("no echo after idling")
+            .expect("ended while idle");
+        assert_eq!(&b, b"after!");
+    }
+
     #[test]
     fn proc_net_tables_are_read_in_host_byte_order() {
         assert_eq!(

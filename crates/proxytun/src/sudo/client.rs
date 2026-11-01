@@ -2,7 +2,7 @@
 //! started on it, and the request and fds sent to the program side.
 
 use super::{seqpacket, Request, HELPER_ARG, MAX_INHERIT};
-use crate::ctl::{recv_setup, send_with_fds, Child, Handover};
+use crate::ctl::{recv_setup, send_with_fds, Child, Handover, SETUP_TIMEOUT};
 use crate::netns::{self, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nix::sys::socket::{accept4, bind, getsockopt, listen, sockopt, Backlog, SockFlag, UnixAddr};
@@ -36,7 +36,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
     let dir = TempDir::new()?;
     let ctl = start_helper(&dir.path().join("ctl"))?;
     send_request(&ctl, s)?;
-    let handover = recv_setup(&ctl)?;
+    let handover = recv_setup(&ctl, SETUP_TIMEOUT)?;
     let report = &handover.report;
     let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
     let pid = value("pid=")

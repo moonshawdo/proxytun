@@ -13,6 +13,7 @@
 
 use crate::ctl::{
     join_list, recv_setup, send_error, send_ok, split_list, wait_go, Child, Handover, Namespace, SetupError,
+    SETUP_TIMEOUT,
 };
 use crate::netcfg;
 use anyhow::{anyhow, bail, Context, Result};
@@ -213,7 +214,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
         }
     }
     drop(theirs);
-    match recv_setup(&ours) {
+    match recv_setup(&ours, SETUP_TIMEOUT) {
         Ok(handover) => Ok((Child::new(pid, ours), handover)),
         Err(e) => {
             abandon(pid);

@@ -268,6 +268,12 @@ fn helper(args: &[OsString]) -> Result<()> {
     drop((detach, to_parent)); // EOF should the program side die
     let served = (|| -> Result<()> {
         if let Some(left) = left {
+            // Said at once, still as root; only a stop (job control, before
+            // it left the session) can hold it up, and that must not hold
+            // root: given up on as the report is.
+            if !crate::sys::readable_within(&left, HELPER_TIMEOUT) {
+                return refuse(&ctl, anyhow!("the program side did not leave sudo's session in time"));
+            }
             let mut b = [0u8; 1];
             // SAFETY: plain read into a local buffer.
             unsafe { libc::read(left.as_raw_fd(), b.as_mut_ptr().cast(), 1) };

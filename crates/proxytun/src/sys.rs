@@ -1,9 +1,10 @@
 //! Thin wrappers over libc calls that modules otherwise unrelated to each
 //! other make alike (the sudo helper, the signal witness, signal handling,
-//! the setup process).
+//! the setup process, the control channel).
 
 use anyhow::{bail, Result};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Duration;
 
 /// A close-on-exec pipe: (read end, write end).
 pub fn pipe() -> Result<(OwnedFd, OwnedFd)> {
@@ -25,5 +26,37 @@ pub fn sigset(sigs: &[libc::c_int]) -> libc::sigset_t {
             libc::sigaddset(&mut set, s);
         }
         set
+    }
+}
+
+/// Wait at most `within` for something to read on `fd` (or its end): false
+/// if nothing came, so that a peer gone quiet cannot hold us.
+pub fn readable_within(fd: &impl AsRawFd, within: Duration) -> bool {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = within.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: plain syscall on a local pollfd.
+    unsafe { libc::poll(&mut p, 1, ms) == 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quiet_fd_is_given_up_on_and_data_or_its_end_is_not() {
+        let (r, w) = pipe().unwrap();
+        let start = std::time::Instant::now();
+        assert!(!readable_within(&r, Duration::from_millis(100)), "nothing written");
+        assert!(start.elapsed() >= Duration::from_millis(100), "it waited");
+        // SAFETY: plain write of one byte to our own pipe.
+        assert_eq!(unsafe { libc::write(w.as_raw_fd(), b"x".as_ptr().cast(), 1) }, 1);
+        assert!(readable_within(&r, Duration::from_secs(5)), "a byte");
+        let (r, w) = pipe().unwrap();
+        drop(w);
+        assert!(readable_within(&r, Duration::from_secs(5)), "the writer gone: EOF");
     }
 }
