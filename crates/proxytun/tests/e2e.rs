@@ -2501,6 +2501,29 @@ fn a_failed_sudo_is_reported_and_nothing_runs() {
 }
 
 #[test]
+fn a_sudo_wrapper_ahead_on_path_is_passed_over_for_sudo_itself() {
+    require_centos7!();
+    let dir = shared_dir("sudo-wrapper");
+    write_cfg(&dir, "127.0.0.1:1".parse().unwrap(), "", "");
+    // Like devtoolset's sudo (`scl enable`): root's, not setuid, a script
+    // that rewrites the command line for the real sudo.
+    let root = r#"cp "$BIN" "$D/pt" && mkdir "$D/wrapper" && printf '#!/bin/sh\ntouch "%s/wrapper-ran"\nexit 127\n' "$D" > "$D/wrapper/sudo" && chmod 755 "$D/wrapper/sudo""#;
+    let user = r#"export PATH="$D/wrapper:$PATH"; "$D/pt" -c "$D/cfg.toml" -- echo ran; echo "exit=$?"; "$D/pt" -c "$D/cfg.toml" --doctor | grep 'sudo mode'"#;
+    let out = sh_like_centos7(&dir, root, user);
+    assert!(
+        !dir.join("wrapper-ran").exists(),
+        "the wrapper must not run\n{}",
+        out.dump()
+    );
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines.get(..2), Some(&["ran", "exit=0"][..]), "{}", out.dump());
+    // --doctor names the sudo a run uses.
+    let sudo = fake_sudo_dir().unwrap().join("sudo");
+    let named = format!("runs will ask {} to", sudo.display());
+    assert!(lines[2].contains(&named), "{}", out.dump());
+}
+
+#[test]
 fn the_helper_serves_only_the_user_sudo_was_run_by() {
     require_centos7!();
     let dir = shared_dir("sudo-wrong-uid");

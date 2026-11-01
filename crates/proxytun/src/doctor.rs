@@ -195,12 +195,9 @@ fn check_sudo(no_sudo: bool) -> Check {
             "--no-sudo given: without user namespaces nothing can run",
         );
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    match std::env::split_paths(&path)
-        .map(|d| d.join("sudo"))
-        .find(|p| p.is_file())
-    {
-        Some(p) => check(
+    // The sudo a run would use.
+    match crate::sudo::find_sudo(&std::env::var_os("PATH").unwrap_or_default()) {
+        Ok(p) => check(
             "sudo mode",
             Status::Ok,
             format!(
@@ -208,7 +205,7 @@ fn check_sudo(no_sudo: bool) -> Check {
                 p.display()
             ),
         ),
-        None => check("sudo mode", Status::Fail, "no user namespaces and no sudo on PATH"),
+        Err(e) => check("sudo mode", Status::Fail, format!("no user namespaces and {e}")),
     }
 }
 

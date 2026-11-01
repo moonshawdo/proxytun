@@ -318,7 +318,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
   报错时说明原因。示例 `proxytun.toml` 只有必填的 `[[proxies]]`,其余以注释给出默认值。
 - `--doctor`:报告将使用哪种模式(userns / sudo / root)。不靠猜 sysctl,而是按真实运行的路径建一次命名空间、以 `true` 为程序跑完;
   userns 不可用时说明原因并列出相关 sysctl(`max_user_namespaces`、`unprivileged_userns_clone`、AppArmor 限制),
-  检查 PATH 里有没有 `sudo` 但不调用;另查 `/dev/net/tun`、Yama(`gdb -p` 的范围)、将转发的主机端口、每个代理(SOCKS5/HTTP 探测)。
+  报告运行时会用的 sudo(PATH 上第一个属主 root、带 setuid 位的 `sudo`)但不调用;另查 `/dev/net/tun`、Yama(`gdb -p` 的范围)、将转发的主机端口、每个代理(SOCKS5/HTTP 探测)。
   有 FAIL 时退出码为 1;配置读不出时把它记为一项 FAIL,其余照查。
 
 ## 8. 代码组织

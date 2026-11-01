@@ -4,7 +4,8 @@
 //!
 //! proxytun listens on a unix socket in a private (0700) directory and runs
 //! `sudo -- <proxytun> HELPER_ARG <socket>` (sudo closes inherited fds, hence
-//! the socket path). The helper, as root:
+//! the socket path), with the first setuid-root sudo on PATH, never a
+//! wrapper (`client::find_sudo`). The helper, as root:
 //!   * runs only when started by sudo (real and effective uid 0), never setuid;
 //!   * reaches the socket as the caller (effective uid and gid theirs, so
 //!     whatever listens there sees them, not root), and serves only the
@@ -44,7 +45,7 @@ mod client;
 mod helper;
 mod program;
 
-pub use client::spawn;
+pub use client::{find_sudo, spawn};
 pub use helper::helper_main;
 
 use crate::ctl::{join_list, split_list, SCM_MAX_FDS};

@@ -6,8 +6,10 @@ use crate::ctl::{recv_setup, send_with_fds, Child, Handover, SETUP_TIMEOUT};
 use crate::netns::{self, Setup, TempDir};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use nix::sys::socket::{accept4, bind, getsockopt, listen, sockopt, Backlog, SockFlag, UnixAddr};
+use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The fds a program started by us inherits: 3 and up, open without
@@ -26,6 +28,28 @@ fn inheritable_fds() -> Result<Vec<RawFd>> {
     }
     v.sort_unstable();
     Ok(v)
+}
+
+/// The first `sudo` on `path` (a PATH value) that is setuid root, so sudo
+/// itself. Wrappers that shadow it are passed over: devtoolset's (`scl
+/// enable`) rewrites the command line (`--` becomes the command) and keeps
+/// the user's environment (-E) for root.
+pub fn find_sudo(path: &OsStr) -> Result<PathBuf> {
+    let mut passed = Vec::new();
+    for p in std::env::split_paths(path).map(|d| d.join("sudo")) {
+        let Ok(m) = std::fs::metadata(&p) else { continue };
+        if m.uid() == 0 && m.mode() & libc::S_ISUID != 0 {
+            return Ok(p);
+        }
+        passed.push(p.display().to_string());
+    }
+    if passed.is_empty() {
+        bail!("no sudo on PATH");
+    }
+    bail!(
+        "no sudo on PATH is setuid root, so none is sudo itself (a wrapper?): {}",
+        passed.join(", ")
+    )
 }
 
 /// Have sudo start the helper and wait for the namespace. Returns the
@@ -61,8 +85,10 @@ fn start_helper(path: &Path) -> Result<OwnedFd> {
     bind(l.as_raw_fd(), &addr).context("bind the helper socket")?;
     listen(&l, Backlog::new(1)?).context("listen")?;
     let exe = std::env::current_exe().context("locate our own executable for sudo")?;
+    let sudo = find_sudo(&std::env::var_os("PATH").unwrap_or_default())?;
+    tracing::debug!("sudo: {}", sudo.display());
     // stdio stays ours: sudo asks for the password on the terminal.
-    let mut sudo = std::process::Command::new("sudo")
+    let mut sudo = std::process::Command::new(sudo)
         .arg("--")
         .arg(&exe)
         .arg(HELPER_ARG)
@@ -144,4 +170,63 @@ fn send_request(ctl: &OwnedFd, s: &Setup) -> Result<()> {
         .chain(req.inherit.iter().copied())
         .collect();
     send_with_fds(ctl, &req.encode(), &fds).context("send the request to the helper (environment too large?)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    /// A setuid-root program of this host, to stand in for sudo.
+    fn setuid_root() -> Option<PathBuf> {
+        [
+            "/usr/bin/sudo",
+            "/usr/bin/su",
+            "/bin/su",
+            "/usr/bin/passwd",
+            "/usr/bin/mount",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.uid() == 0 && m.mode() & libc::S_ISUID != 0))
+    }
+
+    #[test]
+    fn only_a_setuid_root_sudo_is_run_never_a_wrapper_ahead_of_it_on_path() {
+        let Some(real) = setuid_root() else {
+            eprintln!("SKIP: no setuid-root program on this host to stand in for sudo");
+            return;
+        };
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("SKIP: as root, a setuid file of our own would be root's");
+            return;
+        }
+        let t = TempDir::new().unwrap();
+        let dir = |n: &str| {
+            let d = t.path().join(n);
+            std::fs::create_dir(&d).unwrap();
+            d
+        };
+        // root's but not setuid, as devtoolset's wrapper script.
+        let wrapper = dir("wrapper");
+        symlink("/bin/sh", wrapper.join("sudo")).unwrap();
+        // setuid, but ours: it makes nobody root.
+        let ours = dir("ours");
+        std::fs::write(ours.join("sudo"), "").unwrap();
+        std::fs::set_permissions(ours.join("sudo"), std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let none = dir("none");
+        let real_dir = dir("real");
+        symlink(&real, real_dir.join("sudo")).unwrap();
+
+        let path = std::env::join_paths([&wrapper, &ours, &none, &real_dir]).unwrap();
+        assert_eq!(find_sudo(&path).unwrap(), real_dir.join("sudo"));
+
+        let path = std::env::join_paths([&wrapper, &ours, &none]).unwrap();
+        let e = find_sudo(&path).unwrap_err().to_string();
+        for passed in [wrapper.join("sudo"), ours.join("sudo")] {
+            assert!(e.contains(passed.to_str().unwrap()), "{e}");
+        }
+        let path = std::env::join_paths([&none]).unwrap();
+        assert_eq!(find_sudo(&path).unwrap_err().to_string(), "no sudo on PATH");
+    }
 }

@@ -127,4 +127,9 @@ ls -ld /tmp/proxytun-* 2>/dev/null # 预期没有输出
 
 - 加 `-vv --log-file ~/proxytun.log` 重跑那一步,发回日志;
 - SELinux 为 Enforcing 时:`sudo ausearch -m avc -ts recent`;
+- 启用了 devtoolset(`scl enable devtoolset-N`)时,PATH 上排在前面的 `sudo` 是它的包装脚本;proxytun 跳过它，直接用
+  setuid 的 `/usr/bin/sudo`,`--doctor` 的 `sudo mode` 一行会显示实际用的路径;
+- sudo 模式的启动过程不能用 `strace -f` 跟踪：以你的身份跟踪时 sudo 拿不到 root(报 `effective uid is not 0`);
+  以 root 跟踪时特权助手发现自己被跟踪会拒绝运行(这是有意的)。请用 `-vv` 日志;要看程序的系统调用，用第 6 节的
+  `proxytun -- strace -f ...`,或在启动后 `strace -p <proxytun 的 pid>`;
 - 如果报 `sudo: sorry, you must have a tty to run sudo`:说明 sudoers 有 `requiretty`,请从交互终端运行(不要经 cron 或无 tty 的 ssh)。

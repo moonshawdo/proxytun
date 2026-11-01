@@ -35,7 +35,9 @@ flowchart TD
 ### 5.2 sudo 模式的流程
 
 proxytun 在 0700 的私有目录里建一个 unix socket,运行 `sudo -- <proxytun 自己的绝对路径> __proxytun_root_setup <socket 路径>`
-(sudo 会关闭 fd ≥ 3,所以只能传路径)。特权助手(root)按下图建好命名空间后立即退出。
+(sudo 会关闭 fd ≥ 3,所以只能传路径)。用的是 PATH 上第一个属主 root、带 setuid 位的 `sudo`,即 sudo 本身;
+排在它前面的包装脚本(如 devtoolset 的 `scl enable` 包装)跳过不用:它会改写命令行(把 `--` 当成命令),
+还用 `-E` 把用户的环境带给 root。特权助手(root)按下图建好命名空间后立即退出。
 
 ```mermaid
 sequenceDiagram
