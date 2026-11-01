@@ -36,7 +36,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
     let dir = TempDir::new()?;
     let ctl = start_helper(&dir.path().join("ctl"))?;
     send_request(&ctl, s)?;
-    let handover = recv_setup(&ctl, None)?;
+    let handover = recv_setup(&ctl)?;
     let report = &handover.report;
     let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
     let pid = value("pid=")

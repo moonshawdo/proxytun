@@ -213,8 +213,23 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
         }
     }
     drop(theirs);
-    let handover = recv_setup(&ours, Some(pid))?;
-    Ok((Child::new(pid, ours), handover))
+    match recv_setup(&ours) {
+        Ok(handover) => Ok((Child::new(pid, ours), handover)),
+        Err(e) => {
+            abandon(ours, pid);
+            Err(e)
+        }
+    }
+}
+
+/// The setup failed: close our end of `ctl`, then reap the setup process.
+/// In this order: one that answered (even wrongly) waits on `ctl` for the
+/// go-ahead and leaves only on EOF.
+fn abandon(ctl: OwnedFd, pid: libc::pid_t) {
+    drop(ctl);
+    let mut status = 0;
+    // SAFETY: plain syscall.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
 }
 
 /// Entry point of the setup process (`proxytun SETUP_ARG ...`). Never
@@ -574,5 +589,43 @@ mod tests {
                 .context("configure")
         ));
         assert!(!blames_userns(&io(libc::ENOENT).context("TUNSETIFF")));
+    }
+
+    #[test]
+    fn a_failed_setup_that_waits_for_go_is_ended_and_reaped_not_waited_on_forever() {
+        // A setup process whose answer was refused: it answered, so it now
+        // blocks on ctl for the go-ahead, as in `wait_go`.
+        let (ours, theirs) =
+            socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::SOCK_CLOEXEC).unwrap();
+        // SAFETY: the child only calls close, read and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            unsafe {
+                // Only its end of ctl stays open, as after the exec.
+                for fd in 3..4096 {
+                    if fd != theirs.as_raw_fd() {
+                        libc::close(fd);
+                    }
+                }
+                let mut go = [0u8; 1];
+                libc::read(theirs.as_raw_fd(), go.as_mut_ptr().cast(), 1);
+                libc::_exit(125);
+            }
+        }
+        drop(theirs);
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            abandon(ours, pid);
+            let _ = done.send(());
+        });
+        ended
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("abandon waits on a setup process that waits on us");
+        // Reaped, no zombie left: it is no longer our child.
+        let mut status = 0;
+        // SAFETY: plain syscall.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     }
 }

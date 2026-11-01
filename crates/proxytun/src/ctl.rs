@@ -103,8 +103,8 @@ pub fn recv_with_fds(ctl: &OwnedFd, buf: &mut [u8]) -> Result<(usize, Vec<OwnedF
     Ok((msg.bytes, fds))
 }
 
-/// Read the setup's answer on `ctl`. `pid` is reaped on failure.
-pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<Handover> {
+/// Read the setup's answer on `ctl`.
+pub fn recv_setup(ctl: &OwnedFd) -> Result<Handover> {
     let mut buf = vec![0u8; 16 * 1024];
     let (n, fds) = recv_with_fds(ctl, &mut buf).context("waiting for the namespace setup")?;
     let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
@@ -134,9 +134,6 @@ pub fn recv_setup(ctl: &OwnedFd, pid: Option<libc::pid_t>) -> Result<Handover> {
             })
         }
         None => {
-            if let Some(pid) = pid {
-                reap(pid);
-            }
             if let Some(why) = reply.strip_prefix("ERR userns ") {
                 return Err(UsernsUnusable(why.to_string()).into());
             }
@@ -165,12 +162,6 @@ pub fn send_ok(ctl: &OwnedFd, ns: &Namespace, report: &str) -> Result<()> {
     let mut fds = vec![ns.tun.as_raw_fd(), ns.listener.as_raw_fd()];
     fds.extend(ns.forwards.iter().map(|(_, l)| l.as_raw_fd()));
     send_with_fds(ctl, msg.as_bytes(), &fds).context("handing the namespace over")
-}
-
-fn reap(pid: libc::pid_t) {
-    let mut status = 0;
-    // SAFETY: plain syscall.
-    unsafe { libc::waitpid(pid, &mut status, 0) };
 }
 
 /// The started program, still waiting for `go`.
