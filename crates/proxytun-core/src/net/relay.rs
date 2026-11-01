@@ -73,9 +73,16 @@ pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: 
             .await
             .map(|s| (s, None, "direct".to_string())),
         Decision::Proxy { group } => match live.registry.group(&group) {
-            Some(g) => proxy::dial_group(g, target, live.retries, live.fail_threshold, live.connect_timeout)
-                .await
-                .map(|(s, conn, node)| (s, Some(conn), node)),
+            Some(g) => proxy::dial_group(
+                g,
+                target,
+                live.retries,
+                live.fail_threshold,
+                live.connect_timeout,
+                live.handshake_timeout,
+            )
+            .await
+            .map(|(s, conn, node)| (s, Some(conn), node)),
             None => Err(anyhow!("rule names unknown group '{group}'")),
         },
     };
@@ -476,6 +483,22 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{what}: ended while idle: {e}"));
             assert_eq!(&b, b"after!", "{what}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_never_greets_resets_the_program_after_the_handshake_timeout() {
+        // The kernel takes the connection; nobody ever greets on it.
+        let mute = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = Config::parse(&format!(
+            "handshake_timeout_ms = 200\n[proxy]\ntype=\"socks5\"\naddr=\"{}\"\n",
+            mute.local_addr().unwrap()
+        ))
+        .unwrap();
+        let live = Arc::new(Live::new(&cfg, EnvProxies::default()).unwrap());
+        let mut c = relay_pending(&live, pending(Target::Domain("x.example".into(), 443))).await;
+        let r = tokio::time::timeout(Duration::from_secs(3), c.read(&mut [0u8; 1])).await;
+        let r = r.expect("given up after the configured 200 ms, not the default 10 s");
+        assert_eq!(r.map_err(|e| e.kind()), Err(std::io::ErrorKind::ConnectionReset));
     }
 
     #[tokio::test]

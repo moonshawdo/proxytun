@@ -34,6 +34,7 @@
 | `host_ports_exclude` | 端口数组 | `[]` | 0 ~ 65535 | 重启 |
 | `retries` | 整数 | `2` | ≥ 0 | 热加载 |
 | `connect_timeout_ms` | 整数(毫秒) | `10000` | 100 ~ 60000 | 热加载 |
+| `handshake_timeout_ms` | 整数(毫秒) | `10000` | 100 ~ 60000 | 热加载 |
 | `[health] interval_secs` | 整数(秒) | `10` | 1 ~ 3600 | 热加载 |
 | `[health] fail_threshold` | 整数 | `3` | 1 ~ 100 | 热加载 |
 | `[health] timeout_ms` | 整数(毫秒) | `10000` | 100 ~ 60000 | 热加载 |
@@ -204,13 +205,25 @@ systemd-resolved 的 unix socket 解析),proxytun 先看一眼程序发出的第
 - 类型：非负整数;默认 `2`;可热加载。
 - 与代理握手失败时，最多再换几个组内成员重试。总尝试次数 = `retries` + 1,且不超过组内健康成员的数量。`0` 表示不换。
 - 只在握手阶段重试：这时程序的数据一个字节都还没发出，重试是安全的。
-- 会换成员重试：连不上代理、连接超时(`connect_timeout_ms`,默认 10 秒,见 3.6)、问候超时、代理回复"一般性失败"或访问控制拒绝(SOCKS5 0x01、0x02,HTTP 403、500、503 等)、
+- 会换成员重试：连不上代理、连接超时(`connect_timeout_ms`,见 3.6)、问候超时(`handshake_timeout_ms`,见 3.6)、代理回复"一般性失败"或访问控制拒绝(SOCKS5 0x01、0x02,HTTP 403、500、503 等)、
   SOCKS5 代理收下请求后直接断开(`ssh -D` 连不上目标时就是这样)、本机临时端口耗尽。
-- 不重试：代理明确回复目标拒绝、不可达(SOCKS5 0x03 ~ 0x06,HTTP 502、504),或代理等目标超时(换一个代理也会是同样的结果)。
+- 不重试：代理明确回复目标拒绝、不可达(SOCKS5 0x03 ~ 0x06,HTTP 502、504),或代理等目标超时(`handshake_timeout_ms`;换一个代理也会是同样的结果)。
   本机 fd / 内存不足，或目标域名为空、超过 255 字节(SOCKS5 编码不了)时也直接失败。
 - 所有尝试都失败时向程序发 RST 关闭连接，**不会回落到直连**。
 
-### 3.6 建连超时
+### 3.6 建连与握手超时
+
+上游代理可能自己设了较长的超时(比如它连目标时等得久),所以 proxytun 等上游代理的每一步默认都是 10 秒:
+
+| 等什么 | 超时 | 超时算谁的 |
+|---|---|---|
+| 与代理建立 TCP 连接 | `connect_timeout_ms`,默认 10 秒 | 代理:计入健康，换组内其他成员 |
+| SOCKS5 问候与认证的读写 | `handshake_timeout_ms`,默认 10 秒 | 代理:计入健康，换组内其他成员 |
+| 发出 SOCKS5 请求 / HTTP CONNECT 后等代理回复(代理在连目标) | `handshake_timeout_ms`,默认 10 秒 | 目标：不计入健康，不换代理重试 |
+| 健康探测(建连 + SOCKS5 问候),以及 `proxytun doctor` 的代理检查 | `[health] timeout_ms`,默认 10 秒 | 代理 |
+
+连上之后(握手完成)的中继读写没有超时，空闲多久都不断，死链靠 TCP keepalive 发现。
+所以经代理的一条连接，最坏要等 `connect_timeout_ms` + 2 × `handshake_timeout_ms`(默认 30 秒)才失败。
 
 #### `connect_timeout_ms`
 
@@ -219,17 +232,17 @@ systemd-resolved 的 unix socket 解析),proxytun 先看一眼程序发出的第
 - 超时后向程序发 RST,程序马上得到连接被重置，而不是挂着：只靠内核自己重试 SYN 要约 2 分钟，这期间一直占着一个中继名额
   (主机上的服务卡住、accept 队列满时就是这样)。
 - 连代理超时算代理的问题：计入健康(连续失败 `[health] fail_threshold` 次标为 DOWN),并按 `retries` 换组内其他成员。
-- 只管 TCP 建连这一步，连上之后的中继读写没有超时，空闲多久都不断(死链靠 TCP keepalive 发现)。
+- 只管 TCP 建连这一步。
 - 设得太小，连远端代理会频繁失败;只有本机代理时可以调小，让失败更快暴露。
 
-上游代理可能自己设了较长的超时(比如它连目标时等得久),所以 proxytun 等上游代理的每一步默认都是 10 秒:
+#### `handshake_timeout_ms`
 
-| 等什么 | 超时 | 能否配置 |
-|---|---|---|
-| 与代理建立 TCP 连接 | `connect_timeout_ms`,默认 10 秒 | 能 |
-| SOCKS5 问候与认证的读写 | 10 秒 | 固定 |
-| 发出 SOCKS5 请求 / HTTP CONNECT 后等代理回复(代理在连目标) | 10 秒;超时算目标的问题，不换代理重试 | 固定 |
-| 健康探测(建连 + SOCKS5 问候),以及 `proxytun doctor` 的代理检查 | `[health] timeout_ms`,默认 10 秒 | 能 |
+- 类型：整数，毫秒;默认 `10000`;范围 100 ~ 60000;可热加载(之后新建的连接生效)。
+- 经代理的连接，在 TCP 连上代理之后，握手的每一步最多等多久。两步各自计时，前一步慢不会挤占后一步的时间:
+  1. SOCKS5 问候与认证(HTTP 代理没有这一步)。超时算代理的问题：计入健康，按 `retries` 换组内其他成员。
+  2. 发出 SOCKS5 请求或 HTTP CONNECT 后等代理回复。代理连上目标才回复，所以这里等的其实是代理连目标;
+     超时算目标的问题：不计入代理健康，也不换代理重试(换一个代理也要等同样久)。
+- 超时后向程序发 RST。上游代理连目标的超时比 10 秒长、又希望等它连完时调大;想让连不上的目标更快失败时调小。
 
 ## 4. `[health]` 健康检查
 
@@ -530,7 +543,7 @@ addr = "127.0.0.1:7890"
 | ``no group named 'default' (rules without `group` use it)`` | 写了 `[[groups]]` 但没有 `default` 组 |
 | `health.interval_secs must be between 1 and 3600` 等 | `[health]` 的值超出范围 |
 | `sniff_timeout_ms must be between 1 and 10000` | 同上 |
-| `connect_timeout_ms must be between 100 and 60000` | 同上 |
+| `connect_timeout_ms must be between 100 and 60000` / `handshake_timeout_ms must be between 100 and 60000` | 同上 |
 | `bad fake_ip_range …` / `fake_ip_range prefix must be between /8 and /22 …` | 不是 IPv4 CIDR,或前缀长度超出范围(proxyhook 配置里比 /22 更窄的段要放宽) |
 | `bad upstream_dns …` | 不是 `IP:端口` |
 | `bad localnet entry …` | 不是合法的 CIDR |

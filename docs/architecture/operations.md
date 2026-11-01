@@ -17,7 +17,7 @@
 
 ```mermaid
 flowchart TD
-    SEL["在健康、本连接没试过的成员里选一个"] --> D["连代理 (5 秒)<br/>SOCKS5 问候与认证 (10 秒)<br/>连接请求 (10 秒)"]
+    SEL["在健康、本连接没试过的成员里选一个"] --> D["连代理 (connect_timeout_ms, 默认 10 秒)<br/>SOCKS5 问候与认证 (handshake_timeout_ms)<br/>连接请求 (handshake_timeout_ms)"]
     D --> RES{"结果"}
     RES -- "成功" --> OK["记成功, 开始双向拷贝"]
     RES -- "目标的问题<br/>SOCKS5 0x03-0x06, HTTP 502/504,<br/>请求超时" --> TGT["不换成员, 连接失败<br/>(代理回答过的记成功)"]

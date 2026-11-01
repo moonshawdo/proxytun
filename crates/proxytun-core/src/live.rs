@@ -36,6 +36,8 @@ pub struct Live {
     /// The most each TCP connect out may take: to a proxy, direct, or to a
     /// forwarded host port.
     pub connect_timeout: Duration,
+    /// The most each step of a proxy handshake may take.
+    pub(crate) handshake_timeout: Duration,
 }
 
 impl Live {
@@ -54,6 +56,7 @@ impl Live {
                 override_destination: cfg.sniff_override_destination,
             },
             connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
+            handshake_timeout: Duration::from_millis(cfg.handshake_timeout_ms),
         })
     }
 }

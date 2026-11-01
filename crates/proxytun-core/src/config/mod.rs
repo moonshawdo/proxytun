@@ -58,6 +58,14 @@ pub struct Config {
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_ms: u64,
 
+    /// How long each step of a proxy handshake may take, each its own time:
+    /// the SOCKS5 greeting and authentication (the proxy's doing: it counts
+    /// as failing, another member is tried), then the answer to the SOCKS5
+    /// request or HTTP CONNECT, given once the proxy has reached the
+    /// destination (the destination's doing: not retried).
+    #[serde(default = "default_handshake_timeout")]
+    pub handshake_timeout_ms: u64,
+
     /// Recover the hostname of connections to a literal IP by peeking the first
     /// bytes (TLS SNI / HTTP Host). Catches programs that bypass our DNS
     /// (Chrome's DoH, hard-coded IPs). Default true.
@@ -167,9 +175,11 @@ fn default_retries() -> u32 {
     2
 }
 // Upstream proxies may take their time (their own timeouts towards the
-// destination are often long): what we wait for from them defaults to 10 s,
-// as the fixed handshake timeout (`proxy::HANDSHAKE_TIMEOUT`) does.
+// destination are often long): what we wait for from them defaults to 10 s.
 fn default_connect_timeout() -> u64 {
+    10_000
+}
+fn default_handshake_timeout() -> u64 {
     10_000
 }
 fn yes() -> bool {
@@ -470,6 +480,9 @@ impl Config {
         if self.connect_timeout_ms < 100 || self.connect_timeout_ms > 60_000 {
             bail!("connect_timeout_ms must be between 100 and 60000");
         }
+        if self.handshake_timeout_ms < 100 || self.handshake_timeout_ms > 60_000 {
+            bail!("handshake_timeout_ms must be between 100 and 60000");
+        }
         let net: Ipv4Net = self
             .fake_ip_range
             .parse()
@@ -552,6 +565,7 @@ mod tests {
         assert_eq!(c.retries, 2);
         // What we wait for from an upstream proxy: 10 s by default.
         assert_eq!(c.connect_timeout_ms, 10_000);
+        assert_eq!(c.handshake_timeout_ms, 10_000);
         assert_eq!(c.health.timeout_ms, 10_000);
         assert_eq!(c.upstream_dns, None, "the host's resolver unless set");
         assert!(c.host_ports_forward);
@@ -565,21 +579,26 @@ mod tests {
     }
 
     #[test]
-    fn connect_timeout_parses_and_stays_within_its_range() {
-        let c = Config::parse(&format!("connect_timeout_ms = 1500\n{MINIMAL}")).unwrap();
-        assert_eq!(c.connect_timeout_ms, 1500);
-        for ok in [100, 60_000] {
-            assert!(
-                Config::parse(&format!("connect_timeout_ms = {ok}\n{MINIMAL}")).is_ok(),
-                "{ok}"
-            );
-        }
-        for bad in [0, 99, 60_001] {
-            let e = Config::parse(&format!("connect_timeout_ms = {bad}\n{MINIMAL}")).unwrap_err();
-            assert!(
-                format!("{e:#}").contains("connect_timeout_ms must be between 100 and 60000"),
-                "{bad}: {e:#}"
-            );
+    fn connect_and_handshake_timeouts_parse_and_stay_within_their_range() {
+        let c = Config::parse(&format!(
+            "connect_timeout_ms = 1500\nhandshake_timeout_ms = 2500\n{MINIMAL}"
+        ))
+        .unwrap();
+        assert_eq!((c.connect_timeout_ms, c.handshake_timeout_ms), (1500, 2500));
+        for key in ["connect_timeout_ms", "handshake_timeout_ms"] {
+            for ok in [100, 60_000] {
+                assert!(
+                    Config::parse(&format!("{key} = {ok}\n{MINIMAL}")).is_ok(),
+                    "{key} = {ok}"
+                );
+            }
+            for bad in [0, 99, 60_001] {
+                let e = Config::parse(&format!("{key} = {bad}\n{MINIMAL}")).unwrap_err();
+                assert!(
+                    format!("{e:#}").contains(&format!("{key} must be between 100 and 60000")),
+                    "{bad}: {e:#}"
+                );
+            }
         }
     }
 
@@ -794,6 +813,9 @@ mod tests {
         let c = Config::parse(&format!("{}\n{MINIMAL}", line("connect_timeout_ms"))).unwrap();
         assert!(c.ignored_keys.is_empty(), "{:?}", c.ignored_keys);
         assert_eq!(c.connect_timeout_ms, default.connect_timeout_ms);
+        let c = Config::parse(&format!("{}\n{MINIMAL}", line("handshake_timeout_ms"))).unwrap();
+        assert!(c.ignored_keys.is_empty(), "{:?}", c.ignored_keys);
+        assert_eq!(c.handshake_timeout_ms, default.handshake_timeout_ms);
         let c = Config::parse(&format!("{MINIMAL}\n[health]\n{}", line("timeout_ms"))).unwrap();
         assert!(c.ignored_keys.is_empty(), "{:?}", c.ignored_keys);
         assert_eq!(c.health.timeout_ms, default.health.timeout_ms);

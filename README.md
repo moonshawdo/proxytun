@@ -141,6 +141,7 @@ host_ports_forward = true        # 主机的回环监听转发进命名空间
 host_ports_exclude = []          # 程序要自己监听的端口
 retries = 2                      # 代理握手失败时再换几个出口
 connect_timeout_ms = 10000       # 连代理 / 直连 / 主机端口的建连超时, 超时向程序发 RST
+handshake_timeout_ms = 10000     # 与代理握手每一步的超时: SOCKS5 问候认证, 等代理回复请求 / CONNECT
 
 [[proxies]]
 name = "clash"
@@ -278,7 +279,7 @@ proxytun -c proxytun.toml ltrace -f ./prog
 | `kill <proxytun pid>`、`pkill proxytun`、`killall proxytun`(只发给 proxytun) | 转发给程序，恰好一次(见证进程叫 `signal-witness`,不会被这些命令选中) |
 | `kill %1`、`kill -- -<pgid>`、systemd 逐进程发送 | 程序已经收到，不重复转发(靠一个"见证进程"判断)。程序不在 proxytun 的进程组时(sudo `use_pty`),逐进程发送会让它收到两份 |
 | 第二次 `SIGTERM`(不论间隔多久);或主程序已退出、只剩后台子进程时按 Ctrl+C | proxytun 立即以该信号结束 |
-| `kill -HUP <pid>` | 重新加载规则、localnet、`direct_to_proxies`、代理和分组、`retries`、`connect_timeout_ms`、嗅探与健康检查设置;配置有错则保留旧配置 |
+| `kill -HUP <pid>` | 重新加载规则、localnet、`direct_to_proxies`、代理和分组、`retries`、`connect_timeout_ms`、`handshake_timeout_ms`、嗅探与健康检查设置;配置有错则保留旧配置 |
 | `kill -USR1 <pid>` | 打印统计：假 IP 数、地址改写表大小、连接数、流量、DNS 查询数、按原因分开的丢弃、各代理的健康与延迟 |
 | proxytun 被 `kill -9` 或崩溃 | 程序**不会被杀**,继续运行但断网(TUN 已随 proxytun 消失),不会绕过代理直连 |
 
