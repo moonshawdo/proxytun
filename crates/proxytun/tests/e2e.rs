@@ -726,9 +726,39 @@ fn a_stalled_or_vanished_stderr_stops_neither_the_program_nor_proxytun() {
     }
 }
 
+/// Can we be root in a user namespace of our own, with uid 1000 mapped
+/// (subordinate ids) to become with setpriv? Needs `unshare --map-auto`
+/// (util-linux 2.38 or later), newuidmap and a range in /etc/subuid.
+fn subordinate_uids_work() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        Command::new("unshare")
+            .args(["--user", "--map-auto", "--map-root-user", "--"])
+            .args([
+                "setpriv",
+                "--reuid=1000",
+                "--regid=1000",
+                "--clear-groups",
+                "--",
+                "true",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
 #[test]
 fn a_stalled_stderr_we_may_not_reopen_does_not_stop_proxytun_either() {
     require!("python3", "curl", "unshare", "setpriv");
+    if !subordinate_uids_work() {
+        eprintln!(
+            "SKIP: cannot become uid 1000 in a user namespace of our own \
+             (needs unshare --map-auto from util-linux 2.38+, newuidmap and /etc/subuid)"
+        );
+        return;
+    }
     let origin = start_origin();
     let mock = start_mock_proxy(origin);
     let dir = shared_dir("stderr-theirs");

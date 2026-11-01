@@ -350,7 +350,7 @@ cargo test --release --test bench -- --ignored --nocapture --test-threads=1   # 
   拒绝被跟踪或被过滤的 sudo、恶意的助手客户端)。
 - 端到端测试需要 `curl`、`python3`、`cc`、`strace`、`gdb`、`ltrace`、`dig`、`pkill`、`mount`、`unshare`(util-linux);sudo 模式的测试和一个 stderr 用例
   另需 `newuidmap`(uidmap 包)、`setpriv`、支持 `--map-auto` 的 `unshare`(util-linux ≥ 2.38)和 `/etc/subuid` 里的区间。宿主机建不了 proxytun 的命名空间时，所有端到端用例都 SKIP。
-  缺少时对应用例打印 `SKIP`(用 `-- --nocapture` 才看得到)并按通过计;例外是那个 stderr 用例，`unshare` 不支持 `--map-auto` 时它会失败而不是 SKIP。
+  缺少时对应用例打印 `SKIP`(用 `-- --nocapture` 才看得到)并按通过计。
 - 测试目录在 `$TMPDIR/proxytun-test-<pid>-*`,保留到下一次运行时尽量删除(只删本用户的、原进程已退出的),便于查看失败现场。
 
 ### 性能
