@@ -44,6 +44,7 @@ flowchart LR
         SIG --> SYS["sys.rs<br/>pipe, sigset"]
         SUDO --> SYS
         WIT --> SYS
+        NETNS --> SYS
         APP --> CTL["ctl.rs<br/>控制通道"]
         NETNS --> CTL
         SUDO --> CTL
@@ -98,7 +99,7 @@ flowchart LR
 | `logging.rs` | 日志初始化：stderr 从不阻塞、从不失败的写入器(见 [6.5](lifecycle.md#65-日志的写入)),或追加写 `--log-file` |
 | `app.rs` | 把各部分接起来：读配置与 `--proxy` 覆盖、建命名空间(userns,不能用时 sudo)、提高 fd 上限并算出中继上限、启动 tokio 上的服务(中继、主机端口、清扫、健康探测)与 tun 线程、放行程序;SIGHUP 热加载(并换掉健康探测)、SIGUSR1 统计 |
 | `signals.rs` | 退出与 INT/QUIT/TERM:在任何线程之前屏蔽、改由 signalfd 读取，判断要不要转发给程序(问见证进程),等整棵进程树，按程序的方式退出(第 6 节) |
-| `netns.rs` | proxytun 自己的地址(`Addrs`:假 IP 范围最后一个 /24,假 IP 池不分配);准备进程：fork 后重新 exec 自己，建 user / 网络 / 挂载命名空间，写 `resolv.conf` 并 bind mount,建 TUN 与捕获监听，经 socketpair 交回 fd,等放行后 exec 程序;准备失败时先关掉控制通道再回收准备进程(它若已应答，正等放行，见 EOF 才退出);exec 前恢复信号屏蔽和调用方的 SIGPIPE 处置 |
+| `netns.rs` | proxytun 自己的地址(`Addrs`:假 IP 范围最后一个 /24,假 IP 池不分配);准备进程：fork 后重新 exec 自己，建 user / 网络 / 挂载命名空间，写 `resolv.conf` 并 bind mount,建 TUN 与捕获监听，经 socketpair 交回 fd,等放行后 exec 程序;准备失败时杀掉并回收准备进程(它若已应答，正等放行，不会自己退出);exec 前恢复信号屏蔽和调用方的 SIGPIPE 处置 |
 | `ctl.rs` | proxytun 与建命名空间的一方(准备进程;sudo 模式下是特权助手及其 fork 出的程序一侧)之间的控制通道：一个 SOCK_SEQPACKET socket 上带 fd(SCM_RIGHTS)的消息、`OK` / `ERR` 应答(`recv_setup`)、放行(`Child::go` / `wait_go`)、列表编码 |
 | `netcfg.rs` | 用 ioctl 配网(不依赖 `ip` 命令和 netlink):建 TUN、地址与 MTU、链路 up、默认路由、绑定监听 |
 | `sudo/` | sudo 模式，按进程身份分文件(见 [5.2](privilege.md#52-sudo-模式的流程)):`mod.rs`:请求的编码与解码、程序的身份 `Identity`、几方共用的常量与 socket 设置、拒绝经 sudo / setuid 以 root 运行(`root_refusal`);`client.rs`:proxytun 一侧，以用户身份运行(私有目录里的 unix socket、调 sudo、发请求和 fd);`helper.rs`:root 助手(校验调用者、安全上下文与资源限制，建空的命名空间并 fork 出程序一侧，重新校验请求，配置命名空间并交回);`program.rs`:fork 出的程序一侧(从 root 降为用户，再接收请求和 fd、转交助手，放行后 exec 程序) |

@@ -134,6 +134,13 @@ pub fn recv_setup(ctl: &OwnedFd) -> Result<Handover> {
             })
         }
         None => {
+            if reply.starts_with("OK ") {
+                // Answered, so still there: waiting for the go-ahead.
+                bail!(
+                    "namespace setup answered wrongly: {reply:?}, fds attached: {}",
+                    fds.len()
+                );
+            }
             if let Some(why) = reply.strip_prefix("ERR userns ") {
                 return Err(UsernsUnusable(why.to_string()).into());
             }
@@ -197,6 +204,19 @@ pub fn wait_go(ctl: &OwnedFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ok_without_the_fds_it_lists_is_refused_as_a_wrong_answer_not_an_exit() {
+        use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+        let pair = || socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::SOCK_CLOEXEC).unwrap();
+        let (ours, theirs) = pair();
+        let (a, _b) = pair();
+        // One fd where the TUN device and the listener make two.
+        send_with_fds(&theirs, b"OK fwd=-", &[a.as_raw_fd()]).unwrap();
+        let e = recv_setup(&ours).err().expect("refused").to_string();
+        assert!(e.contains("answered wrongly") && e.ends_with("fds attached: 1"), "{e}");
+        assert!(!e.contains("exited"), "{e}");
+    }
 
     #[test]
     fn lists_are_comma_separated_or_a_dash_for_none() {

@@ -115,13 +115,14 @@ async fn relay_one(sh: &Shared, stream: tokio::net::TcpStream, peer: SocketAddr)
     let SocketAddr::V4(peer) = peer else {
         bail!("not a captured connection: {peer}");
     };
-    if !sh.nat().is_nat(*peer.ip()) {
-        bail!("not a captured connection: {peer}");
+    let dst = {
+        let mut nat = sh.nat();
+        if !nat.is_nat(*peer.ip()) {
+            bail!("not a captured connection: {peer}");
+        }
+        nat.accept(peer)
     }
-    let dst = sh
-        .nat()
-        .accept(peer)
-        .ok_or_else(|| anyhow!("no address-rewriting entry for {peer}"))?;
+    .ok_or_else(|| anyhow!("no address-rewriting entry for {peer}"))?;
     let _relaying = Relaying::new(sh, Some(peer));
     tracing::trace!(nat = %peer, %dst, "accepted");
 

@@ -216,20 +216,23 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
     match recv_setup(&ours) {
         Ok(handover) => Ok((Child::new(pid, ours), handover)),
         Err(e) => {
-            abandon(ours, pid);
+            abandon(pid);
             Err(e)
         }
     }
 }
 
-/// The setup failed: close our end of `ctl`, then reap the setup process.
-/// In this order: one that answered (even wrongly) waits on `ctl` for the
-/// go-ahead and leaves only on EOF.
-fn abandon(ctl: OwnedFd, pid: libc::pid_t) {
-    drop(ctl);
-    let mut status = 0;
-    // SAFETY: plain syscall.
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+/// The setup failed: kill the setup process, then reap it. Killed, not just
+/// waited for: one that answered (even wrongly) waits for the go-ahead, and
+/// one stuck or stopped would keep us here for good. It has removed its
+/// temporary directory by the time it answers.
+fn abandon(pid: libc::pid_t) {
+    // SAFETY: plain syscalls on our own child, not reaped yet (its pid
+    // cannot have been reused).
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
 }
 
 /// Entry point of the setup process (`proxytun SETUP_ARG ...`). Never
@@ -476,9 +479,7 @@ pub fn exec(argv: &[OsString], sigpipe_ignored: bool) -> i32 {
     // SAFETY: plain syscalls on prepared, NUL-terminated buffers.
     unsafe {
         libc::signal(libc::SIGPIPE, sigpipe_disposition(sigpipe_ignored));
-        let mut empty: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut empty);
-        libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+        libc::sigprocmask(libc::SIG_SETMASK, &crate::sys::sigset(&[]), std::ptr::null_mut());
         libc::execvp(ptrs[0], ptrs.as_ptr());
     }
     eprintln!(
@@ -592,40 +593,35 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_setup_that_waits_for_go_is_ended_and_reaped_not_waited_on_forever() {
-        // A setup process whose answer was refused: it answered, so it now
-        // blocks on ctl for the go-ahead, as in `wait_go`.
-        let (ours, theirs) =
-            socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::SOCK_CLOEXEC).unwrap();
-        // SAFETY: the child only calls close, read and _exit.
+    fn a_failed_setup_is_ended_and_reaped_even_one_that_would_never_leave() {
+        // As app and doctor do: a SIGCHLD ignored by whoever ran the tests
+        // would have the kernel reap for us, and the check below prove nothing.
+        // SAFETY: plain syscall.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+        // A setup process that never leaves by itself: waiting for a go-ahead
+        // that does not come (its ctl kept open elsewhere), stuck, or stopped.
+        // SAFETY: the child only calls pause.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork");
         if pid == 0 {
-            unsafe {
-                // Only its end of ctl stays open, as after the exec.
-                for fd in 3..4096 {
-                    if fd != theirs.as_raw_fd() {
-                        libc::close(fd);
-                    }
-                }
-                let mut go = [0u8; 1];
-                libc::read(theirs.as_raw_fd(), go.as_mut_ptr().cast(), 1);
-                libc::_exit(125);
+            loop {
+                unsafe { libc::pause() };
             }
         }
-        drop(theirs);
         let (done, ended) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            abandon(ours, pid);
+            abandon(pid);
             let _ = done.send(());
         });
-        ended
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("abandon waits on a setup process that waits on us");
+        let gave_up = ended.recv_timeout(std::time::Duration::from_secs(30)).is_err();
+        if gave_up {
+            // SAFETY: plain syscall on our own child.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(!gave_up, "abandon waited on a setup process that never leaves");
         // Reaped, no zombie left: it is no longer our child.
-        let mut status = 0;
         // SAFETY: plain syscall.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     }
 }

@@ -13,7 +13,7 @@ mod socks5;
 use self::http::http_handshake;
 use self::socks5::{socks5_connect_request, socks5_creds, socks5_greet, socks5_request};
 use crate::balancer::{ConnGuard, Group, Node};
-use crate::config::{ProxyCfg, ProxyKind, Strategy};
+use crate::config::{ProxyCfg, ProxyKind};
 use crate::errno::{is_errno, is_local_shortage};
 use crate::types::Target;
 use anyhow::{anyhow, Context, Result};
@@ -173,11 +173,7 @@ pub(crate) async fn dial_group(
     retries: u32,
     fail_threshold: u32,
 ) -> Result<(TcpStream, ConnGuard, String)> {
-    // Only the hash strategy looks at the key.
-    let key = match group.strategy {
-        Strategy::Hash => t.host_key(),
-        _ => String::new(),
-    };
+    let key = t.host_key();
     let mut tried: Vec<usize> = Vec::new();
     let mut last_err = anyhow!("group '{}': no healthy proxy available", group.name);
     for _ in 0..=retries {

@@ -139,28 +139,26 @@ fn from_program(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
             packet::rewrite_tcp(pkt, p, nat, sh.listen);
             write_packet(tun, sh, &pkt[..p.len]);
         }
-        (None, Some(_)) => {
-            // Every retried SYN lands here (`dropped_table_full` counts them
-            // all).
-            if sh.table_full_logged.due() {
-                tracing::error!(
-                    src = %p.src, dst = %p.dst,
-                    "address-rewriting table full, refusing new connections (see \
-                     dropped_table_full; reported every {}s)",
-                    throttle::EVERY.as_secs()
-                );
-            }
+        (None, syn) => {
             if let Some(r) = packet::reset_answering(pkt, p) {
                 write_packet(tun, sh, &r);
             }
-            count(&sh.stats.drop_table_full, 1);
-        }
-        (None, None) => {
-            if let Some(r) = packet::reset_answering(pkt, p) {
-                write_packet(tun, sh, &r);
+            if syn.is_some() {
+                // Every retried SYN lands here (`dropped_table_full` counts
+                // them all).
+                count(&sh.stats.drop_table_full, 1);
+                if sh.table_full_logged.due() {
+                    tracing::error!(
+                        src = %p.src, dst = %p.dst,
+                        "address-rewriting table full, refusing new connections (see \
+                         dropped_table_full; reported every {}s)",
+                        throttle::EVERY.as_secs()
+                    );
+                }
+            } else {
+                count(&sh.stats.drop_no_flow, 1);
+                tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
             }
-            count(&sh.stats.drop_no_flow, 1);
-            tracing::trace!(src = %p.src, dst = %p.dst, flags = p.flags, "tcp for no known connection, dropped");
         }
     }
 }
@@ -397,6 +395,9 @@ mod tests {
             sizes += pkt.len();
             on_packet(&tun, &sh, &rt, pkt);
         }
+        // Each under its own reason: the stray ACK is no flow's, not a full
+        // table's (one of each in the end would not tell them apart).
+        assert_eq!((n(&sh.stats.drop_no_flow), n(&sh.stats.drop_table_full)), (1, 0));
         // Fill the table: the next SYN has nowhere to go.
         {
             let mut nat = sh.nat();

@@ -1,5 +1,6 @@
 //! Thin wrappers over libc calls that modules otherwise unrelated to each
-//! other make alike (the sudo helper, the signal witness, app).
+//! other make alike (the sudo helper, the signal witness, signal handling,
+//! the setup process).
 
 use anyhow::{bail, Result};
 use std::os::fd::{FromRawFd, OwnedFd};
