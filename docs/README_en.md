@@ -84,6 +84,8 @@ cargo build --release            # output: target/release/proxytun
 > **Do not copy a binary built with `cargo build --release` on a recent distribution to CentOS 7**: it links newer glibc symbols and does not start on glibc 2.17.
 > Use the static build above.
 
+To skip building, download the same static build from [Releases](https://github.com/moonshawdo/proxytun/releases) and check it against the `SHA256SUMS` published with it: `sha256sum -c SHA256SUMS`.
+
 ## Usage
 
 ### Quick start
@@ -369,6 +371,17 @@ Benchmarks on the local loopback, comparing "through proxytun" with "without pro
 
 Single-connection throughput is capped by the `tun` thread (about 95% CPU while downloading) at about 1 GB/s, far above the speed of real proxies and networks. Methodology, more data and analysis: [docs/PERFORMANCE.md](PERFORMANCE_en.md).
 
+## Releasing
+
+Releases are published by hand on GitHub; the steps are in [.github/workflows/release.yml](../.github/workflows/release.yml):
+
+1. Set `version` under `[workspace.package]` in `Cargo.toml` to the new version, commit and push to main. Run the [tests](#testing) locally first:
+   the end-to-end tests need namespaces and a TUN device, so GitHub's machines run only the unit tests.
+2. In the repository, Actions → Release → Run workflow, branch main, and enter the same version (without the `v`, e.g. `0.2.0`).
+3. The workflow runs the unit tests with Rust 1.99.1, builds the musl static binary, checks that it is statically linked and that `--version` reports this version,
+   then creates the tag `v<version>` and a release of the same name with `proxytun-x86_64-linux-musl` and `SHA256SUMS`; GitHub generates the release notes from the commits.
+4. A malformed version, one that differs from `Cargo.toml`, an existing tag or a failed tag query, failed tests, or a binary that is not static make the workflow fail before anything is published.
+
 ## Not supported
 
 **Platform and processes**
@@ -408,6 +421,7 @@ crates/proxytun/       capture side and the binary: namespaces and TUN, address 
   tests/e2e.rs         end-to-end tests (real namespaces, TUN, debuggers, sudo mode simulating CentOS 7)
   tests/bench.rs       benchmarks
 scripts/               build-static.sh static build
+.github/workflows/     release.yml manual GitHub release
 docs/                  ARCHITECTURE.md architecture index (the chapters are in architecture/), CONFIG.md config reference,
                        PERFORMANCE.md performance tests, DESIGN.md design decisions, CENTOS7.md CentOS 7 verification steps;
                        English versions are the *_en.md files alongside (this README is docs/README_en.md)

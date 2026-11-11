@@ -84,6 +84,8 @@ cargo build --release            # 产物: target/release/proxytun
 > **不要把在新发行版上 `cargo build --release` 得到的二进制拷到 CentOS 7**:它链接了较新的 glibc 符号，在 glibc 2.17 上无法启动。
 > 请用上面的静态构建。
 
+不想自己编译时，可以从 [Releases](https://github.com/moonshawdo/proxytun/releases) 下载同一个静态版本，用一起发布的 `SHA256SUMS` 校验:`sha256sum -c SHA256SUMS`。
+
 ## 使用说明
 
 ### 快速开始
@@ -369,6 +371,17 @@ cargo test --release --test bench -- --ignored --nocapture --test-threads=1   # 
 
 单连接吞吐的上限在 `tun` 线程(下载时约 95% CPU),约 1 GB/s,远高于真实代理与网络的速度。测试方法、更多数据与分析见 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
+## 发布
+
+在 GitHub 上手动发布，流程定义在 [.github/workflows/release.yml](.github/workflows/release.yml):
+
+1. 把 `Cargo.toml` 里 `[workspace.package]` 的 `version` 改成新版本，提交并推送到 main。发布前在本机跑完[测试](#测试):
+   端到端测试需要命名空间和 TUN 设备,GitHub 的机器上只跑单元测试。
+2. 在仓库的 Actions → Release → Run workflow,分支选 main,填同一个版本号(不带 `v`,如 `0.2.0`)。
+3. workflow 用 Rust 1.99.1 跑单元测试、构建 musl 静态版本，确认它是静态链接、`--version` 报告的正是这个版本，
+   然后创建 tag `v<版本>` 和同名 Release,附上 `proxytun-x86_64-linux-musl` 和 `SHA256SUMS`;发布说明由 GitHub 按提交自动生成。
+4. 版本号格式不对、与 `Cargo.toml` 不一致、tag 已存在或查询 tag 失败、测试失败、二进制不是静态链接时,workflow 直接失败，不发布任何东西。
+
 ## 不支持的功能
 
 **平台与进程**
@@ -408,6 +421,7 @@ crates/proxytun/       捕获侧与程序: 命名空间与 TUN、地址改写、
   tests/e2e.rs         端到端测试(真实命名空间、TUN、调试器, 模拟 CentOS 7 的 sudo 模式)
   tests/bench.rs       性能基准
 scripts/               build-static.sh 静态构建
+.github/workflows/     release.yml 手动发布 Release
 docs/                  ARCHITECTURE.md 技术架构索引(正文分篇在 architecture/), CONFIG.md 配置项说明,
                        PERFORMANCE.md 性能测试, DESIGN.md 设计决策, CENTOS7.md CentOS 7 验证步骤;
                        英文版是同目录下的 *_en.md(README 的英文版是 docs/README_en.md)

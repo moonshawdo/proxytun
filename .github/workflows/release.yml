@@ -1,0 +1,93 @@
+# Manual release: Actions -> Release -> Run workflow, on main, with the
+# version from Cargo.toml (no leading v). Builds the static musl binary,
+# runs the unit tests, checks the binary, then publishes release vX.Y.Z
+# with the binary and SHA256SUMS. Any failed check stops it before
+# anything is published. The end-to-end tests need namespaces and a TUN
+# device the runner may not grant: run them locally before releasing.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (e.g. 0.1.0); must equal Cargo.toml"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+# One release at a time; never cancel one halfway.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ inputs.version }}
+      TARGET: x86_64-unknown-linux-musl
+      # The toolchain proxytun is developed and tested on.
+      RUST_VERSION: "1.99.1"
+      BIN: dist/proxytun-x86_64-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          rustup default "$RUST_VERSION"
+
+      - name: Check the version
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::not a version: $VERSION"
+            exit 1
+          fi
+          cargo_version=$(cargo metadata --no-deps --format-version 1 --locked | python3 -c '
+          import json, sys
+          print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "proxytun"))')
+          if [ "$cargo_version" != "$VERSION" ]; then
+            echo "::error::Cargo.toml says $cargo_version: bump it to $VERSION first"
+            exit 1
+          fi
+          # The tag is created at this commit; an existing one would pair an
+          # old commit with a binary built from this one. --exit-code: 0 found,
+          # 2 not found, anything else is a failed query, which stops us too.
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null || rc=$?
+          if [ "$rc" = 0 ]; then
+            echo "::error::tag v$VERSION already exists"
+            exit 1
+          elif [ "$rc" != 2 ]; then
+            echo "::error::could not list the tags (git ls-remote exit $rc)"
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: cargo test --locked --target "$TARGET" --workspace --lib --bins
+
+      - name: Build the static binary
+        run: |
+          ./scripts/build-static.sh
+          if ! file "$BIN" | grep -q 'static'; then
+            echo "::error::$BIN is not statically linked: $(file "$BIN")"
+            exit 1
+          fi
+          reported=$("$BIN" --version)
+          if [ "$reported" != "proxytun $VERSION" ]; then
+            echo "::error::the binary reports '$reported'"
+            exit 1
+          fi
+          (cd dist && sha256sum proxytun-x86_64-linux-musl > SHA256SUMS)
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" "$BIN" dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "proxytun $VERSION" \
+            --generate-notes
