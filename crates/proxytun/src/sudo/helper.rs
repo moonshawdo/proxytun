@@ -77,7 +77,7 @@ fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
     // The program is put into this group (`setpgid` in `helper`): the
     // caller's own, never another job's, whose signals it would then share.
     ensure!(
-        req.pgrp == caller_pgrp,
+        req.pgrp > 0 && req.pgrp == caller_pgrp,
         "process group {} is not the caller's",
         req.pgrp
     );
@@ -258,9 +258,12 @@ fn helper(args: &[OsString]) -> Result<()> {
     let own = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     same_confinement(&own, &status).or_else(|e| refuse(&ctl, e))?;
     // The caller's process group (for `validate`) and session (to tell
-    // `use_pty` below), and its resource limits for the program.
-    let caller = crate::procfs::proc_stat(cred.pid());
-    let caller_pgrp = caller.map_or(-1, |s| s.pgrp);
+    // `use_pty` below), and its resource limits for the program. Unreadable
+    // means refused: no stand-in value may reach the checks.
+    let caller = crate::procfs::proc_stat(cred.pid())
+        .context("the process behind the socket is gone")
+        .or_else(|e| refuse(&ctl, e))?;
+    let caller_pgrp = caller.pgrp;
     let limits = limits_of(cred.pid()).or_else(|e| refuse(&ctl, e))?;
 
     // The namespaces first, still empty: the program is forked into them
@@ -275,7 +278,7 @@ fn helper(args: &[OsString]) -> Result<()> {
     // leader, sudo's monitor, exits after us, the terminal hangs up whatever
     // is still in it. The program leaves first and tells us on this pipe.
     // SAFETY: plain syscall.
-    let (left, detach) = if caller.map(|s| s.session) != Some(unsafe { libc::getsid(0) }) {
+    let (left, detach) = if caller.session != unsafe { libc::getsid(0) } {
         let (r, w) = crate::sys::pipe()?;
         (Some(r), Some(w))
     } else {
@@ -483,6 +486,11 @@ mod tests {
         ] {
             assert!(validate(&bad, 7).is_err(), "{why}");
         }
+        // A stand-in for "caller unknown" must never match: only a real group passes.
+        assert!(
+            validate(&req("198.18.0.0/15", -1, &[]), -1).is_err(),
+            "no real process group"
+        );
         let many: Vec<String> = (1..=crate::hostports::MAX_FORWARDS as u16 + 1)
             .map(|p| format!("127.0.0.1:{}", 1000 + p))
             .collect();
