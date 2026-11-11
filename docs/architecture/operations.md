@@ -21,7 +21,7 @@
 flowchart TD
     SEL["在健康、本连接没试过的成员里选一个"] --> D["连代理 (connect_timeout_ms, 默认 10 秒)<br/>SOCKS5 问候与认证 (handshake_timeout_ms, 默认 10 秒)<br/>连接请求 (handshake_timeout_ms, 另计)"]
     D --> RES{"结果"}
-    RES -- "成功" --> OK["记成功, 开始双向拷贝"]
+    RES -- "成功<br/>SOCKS5 0x00, HTTP 2xx" --> OK["记成功, 开始双向拷贝"]
     RES -- "目标的问题<br/>SOCKS5 0x03-0x06, HTTP 502/504,<br/>请求超时" --> TGT["不换成员, 连接失败<br/>(代理回答过的记成功)"]
     RES -- "说不清或代理自己的规则<br/>SOCKS5 0x01/0x02 及未知码,<br/>HTTP 其他状态码 (403/500/503 等)" --> ANS["记成功 (代理回答过), 换成员"]
     RES -- "SOCKS5 代理收下请求后直接断开<br/>本机临时端口耗尽 EADDRNOTAVAIL" --> ALT["不计健康, 换成员"]

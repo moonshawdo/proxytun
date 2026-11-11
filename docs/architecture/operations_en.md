@@ -21,7 +21,7 @@ so a timeout after the request is sent is the target's problem; otherwise connec
 flowchart TD
     SEL["pick one among members that are healthy and not yet tried for this connection"] --> D["connect to the proxy (connect_timeout_ms, default 10 s)<br/>SOCKS5 greeting and authentication (handshake_timeout_ms, default 10 s)<br/>connect request (handshake_timeout_ms, timed separately)"]
     D --> RES{"result"}
-    RES -- "success" --> OK["record success, start the two-way copy"]
+    RES -- "success<br/>SOCKS5 0x00, HTTP 2xx" --> OK["record success, start the two-way copy"]
     RES -- "the target's problem<br/>SOCKS5 0x03-0x06, HTTP 502/504,<br/>request timeout" --> TGT["no member switch, connection fails<br/>(success recorded if the proxy answered)"]
     RES -- "unclear or the proxy's own rules<br/>SOCKS5 0x01/0x02 and unknown codes,<br/>other HTTP status codes (403/500/503, etc.)" --> ANS["record success (the proxy answered), switch member"]
     RES -- "SOCKS5 proxy accepts the request, then just disconnects<br/>local ephemeral ports exhausted EADDRNOTAVAIL" --> ALT["health not counted, switch member"]

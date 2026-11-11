@@ -59,7 +59,8 @@ where
         .nth(1)
         .and_then(|c| c.parse::<u16>().ok())
     {
-        Some(200) => Ok(()),
+        // Any 2xx: the tunnel is up (RFC 9110 9.3.6), most proxies say 200.
+        Some(200..=299) => Ok(()),
         // Wrong or missing credentials, or no CONNECT support: a problem with
         // this proxy entry.
         Some(405 | 407) => bail!("http connect failed: {status_line}"),
@@ -166,6 +167,26 @@ mod tests {
         c.read_exact(&mut rest).await.unwrap();
         assert_eq!(&rest, b"TUNNELED");
         assert!(h.await.unwrap().starts_with("CONNECT example.com:443"));
+    }
+
+    #[tokio::test]
+    async fn http_handshake_takes_any_2xx_as_the_tunnel() {
+        // RFC 9110 9.3.6: any 2xx answer to CONNECT means the tunnel is up.
+        for reply in [&b"HTTP/1.1 201 Created\r\n\r\n"[..], b"HTTP/1.0 299 Fine\r\n\r\n"] {
+            let (mut c, srv) = duplex(1024);
+            let h = tokio::spawn(http_server(srv, reply));
+            http_handshake(&mut c, &dom("example.com", 443), None, None)
+                .await
+                .unwrap();
+            let mut rest = [0u8; 8];
+            c.read_exact(&mut rest).await.unwrap();
+            assert_eq!(&rest, b"TUNNELED");
+            h.await.unwrap();
+        }
+        // Not 2xx: no tunnel, whatever the reason phrase says.
+        let (mut c, srv) = duplex(1024);
+        tokio::spawn(http_server(srv, b"HTTP/1.1 300 Connection established\r\n\r\n"));
+        assert!(http_handshake(&mut c, &dom("a.b", 1), None, None).await.is_err());
     }
 
     #[tokio::test]
