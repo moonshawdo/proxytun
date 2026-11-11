@@ -375,12 +375,13 @@ cargo test --release --test bench -- --ignored --nocapture --test-threads=1   # 
 
 在 GitHub 上手动发布，流程定义在 [.github/workflows/release.yml](.github/workflows/release.yml):
 
-1. 把 `Cargo.toml` 里 `[workspace.package]` 的 `version` 改成新版本，提交并推送到 main。发布前在本机跑完[测试](#测试):
+1. 把 `Cargo.toml` 里 `[workspace.package]` 的 `version` 改成新版本;[CHANGELOG.md](CHANGELOG.md)(英文)里要有这个版本的一节 `## v<版本>`,
+   按 `### 🐞 Fixes` / `### ✨ New features` / `### 🚀 Improvements` 分类(平时改动直接记在下一个版本号下);提交并推送到 main。发布前在本机跑完[测试](#测试):
    端到端测试需要命名空间和 TUN 设备,GitHub 的机器上只跑单元测试。
 2. 在仓库的 Actions → Release → Run workflow,分支选 main,填同一个版本号(不带 `v`,如 `0.2.0`)。
 3. workflow 用 Rust 1.99.1 跑单元测试、构建 musl 静态版本，确认它是静态链接、`--version` 报告的正是这个版本，
-   然后创建 tag `v<版本>` 和同名 Release,附上 `proxytun-x86_64-linux-musl` 和 `SHA256SUMS`;发布说明由 GitHub 按提交自动生成。
-4. 版本号格式不对、与 `Cargo.toml` 不一致、tag 已存在或查询 tag 失败、测试失败、二进制不是静态链接时,workflow 直接失败，不发布任何东西。
+   然后创建 tag `v<版本>` 和同名 Release,附上 `proxytun-x86_64-linux-musl` 和 `SHA256SUMS`;发布说明就是 CHANGELOG.md 里这个版本的一节，后面自动附上下载表格、校验与安装命令、FAQ 和与上一版的对比链接。
+4. 版本号格式不对、与 `Cargo.toml` 不一致、CHANGELOG.md 里没有这一节或这一节为空、tag 已存在或查询 tag 失败、测试失败、二进制不是静态链接时,workflow 直接失败，不发布任何东西。
 
 ## 不支持的功能
 
@@ -426,6 +427,7 @@ docs/                  ARCHITECTURE.md 技术架构索引(正文分篇在 archit
                        PERFORMANCE.md 性能测试, DESIGN.md 设计决策, CENTOS7.md CentOS 7 验证步骤;
                        英文版是同目录下的 *_en.md(README 的英文版是 docs/README_en.md)
 proxytun.toml          带注释的示例配置
+CHANGELOG.md           各版本的改动(英文),即 Release 的发布说明
 ```
 
 ## 排错

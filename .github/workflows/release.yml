@@ -1,9 +1,10 @@
 # Manual release: Actions -> Release -> Run workflow, on main, with the
 # version from Cargo.toml (no leading v). Builds the static musl binary,
 # runs the unit tests, checks the binary, then publishes release vX.Y.Z
-# with the binary and SHA256SUMS. Any failed check stops it before
-# anything is published. The end-to-end tests need namespaces and a TUN
-# device the runner may not grant: run them locally before releasing.
+# with the binary and SHA256SUMS; the notes are the version's section of
+# CHANGELOG.md. Any failed check stops it before anything is published.
+# The end-to-end tests need namespaces and a TUN device the runner may
+# not grant: run them locally before releasing.
 name: Release
 
 on:
@@ -33,6 +34,9 @@ jobs:
       BIN: dist/proxytun-x86_64-linux-musl
     steps:
       - uses: actions/checkout@v5
+        with:
+          # All history and tags: the notes link back to the previous tag.
+          fetch-depth: 0
 
       - name: Install Rust
         run: |
@@ -65,6 +69,53 @@ jobs:
             exit 1
           fi
 
+      - name: Release notes from CHANGELOG.md
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          base="https://github.com/$GITHUB_REPOSITORY"
+          dl="$base/releases/download/v$VERSION"
+          # The "## vX.Y.Z" section (its heading may go on, e.g. with a date),
+          # up to the next "## " heading.
+          awk -v want="## v$VERSION" '
+            /^## / { if (found) exit; found = ($0 == want || index($0, want " ") == 1); next }
+            found
+          ' CHANGELOG.md > "$notes"
+          if ! grep -q '[^[:space:]]' "$notes"; then
+            echo "::error::CHANGELOG.md has no '## v$VERSION' section, or it is empty"
+            exit 1
+          fi
+          prev=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            changes="$base/compare/$prev...v$VERSION"
+          else
+            changes="$base/commits/v$VERSION"
+          fi
+          cat >> "$notes" <<EOF
+
+          ## Downloads
+
+          | Platform | File |
+          |---|---|
+          | Linux x86-64, any glibc (CentOS 7 included) | [proxytun-x86_64-linux-musl]($dl/proxytun-x86_64-linux-musl) |
+          | SHA-256 checksums | [SHA256SUMS]($dl/SHA256SUMS) |
+
+          \`\`\`bash
+          curl -LO $dl/proxytun-x86_64-linux-musl
+          curl -LO $dl/SHA256SUMS
+          sha256sum -c SHA256SUMS
+          sudo install -o root -g root -m 0755 proxytun-x86_64-linux-musl /usr/local/bin/proxytun
+          proxytun --doctor
+          \`\`\`
+
+          ## FAQ
+
+          Run \`proxytun --doctor\` first, then see Troubleshooting:
+          [English]($base/blob/v$VERSION/docs/README_en.md#troubleshooting) · [中文]($base/blob/v$VERSION/README.md#排错)
+
+          **Full Changelog**: $changes
+          EOF
+          cat "$notes"
+
       - name: Unit tests
         run: cargo test --locked --target "$TARGET" --workspace --lib --bins
 
@@ -90,4 +141,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "proxytun $VERSION" \
-            --generate-notes
+            --notes-file "$RUNNER_TEMP/notes.md"

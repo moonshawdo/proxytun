@@ -375,12 +375,13 @@ Single-connection throughput is capped by the `tun` thread (about 95% CPU while 
 
 Releases are published by hand on GitHub; the steps are in [.github/workflows/release.yml](../.github/workflows/release.yml):
 
-1. Set `version` under `[workspace.package]` in `Cargo.toml` to the new version, commit and push to main. Run the [tests](#testing) locally first:
+1. Set `version` under `[workspace.package]` in `Cargo.toml` to the new version; [CHANGELOG.md](../CHANGELOG.md) needs a section `## v<version>` for it,
+   grouped as `### 🐞 Fixes` / `### ✨ New features` / `### 🚀 Improvements` (changes are noted under the next version as they are made); commit and push to main. Run the [tests](#testing) locally first:
    the end-to-end tests need namespaces and a TUN device, so GitHub's machines run only the unit tests.
 2. In the repository, Actions → Release → Run workflow, branch main, and enter the same version (without the `v`, e.g. `0.2.0`).
 3. The workflow runs the unit tests with Rust 1.99.1, builds the musl static binary, checks that it is statically linked and that `--version` reports this version,
-   then creates the tag `v<version>` and a release of the same name with `proxytun-x86_64-linux-musl` and `SHA256SUMS`; GitHub generates the release notes from the commits.
-4. A malformed version, one that differs from `Cargo.toml`, an existing tag or a failed tag query, failed tests, or a binary that is not static make the workflow fail before anything is published.
+   then creates the tag `v<version>` and a release of the same name with `proxytun-x86_64-linux-musl` and `SHA256SUMS`; the release notes are this version's section of CHANGELOG.md, followed by a download table, checksum and install commands, a FAQ pointer and a link to the changes since the previous release.
+4. A malformed version, one that differs from `Cargo.toml`, no or an empty section in CHANGELOG.md, an existing tag or a failed tag query, failed tests, or a binary that is not static make the workflow fail before anything is published.
 
 ## Not supported
 
@@ -426,6 +427,7 @@ docs/                  ARCHITECTURE.md architecture index (the chapters are in a
                        PERFORMANCE.md performance tests, DESIGN.md design decisions, CENTOS7.md CentOS 7 verification steps;
                        English versions are the *_en.md files alongside (this README is docs/README_en.md)
 proxytun.toml          annotated example config
+CHANGELOG.md           changes per version, used as the release notes
 ```
 
 ## Troubleshooting
