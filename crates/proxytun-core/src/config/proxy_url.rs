@@ -79,7 +79,9 @@ fn percent_decode(s: &str) -> Result<String> {
         if b[i] == b'%' {
             // Two hex digits must follow; `get` is None past the end of the string or
             // when the two bytes cut a multi-byte character.
-            let hex = s.get(i + 1..i + 3).filter(|h| h.len() == 2);
+            let hex = s
+                .get(i + 1..i + 3)
+                .filter(|h| h.len() == 2 && h.bytes().all(|c| c.is_ascii_hexdigit()));
             let v = hex.and_then(|h| u8::from_str_radix(h, 16).ok());
             match v {
                 Some(v) => {
@@ -183,6 +185,9 @@ mod tests {
         assert_eq!(p.password.as_deref(), Some("p@ss:w/d"));
         assert!(parse_proxy_url("http://bob:bad%zz@10.0.0.1:8080").is_err());
         assert!(parse_proxy_url("http://bob:trail%4@10.0.0.1:8080").is_err());
+        // Exactly two hex digits: a sign is no digit, though Rust's radix parser takes one.
+        assert!(parse_proxy_url("http://bob:sign%+A@10.0.0.1:8080").is_err());
+        assert!(parse_proxy_url("http://bob:sign%-A@10.0.0.1:8080").is_err());
     }
 
     #[test]
