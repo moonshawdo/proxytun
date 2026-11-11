@@ -76,10 +76,12 @@ pub async fn finish(
 /// Copy both ways until both sides are done, and say how many bytes went
 /// each way (`up` = read from `a`), also when it ended in an error. A plain
 /// copy, not splice(2): for connections that came in through the TUN device
-/// it measured 20-30% faster (the TUN thread is the bottleneck either way, and
-/// splice only adds to it). See docs/DESIGN.md.
+/// it measured about a third faster (the TUN thread is the bottleneck either
+/// way, and splice only adds to it). See docs/DESIGN.md.
 async fn pump(a: &mut TcpStream, b: &mut TcpStream, traffic: &Traffic) -> (Transfer, Result<()>) {
+    // No Nagle on either leg: a relay must pass small writes on at once.
     a.set_nodelay(true).ok();
+    b.set_nodelay(true).ok();
     // Counted in wrappers as bytes pass: the copy's own counts are lost when it fails.
     let mut a = Counted {
         s: a,
@@ -162,6 +164,19 @@ mod tests {
             (moved, r, traffic)
         });
         (client, server, h)
+    }
+
+    #[tokio::test]
+    async fn pump_turns_off_nagle_on_both_sides() {
+        // Host port forwarding hands pump an outbound socket nobody else
+        // configured: small writes (a prompt, a keystroke) must not wait for
+        // more data on either leg.
+        let (client, mut a) = tcp_pair().await;
+        let (mut b, server) = tcp_pair().await;
+        drop((client, server));
+        let _ = pump(&mut a, &mut b, &Traffic::default()).await;
+        assert!(a.nodelay().unwrap(), "inbound");
+        assert!(b.nodelay().unwrap(), "outbound");
     }
 
     fn pattern(n: usize) -> Vec<u8> {
