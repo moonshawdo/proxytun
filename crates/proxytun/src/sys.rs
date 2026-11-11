@@ -38,6 +38,8 @@ pub fn readable_within(fd: &impl AsRawFd, within: Duration) -> bool {
         revents: 0,
     };
     let ms = within.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    // 1: ready (data, or POLLHUP at its end); 0, a timeout, and -1, an error
+    // (EINTR included), both count as nothing.
     // SAFETY: plain syscall on a local pollfd.
     unsafe { libc::poll(&mut p, 1, ms) == 1 }
 }

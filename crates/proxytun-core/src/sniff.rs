@@ -32,6 +32,8 @@ pub fn sniff(buf: &[u8]) -> Sniffed {
     if buf.is_empty() {
         return Sniffed::NeedMore;
     }
+    // The first byte tells the protocol: 0x16 is a TLS handshake record, and these letters
+    // start the HTTP methods in `METHODS`.
     match buf[0] {
         0x16 => sniff_tls(buf),
         b'G' | b'P' | b'H' | b'D' | b'O' | b'C' | b'T' => sniff_http(buf),
@@ -72,9 +74,11 @@ fn sniff_tls(buf: &[u8]) -> Sniffed {
         return Sniffed::No;
     }
     let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    // A plaintext record carries 1 to 2^14 bytes; any other length is not TLS.
     if rec_len == 0 || rec_len > 16 * 1024 {
         return Sniffed::No;
     }
+    // Wait for the whole first record: its payload must hold the ClientHello.
     if buf.len() < 5 + rec_len {
         return Sniffed::NeedMore;
     }
@@ -86,6 +90,7 @@ fn sniff_tls(buf: &[u8]) -> Sniffed {
 
 fn parse_client_hello(rec: &[u8]) -> Option<String> {
     let mut r = Rd(rec);
+    // Handshake header: msg_type (1 = ClientHello) and a 3-byte body length.
     if r.u8()? != 0x01 {
         return None; // not a ClientHello
     }
@@ -94,6 +99,9 @@ fn parse_client_hello(rec: &[u8]) -> Option<String> {
         .map(|b| ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize)?;
     let mut h = Rd(r.take(len)?); // a hello fragmented over several records fails here
     h.take(2 + 32)?; // legacy_version + random
+
+    // Skip the session id, cipher suites and compression methods: each is length-prefixed
+    // (1, 2 and 1 bytes) and they all come before the extensions.
     let sid = h.u8()? as usize;
     h.take(sid)?;
     let cs = h.u16()? as usize;
@@ -103,6 +111,7 @@ fn parse_client_hello(rec: &[u8]) -> Option<String> {
     let ext_len = h.u16()? as usize;
     let mut exts = Rd(h.take(ext_len)?);
 
+    // Walk the extensions (2-byte type, 2-byte length, body) and keep the first server_name.
     let mut name = None;
     while !exts.0.is_empty() {
         let ty = exts.u16()?;
@@ -110,6 +119,8 @@ fn parse_client_hello(rec: &[u8]) -> Option<String> {
         let body = exts.take(l)?;
         match ty {
             EXT_SERVER_NAME if name.is_none() => {
+                // server_name body: a length-prefixed list of (name_type, 2-byte length, name);
+                // name_type 0 is a DNS host name, the only type defined.
                 let mut e = Rd(body);
                 let list_len = e.u16()? as usize;
                 let mut list = Rd(e.take(list_len)?);
@@ -142,11 +153,14 @@ const METHODS: [&[u8]; 9] = [
 ];
 
 fn sniff_http(buf: &[u8]) -> Sniffed {
+    // A request starts with one of `METHODS`; a few bytes that are a prefix of one may
+    // still become one.
     let method_ok = METHODS.iter().any(|m| buf.starts_with(m));
     let could_be = METHODS.iter().any(|m| m.starts_with(&buf[..buf.len().min(m.len())]));
     if !method_ok {
         return if could_be { Sniffed::NeedMore } else { Sniffed::No };
     }
+    // The header block ends at the first empty line; stop waiting for it after 8 KiB.
     let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
         return if buf.len() < 8192 {
             Sniffed::NeedMore
@@ -157,6 +171,7 @@ fn sniff_http(buf: &[u8]) -> Sniffed {
     let Ok(head) = std::str::from_utf8(&buf[..end]) else {
         return Sniffed::No;
     };
+    // Skip the request line; the first header named Host (any case) decides.
     for line in head.split("\r\n").skip(1) {
         let Some((k, v)) = line.split_once(':') else { continue };
         if k.eq_ignore_ascii_case("host") {
@@ -175,18 +190,21 @@ fn sniff_http(buf: &[u8]) -> Sniffed {
 
 /// Accept only plausible DNS names; reject IP literals, trailing dots, junk.
 fn valid_host(s: &str) -> Option<String> {
+    // 253 bytes is the longest a DNS name can be in dotted form without the root dot.
     if s.is_empty() || s.len() > 253 || s.starts_with('.') || s.ends_with('.') {
         return None;
     }
     if s.parse::<IpAddr>().is_ok() {
         return None;
     }
+    // Host name characters (letters, digits, '-', '.'), plus '_', which some real names use.
     if !s
         .bytes()
         .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_')
     {
         return None;
     }
+    // Every label 1 to 63 bytes (the DNS limit); an empty one means two dots in a row.
     if s.split('.').any(|l| l.is_empty() || l.len() > 63) {
         return None;
     }

@@ -64,7 +64,10 @@ pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: 
     let _pin = guard;
 
     let dial_start = Instant::now();
+    // Each arm gives the outbound stream, the proxy's connection guard (none when
+    // direct) and the name logged as `via`.
     let dialed = match decision {
+        // Returning drops `inbound`: the program sees its connection closed.
         Decision::Block => {
             tracing::info!(ms = start.elapsed().as_millis() as u64, "closed: blocked by a rule");
             return Ok(());
@@ -108,6 +111,8 @@ pub async fn route(live: &Live, traffic: &Traffic, inbound: TcpStream, pending: 
 /// a dead path ends the connection after the kernel's own retries.
 fn keepalive(s: &TcpStream) {
     let fd = s.as_raw_fd();
+    // (level, option, value): keepalive on, then idle time and probe interval in seconds,
+    // and the probe count. setsockopt failures are not checked.
     for (level, opt, v) in [
         (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
         (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60),
@@ -144,13 +149,16 @@ async fn maybe_sniff(inbound: &TcpStream, target: &Target, cfg: &SniffCfg, polic
     if crate::policy::is_local_scope(ip) || policy.has_ip_rule_for(target) {
         return None;
     }
+    // Peek again as more bytes arrive, until the sniffer can decide; one deadline for all.
     let deadline = tokio::time::Instant::now() + cfg.timeout;
     let mut buf = vec![0u8; sniff::MAX_PEEK];
     loop {
+        // peek() leaves the bytes in the socket: the copy to the target still reads them all.
         let n = tokio::time::timeout_at(deadline, inbound.peek(&mut buf))
             .await
             .ok()?
             .ok()?;
+        // EOF: the program closed without sending anything.
         if n == 0 {
             return None;
         }
@@ -164,6 +172,7 @@ async fn maybe_sniff(inbound: &TcpStream, target: &Target, cfg: &SniffCfg, polic
                 tracing::debug!(?target, bytes = n, head = %hex(&buf[..n.min(16)]), "sniff: no hostname, keeping the IP");
                 return None;
             }
+            // The buffer is full and still not enough: peeking again would return the same bytes.
             Sniffed::NeedMore if n == buf.len() => return None,
             Sniffed::NeedMore => {
                 // peek() returns at once while unread data sits in the buffer;
@@ -208,10 +217,13 @@ async fn lookup(
         )));
     };
     let host = host.to_owned();
+    // to_socket_addrs on a (host, port) pair calls getaddrinfo, which blocks the thread.
     tokio::task::spawn_blocking(move || {
         let _slot = slot; // held until getaddrinfo is done, however long
         std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port)).map(Iterator::collect)
     })
+    // The outer error is the task's own (a panic, or a runtime shutting down), the inner
+    // one the lookup's.
     .await
     .map_err(io::Error::other)?
 }
@@ -219,6 +231,8 @@ async fn lookup(
 /// Direct connect. For a domain we must resolve it ourselves now, because the
 /// program was handed a *fake* IP; the real one was never resolved on its side.
 async fn dial_direct(t: &Target, timeout: Duration) -> Result<TcpStream> {
+    // One timeout covers the lookup and the connect, which tries each resolved address in
+    // turn until one accepts.
     let fut = async {
         match t {
             Target::Domain(d, p) => TcpStream::connect(&lookup(&LOOKUPS, d, *p).await?[..]).await,

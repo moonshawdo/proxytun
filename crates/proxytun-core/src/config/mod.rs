@@ -15,6 +15,9 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 
+/// The group used by `proxy` rules without a `group` and by connections no rule
+/// matches; also the proxy name of an unnamed legacy `[proxy]` and of a
+/// `--proxy` override.
 pub const DEFAULT_GROUP: &str = "default";
 
 #[derive(Debug, Deserialize, Clone)]
@@ -127,6 +130,8 @@ pub struct Config {
 pub fn first_nameserver(resolv: &str) -> Option<SocketAddr> {
     resolv.lines().find_map(|l| {
         let mut f = l.split_whitespace();
+        // Any other line, or an address that does not parse (`fe80::1%eth0`),
+        // gives None and find_map moves on to the next line.
         (f.next()? == "nameserver").then_some(())?;
         let ip: std::net::IpAddr = f.next()?.parse().ok()?;
         Some(SocketAddr::new(ip, 53))
@@ -333,6 +338,7 @@ impl Config {
             .iter()
             .any(|p| p.password.as_deref().is_some_and(|pw| !pw.is_empty()));
         let mode = std::fs::metadata(path).ok()?.permissions().mode();
+        // Any permission bit for group or others counts, not only read.
         (has_secret && mode & 0o077 != 0).then(|| {
             format!(
                 "{} contains a proxy password but is readable by group/others (mode {:o}); run: chmod 600 {}",
@@ -375,6 +381,7 @@ impl Config {
     }
 
     fn normalise(&mut self) {
+        // A legacy `[proxy]` becomes the only proxy; next to `[[proxies]]` it is dropped.
         if let Some(mut p) = self.proxy.take() {
             if self.proxies.is_empty() {
                 if p.name.is_empty() {
@@ -383,6 +390,7 @@ impl Config {
                 self.proxies.push(p);
             }
         }
+        // No `[[groups]]` at all: one `default` group of every proxy.
         if self.groups.is_empty() && !self.proxies.is_empty() {
             self.groups.push(GroupCfg {
                 name: DEFAULT_GROUP.into(),
@@ -390,6 +398,8 @@ impl Config {
                 members: self.proxies.iter().map(|p| p.name.clone()).collect(),
             });
         }
+        // Domain rule values in the form matching compares against: lowercase, and a
+        // suffix without its `*.` or `.`. `Policy::decide` lowercases only the target.
         for r in &mut self.rules {
             if r.kind == RuleKind::DomainSuffix {
                 r.value = domain_suffix(&r.value);
@@ -397,6 +407,7 @@ impl Config {
                 r.value = r.value.to_ascii_lowercase();
             }
         }
+        // Skip entries are matched as domain suffixes too (`SniffCfg::skips`).
         for d in &mut self.sniff_skip_domains {
             *d = domain_suffix(d);
         }
@@ -426,7 +437,11 @@ impl Config {
             if p.weight == 0 || p.weight > MAX_WEIGHT {
                 bail!("proxy '{}': weight must be between 1 and {MAX_WEIGHT}", p.name);
             }
+            // An ip:port, never a hostname: nothing resolves it. Connections dial it as
+            // parsed, and `direct_to_proxies` matches the program's own connections against it.
             p.socket_addr()?;
+            // SOCKS5 username/password auth (RFC 1929) sends each with a 1-byte length;
+            // HTTP proxies get the same limit.
             if p.username.as_deref().is_some_and(|u| u.len() > 255)
                 || p.password.as_deref().is_some_and(|u| u.len() > 255)
             {
@@ -473,6 +488,8 @@ impl Config {
         if h.timeout_ms < 100 || h.timeout_ms > 60_000 {
             bail!("health.timeout_ms must be between 100 and 60000");
         }
+        // Each connection to a literal IP on a sniff port may wait this long for its
+        // first bytes before a rule is even chosen.
         if self.sniff_timeout_ms == 0 || self.sniff_timeout_ms > 10_000 {
             bail!("sniff_timeout_ms must be between 1 and 10000");
         }
@@ -483,11 +500,13 @@ impl Config {
         if self.handshake_timeout_ms < 100 || self.handshake_timeout_ms > 60_000 {
             bail!("handshake_timeout_ms must be between 100 and 60000");
         }
+        // IPv4 only: the namespace has no IPv6 route, and AAAA queries get an empty answer.
         let net: Ipv4Net = self
             .fake_ip_range
             .parse()
             .with_context(|| format!("bad fake_ip_range {:?}", self.fake_ip_range))?;
         // The last /24 of the range holds proxytun's own namespace addresses.
+        // A /22 still leaves 766 addresses below it for fake IPs.
         if net.prefix_len() < 8 || net.prefix_len() > 22 {
             bail!(
                 "fake_ip_range prefix must be between /8 and /22, got /{} (proxytun keeps the last /24 \
@@ -495,6 +514,7 @@ impl Config {
                 net.prefix_len()
             );
         }
+        // Only the syntax of `upstream_dns`, if set: the host's resolv.conf is read at start-up.
         self.upstream_dns_addr("")?;
         for c in &self.localnet {
             c.parse::<IpNet>()
@@ -508,6 +528,7 @@ impl Config {
         for (i, r) in self.rules.iter().enumerate() {
             match r.kind {
                 RuleKind::Final => {}
+                // A prefix length is required: `1.2.3.4` alone, or no value, fails to parse.
                 RuleKind::IpCidr => {
                     r.value
                         .parse::<IpNet>()

@@ -42,21 +42,28 @@ impl Packet {
 /// versions, malformed or truncated headers, and fragments (the kernel sends
 /// TCP with DF set, and a DNS query never needs fragmenting at our MTU).
 pub fn parse(buf: &[u8]) -> Option<Packet> {
+    // IPv4 header, byte 0: version (high nibble) and IHL, the header length in 32-bit words.
     if buf.len() < 20 || buf[0] >> 4 != 4 {
         return None;
     }
     let ihl = (buf[0] & 0x0f) as usize * 4;
+    // Bytes 2..4: total length, header included; buffer bytes past it are padding, ignored.
     let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
     if ihl < 20 || len < ihl || len > buf.len() {
         return None;
     }
+    // Bytes 6..8: flags (reserved, DF 0x4000, MF 0x2000) and the 13-bit fragment offset.
+    // DF alone is fine.
     let frag = u16::from_be_bytes([buf[6], buf[7]]);
     if frag & 0x3fff != 0 {
         return None; // MF set or a non-zero offset
     }
+    // Byte 9: protocol; bytes 12..16 and 16..20: source and destination address.
     let proto = buf[9];
     let src_ip = Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]);
     let dst_ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
+    // TCP and UDP both start with source and destination port (bytes 0..2, 2..4); TCP's flags
+    // are byte 13. A segment shorter than its fixed header (TCP 20, UDP 8 bytes) is refused.
     let l4 = &buf[ihl..len];
     let (sport, dport, flags) = match proto {
         PROTO_TCP if l4.len() >= 20 => (port(l4, 0), port(l4, 2), l4[13]),
@@ -89,6 +96,8 @@ pub fn udp_payload<'a>(buf: &'a [u8], p: &Packet) -> &'a [u8] {
 /// never re-read.
 pub fn rewrite_tcp(buf: &mut [u8], p: &Packet, src: SocketAddrV4, dst: SocketAddrV4) {
     debug_assert_eq!(p.proto, PROTO_TCP);
+    // The 12 bytes that change: source and destination address (IP header bytes 12..20),
+    // then source and destination port (TCP header bytes 0..4). Saved before, read after.
     let mut old = [0u8; 12];
     old[..8].copy_from_slice(&buf[12..20]);
     old[8..12].copy_from_slice(&buf[p.ihl..p.ihl + 4]);
@@ -102,6 +111,8 @@ pub fn rewrite_tcp(buf: &mut [u8], p: &Packet, src: SocketAddrV4, dst: SocketAdd
     new[..8].copy_from_slice(&buf[12..20]);
     new[8..12].copy_from_slice(&buf[p.ihl..p.ihl + 4]);
 
+    // The TCP checksum (TCP bytes 16..18) covers the addresses too, through the pseudo-header,
+    // so all 12 bytes go into its update. The IP checksum covers only the IP header.
     let at = p.ihl + 16;
     let sum = u16::from_be_bytes([buf[at], buf[at + 1]]);
     buf[at..at + 2].copy_from_slice(&update_checksum(sum, &old, &new).to_be_bytes());
@@ -119,6 +130,8 @@ fn update_checksum(sum: u16, old: &[u8], new: &[u8]) -> u16 {
     !fold(acc)
 }
 
+/// Fold a 32-bit sum of 16-bit words into 16 bits, adding each carry back in
+/// (one's-complement addition).
 fn fold(mut acc: u32) -> u16 {
     while acc > 0xffff {
         acc = (acc & 0xffff) + (acc >> 16);
@@ -139,6 +152,8 @@ fn sum_words(data: &[u8], mut acc: u32) -> u32 {
 }
 
 fn set_ip_checksum(buf: &mut [u8], ihl: usize) {
+    // The header checksum (bytes 10..12) is summed as zero, then set to the complement of
+    // the sum over the whole header, options included.
     buf[10..12].copy_from_slice(&[0, 0]);
     let c = !fold(sum_words(&buf[..ihl], 0));
     buf[10..12].copy_from_slice(&c.to_be_bytes());
@@ -146,6 +161,8 @@ fn set_ip_checksum(buf: &mut [u8], ihl: usize) {
 
 /// Checksum of a TCP/UDP segment with its IPv4 pseudo-header.
 fn l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, segment: &[u8]) -> u16 {
+    // Pseudo-header: source and destination address, a zero byte and the protocol (one
+    // 16-bit word), and the segment length; then the segment (callers leave its checksum zero).
     let mut acc = sum_words(&src.octets(), 0);
     acc = sum_words(&dst.octets(), acc);
     acc += u32::from(proto);
@@ -153,11 +170,16 @@ fn l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, segment: &[u8]) -> u16 {
     !fold(sum_words(segment, acc))
 }
 
+/// Fill in a 20-byte IPv4 header (no options) at the start of `buf`, checksum
+/// included, for a packet of `total` bytes.
 fn ip_header(buf: &mut [u8], total: usize, proto: u8, src: Ipv4Addr, dst: Ipv4Addr) {
+    // Version 4 and IHL 5 (20 bytes), then TOS 0 and the total length.
     buf[0] = 0x45;
     buf[1] = 0;
     buf[2..4].copy_from_slice(&(total as u16).to_be_bytes());
     buf[4..6].copy_from_slice(&[0, 0]); // id: DF is set, so it is never used
+
+    // Flags DF (don't fragment), fragment offset 0.
     buf[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
     buf[8] = TTL;
     buf[9] = proto;
@@ -169,12 +191,15 @@ fn ip_header(buf: &mut [u8], total: usize, proto: u8, src: Ipv4Addr, dst: Ipv4Ad
 /// A UDP datagram from `src` to `dst`. `None` if the payload cannot fit in
 /// one IPv4 packet.
 pub fn build_udp(src: SocketAddrV4, dst: SocketAddrV4, payload: &[u8]) -> Option<Vec<u8>> {
+    // IP header (20 bytes), UDP header (8), payload: the IP total length field is 16 bits.
     let total = 28 + payload.len();
     if total > u16::MAX as usize {
         return None;
     }
     let mut buf = vec![0u8; total];
     ip_header(&mut buf, total, PROTO_UDP, *src.ip(), *dst.ip());
+    // UDP header: source port, destination port, length (header + payload), checksum
+    // (bytes 6..8, still zero while the checksum is computed).
     let udp = &mut buf[20..];
     udp[0..2].copy_from_slice(&src.port().to_be_bytes());
     udp[2..4].copy_from_slice(&dst.port().to_be_bytes());
@@ -200,6 +225,8 @@ pub fn tcp_seq(buf: &[u8], p: &Packet) -> u32 {
 pub fn build_tcp_reset(src: SocketAddrV4, dst: SocketAddrV4, seq: u32, ack: Option<u32>) -> Vec<u8> {
     let mut buf = vec![0u8; 40];
     ip_header(&mut buf, 40, PROTO_TCP, *src.ip(), *dst.ip());
+    // TCP header: ports, sequence number (4..8), acknowledgment number (8..12), data offset
+    // and flags; window (14..16) and urgent pointer (18..20) stay 0, the checksum (16..18) last.
     let tcp = &mut buf[20..];
     tcp[0..2].copy_from_slice(&src.port().to_be_bytes());
     tcp[2..4].copy_from_slice(&dst.port().to_be_bytes());
@@ -221,10 +248,14 @@ pub fn reset_answering(buf: &[u8], p: &Packet) -> Option<Vec<u8>> {
         return None;
     }
     let tcp = &buf[p.ihl..p.len];
+    // With an ACK: its acknowledgment number (TCP bytes 8..12) is the reset's sequence number.
     if p.flags & TCP_ACK != 0 {
         let ack = u32::from_be_bytes(tcp[8..12].try_into().expect("4 bytes"));
         return Some(build_tcp_reset(p.dst, p.src, ack, None));
     }
+    // Without: acknowledge its sequence number plus what it occupies, the data (past the
+    // header, whose length in 32-bit words is the high nibble of byte 12) and one each for
+    // SYN and FIN.
     let data = tcp.len().saturating_sub((tcp[12] >> 4) as usize * 4);
     let flags = (p.flags & TCP_SYN != 0) as usize + (p.flags & TCP_FIN != 0) as usize;
     let ack = tcp_seq(buf, p).wrapping_add((data + flags) as u32);
@@ -237,6 +268,8 @@ pub fn reset_answering(buf: &[u8], p: &Packet) -> Option<Vec<u8>> {
 /// (RFC 792), which hold the UDP ports.
 pub fn build_port_unreachable(orig: &[u8], p: &Packet) -> Vec<u8> {
     let quoted = &orig[..(p.ihl + 8).min(p.len)];
+    // Our IP header, the 8-byte ICMP header (type, code, checksum at 2..4, 4 unused bytes),
+    // then the quote.
     let total = 20 + 8 + quoted.len();
     let mut buf = vec![0u8; total];
     ip_header(&mut buf, total, PROTO_ICMP, *p.dst.ip(), *p.src.ip());
@@ -244,6 +277,7 @@ pub fn build_port_unreachable(orig: &[u8], p: &Packet) -> Vec<u8> {
     icmp[0] = 3; // destination unreachable
     icmp[1] = 3; // port unreachable
     icmp[8..].copy_from_slice(quoted);
+    // The ICMP checksum covers the ICMP message alone: no pseudo-header.
     let c = !fold(sum_words(icmp, 0));
     icmp[2..4].copy_from_slice(&c.to_be_bytes());
     buf

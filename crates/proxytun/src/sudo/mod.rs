@@ -97,6 +97,8 @@ impl Request {
         field(format!("{:o}", self.umask).as_bytes());
         field(if self.sigpipe_ignored { b"1" } else { b"0" });
         field(join_list(&self.inherit).as_bytes());
+        // The count is what tells `decode` where argv ends and the environment
+        // begins: items of either may be empty or hold any byte but NUL.
         field(self.argv.len().to_string().as_bytes());
         for a in &self.argv {
             field(a.as_bytes());
@@ -108,7 +110,9 @@ impl Request {
     }
 
     fn decode(b: &[u8]) -> Option<Request> {
+        // Every field ends in NUL (see `encode`): drop the last one, split on the rest.
         let mut fields = b.strip_suffix(&[0])?.split(|&c| c == 0);
+        // The fixed fields are UTF-8 text; argv and env are taken as raw bytes.
         let mut text = || std::str::from_utf8(fields.next()?).ok().map(str::to_owned);
         if text()? != "3" {
             return None;
@@ -127,9 +131,11 @@ impl Request {
         let argv: Vec<OsString> = (0..argc)
             .map(|_| fields.next().map(|a| OsString::from_vec(a.to_vec())))
             .collect::<Option<_>>()?;
+        // `netns::exec` needs a program name in argv[0].
         if argv.is_empty() {
             return None;
         }
+        // Whatever follows argv is the environment, `KEY=VALUE` each.
         let env = fields.map(|e| OsString::from_vec(e.to_vec())).collect();
         Some(Request {
             fake_range,
@@ -193,6 +199,9 @@ const MAX_INHERIT: usize = SCM_MAX_FDS - 4;
 const REQUEST_MAX: usize = 1 << 20;
 
 fn set_timeouts(fd: &OwnedFd, t: Duration) -> Result<()> {
+    // Blocking receives and sends on the socket (connect included) give up
+    // after `t`; zero means wait forever. They belong to the socket, so every
+    // fd sharing it (a forked child's too) sees the same ones.
     let tv = libc::timeval {
         tv_sec: t.as_secs() as _,
         tv_usec: 0,

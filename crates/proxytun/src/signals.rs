@@ -30,11 +30,15 @@ pub fn finish(exit: Exit) -> ! {
     };
     // SAFETY: plain syscalls on our own process.
     unsafe {
+        // No core file of ours (SIGQUIT's default action would write one).
         let none = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
         libc::setrlimit(libc::RLIMIT_CORE, &none);
+        // Default action (the Rust runtime ignores SIGPIPE, tokio handles
+        // SIGHUP and SIGUSR1) and unblocked (INT / QUIT / TERM are blocked for
+        // the signalfd), so that raising it here ends us.
         libc::signal(sig, libc::SIG_DFL);
         let set = crate::sys::sigset(&[sig]);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
@@ -52,6 +56,8 @@ pub fn wait_tree(main: libc::pid_t, main_pid: &AtomicI32, witness: Option<&Witne
     let (mut main, mut exit) = (Some(main), Exit::Code(1));
     loop {
         let mut status = 0;
+        // Whichever child ends next, the orphans re-parented to us included;
+        // __WALL takes clone children too (those that signal no SIGCHLD on exit).
         // SAFETY: plain syscall.
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
         if pid < 0 {
@@ -63,11 +69,13 @@ pub fn wait_tree(main: libc::pid_t, main_pid: &AtomicI32, witness: Option<&Witne
         // Once only: its pid may be reused by a later child of the tree.
         if main == Some(pid) {
             main = None;
+            // Without WUNTRACED no stops are reported: it exited or was killed.
             exit = if libc::WIFEXITED(status) {
                 Exit::Code(libc::WEXITSTATUS(status))
             } else {
                 Exit::Signal(libc::WTERMSIG(status))
             };
+            // Tells the signal task the program is gone (see `on_exit_signal`).
             main_pid.store(0, Ordering::SeqCst);
             tracing::info!(?exit, "program exited");
             if let Some(w) = witness {
@@ -84,6 +92,7 @@ pub fn ignored_signals(sigs: &[libc::c_int]) -> Vec<libc::c_int> {
     sigs.iter()
         .copied()
         .filter(|&s| unsafe {
+            // With no new action (null), sigaction only reads the current one.
             let mut old: libc::sigaction = std::mem::zeroed();
             libc::sigaction(s, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
         })
@@ -101,11 +110,15 @@ pub fn exit_signal_fd(sigs: &[libc::c_int]) -> Option<OwnedFd> {
     }
     unsafe {
         let set = crate::sys::sigset(sigs);
+        // Non-blocking for tokio's AsyncFd; close-on-exec, so the program does
+        // not inherit it.
         let fd = libc::signalfd(-1, &set, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
         if fd < 0 {
             tracing::warn!("signalfd: {}", std::io::Error::last_os_error());
             return None;
         }
+        // A signalfd only gets signals that are blocked: unblocked, they would
+        // still take their default action and end us.
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         Some(OwnedFd::from_raw_fd(fd))
     }
@@ -160,8 +173,12 @@ fn forward_to(
     our_pgrp: libc::pid_t,
 ) -> Option<libc::pid_t> {
     match program_pgrp {
+        // Sent to our group, and the program is still in it: it has its copy.
         Some(p) if to_group && p == our_pgrp => None,
+        // Ctrl+C while the program leads a group of its own: that whole group.
         Some(p) if terminal && p == program => Some(-p),
+        // Otherwise the program alone: sent to us alone, the program in some
+        // other group, or its group unknown (gone already).
         _ => Some(program),
     }
 }
@@ -170,6 +187,10 @@ fn forward_to(
 /// delivered to the members one after another, and we may run first.
 const WITNESS_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Read SIGINT / SIGQUIT / SIGTERM from the signalfd `fd` and act on each:
+/// end proxytun now (`on_exit_signal`), or `WITNESS_DELAY` later pass it on
+/// to the program as `forward_to` says. `main_pid` is the program's pid, 0
+/// once it is reaped.
 pub fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Option<Arc<Witness>>) {
     tokio::spawn(async move {
         // SAFETY: an OwnedFd stays open and is the same fd for as long as the
@@ -181,6 +202,8 @@ pub fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Op
         let mut terms = 0;
         loop {
             let Ok(mut ready) = afd.readable().await else { return };
+            // Each read takes one pending signal, as a signalfd_siginfo: the
+            // signal number and the sender's si_code, among others.
             // SAFETY: a plain C struct of integers, filled by read().
             let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
             let size = std::mem::size_of::<libc::signalfd_siginfo>();
@@ -199,6 +222,8 @@ pub fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Op
                 tracing::info!(sig, "exiting on a signal");
                 finish(Exit::Signal(sig))
             }
+            // The rest waits WITNESS_DELAY in a task of its own, so the next
+            // signal is read meanwhile.
             let (witness, main_pid) = (witness.clone(), main_pid.clone());
             tokio::spawn(async move {
                 tokio::time::sleep(WITNESS_DELAY).await;
@@ -214,10 +239,14 @@ pub fn spawn_exit_signal_task(fd: OwnedFd, main_pid: Arc<AtomicI32>, witness: Op
                         let w = w.clone();
                         tokio::task::spawn_blocking(move || w.saw(sig)).await.unwrap_or(false)
                     }
+                    // A terminal signal went to the group anyway; with no
+                    // witness, a process's signal counts as sent to us alone.
                     _ => false,
                 };
                 // SAFETY: plain syscall.
                 let ours = unsafe { libc::getpgrp() };
+                // `to_group`: sent to our whole group, by the terminal or as the
+                // witness saw.
                 if let Some(to) = forward_to(terminal || saw, terminal, pid, procfs::pgrp_of(pid), ours) {
                     tracing::debug!(sig, to, "forwarding the signal to the program");
                     unsafe { libc::kill(to, sig) };

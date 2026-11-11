@@ -28,6 +28,9 @@ fn identity(sudo_uid: u32, peer_uid: u32, peer_gid: u32, peer_status: &str) -> R
             .find_map(|l| l.strip_prefix(name))
             .map(str::split_whitespace)
     };
+    // Uid: lists the real, effective, saved and filesystem uid. The real one
+    // must still be the socket owner's, or the pid now names another process
+    // (or none: an empty status).
     let real_uid = field("Uid:").and_then(|mut f| f.next()?.parse::<u32>().ok());
     ensure!(real_uid == Some(peer_uid), "the process behind the socket is gone");
     let groups = field("Groups:")
@@ -49,13 +52,21 @@ const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The request, checked again by the helper: the client may not be proxytun.
 fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
+    // The bounds the config file puts on fake_ip_range (its last /24 holds
+    // proxytun's own addresses); the helper reads no config, so it checks here.
     let p = req.fake_range.prefix_len();
     ensure!((8..=22).contains(&p), "fake-ip range {} out of bounds", req.fake_range);
+    // Root binds these inside the namespace, low ports included. At most as
+    // many as fit in the handover message with the TUN device and the capture
+    // listener (`hostports::MAX_FORWARDS`).
     ensure!(
         req.forwards.len() <= crate::hostports::MAX_FORWARDS,
         "too many host ports ({})",
         req.forwards.len()
     );
+    // Only what proxytun's own scan produces (hostports.rs): loopback
+    // addresses with a real port, never 53 (DNS must reach the fake-ip DNS),
+    // each once.
     let mut seen = std::collections::HashSet::new();
     for a in &req.forwards {
         ensure!(
@@ -63,6 +74,8 @@ fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
             "host port {a} not allowed"
         );
     }
+    // The program is put into this group (`setpgid` in `helper`): the
+    // caller's own, never another job's, whose signals it would then share.
     ensure!(
         req.pgrp == caller_pgrp,
         "process group {} is not the caller's",
@@ -74,6 +87,8 @@ fn validate(req: &Request, caller_pgrp: libc::pid_t) -> Result<()> {
         "too many inherited fds ({})",
         req.inherit.len()
     );
+    // The program side dup2s each back to its number (`restore_inherited`):
+    // never onto stdio, never two onto one number, never past any fd limit.
     let mut seen = std::collections::HashSet::new();
     for &n in &req.inherit {
         ensure!(
@@ -114,6 +129,8 @@ fn ancestor_within(
         if p == target {
             return true;
         }
+        // Up one level. A ppid of 0 (above init) or a process gone (no stat
+        // to read) ends the walk.
         match ppid_of(p) {
             Some(next) if next > 0 => p = next,
             _ => return false,
@@ -130,6 +147,8 @@ fn ancestor_within(
 fn as_caller<T>(uid: libc::uid_t, gid: libc::gid_t, f: impl FnOnce() -> T) -> Result<T> {
     const KEEP: u32 = u32::MAX; // -1: leave this id as it is
 
+    // Groups and gid first: once the effective uid is not 0, the effective
+    // capabilities are gone and neither could be set to the caller's.
     // SAFETY: plain syscalls on our own credentials.
     unsafe {
         if libc::setgroups(0, std::ptr::null()) != 0
@@ -143,6 +162,8 @@ fn as_caller<T>(uid: libc::uid_t, gid: libc::gid_t, f: impl FnOnce() -> T) -> Re
             "could not take the caller's identity"
         );
         let r = f();
+        // Back in the other order: the uid (allowed, the real and saved uid
+        // being 0), which restores root's capabilities, then the gid.
         if libc::setresuid(KEEP, 0, KEEP) != 0 || libc::setresgid(KEEP, 0, KEEP) != 0 {
             bail!("back to root: {}", std::io::Error::last_os_error());
         }
@@ -176,6 +197,8 @@ fn refuse<T>(ctl: &OwnedFd, e: anyhow::Error) -> Result<T> {
 }
 
 fn helper(args: &[OsString]) -> Result<()> {
+    // Exactly `proxytun HELPER_ARG <socket>`: a sudoers rule ending in `*`
+    // would let more through.
     let [_, mode, path] = args else {
         bail!("{HELPER_ARG} is internal to proxytun");
     };
@@ -192,15 +215,23 @@ fn helper(args: &[OsString]) -> Result<()> {
             .parse()
             .with_context(|| format!("{v} is not a number"))
     };
+    // sudo sets these to the ids of the user who ran it. They serve to reach
+    // the socket as that user and to check its owner; the program's own ids
+    // come from the socket (`identity`).
     let (sudo_uid, sudo_gid) = (id("SUDO_UID")?, id("SUDO_GID")?);
 
     // Never closed by us, only by the kernel when we exit: the client may
     // queue fds on it, and the last close releases them, where a socket with
     // SO_LINGER would keep root waiting. At exit lingering does not apply.
     let ctl = ManuallyDrop::new(seqpacket(SockFlag::empty())?);
+    // Bounds our connect and sends on it, and the program side's read of the
+    // request (same socket after the fork): a silent client cannot hold root.
     set_timeouts(&ctl, HELPER_TIMEOUT)?;
     let addr = UnixAddr::new(path.as_os_str())?;
+    // The path is the caller's choice: followed with their rights, not root's.
     as_caller(sudo_uid, sudo_gid, || connect(ctl.as_raw_fd(), &addr))?.context("connect to proxytun")?;
+    // For a connected socket, the pid, uid and gid of the process listening at
+    // the other end, as the kernel recorded them at its listen().
     let cred = getsockopt(&*ctl, sockopt::PeerCredentials).context("SO_PEERCRED")?;
     // The socket's creator must be the process that ran sudo: one of our
     // ancestors (sudo, sudo's pty monitor in between), alive, so its pid has
@@ -211,6 +242,8 @@ fn helper(args: &[OsString]) -> Result<()> {
     if !ancestor_within(parent, cred.pid(), 4, |p| crate::procfs::proc_stat(p).map(|s| s.ppid)) {
         bail!("the socket was not created by the process that ran sudo");
     }
+    // Its /proc status (uid, groups, seccomp). Should it have died since,
+    // `identity` refuses an empty status or another uid's.
     let status = std::fs::read_to_string(format!("/proc/{}/status", cred.pid())).unwrap_or_default();
     let who = identity(sudo_uid, cred.uid(), cred.gid(), &status).or_else(|e| refuse(&ctl, e))?;
     // sudoers may run its command in another security context (ROLE/TYPE, an
@@ -224,6 +257,8 @@ fn helper(args: &[OsString]) -> Result<()> {
     }
     let own = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     same_confinement(&own, &status).or_else(|e| refuse(&ctl, e))?;
+    // The caller's process group (for `validate`) and session (to tell
+    // `use_pty` below), and its resource limits for the program.
     let caller = crate::procfs::proc_stat(cred.pid());
     let caller_pgrp = caller.map_or(-1, |s| s.pgrp);
     let limits = limits_of(cred.pid()).or_else(|e| refuse(&ctl, e))?;
@@ -246,6 +281,8 @@ fn helper(args: &[OsString]) -> Result<()> {
     } else {
         (None, None)
     };
+    // The program side's report: the request it read, or why it read none
+    // (see `read_report`).
     let (from_program, to_parent) = crate::sys::pipe()?;
     // SAFETY: we are single-threaded.
     let pid = unsafe { libc::fork() };
@@ -266,6 +303,8 @@ fn helper(args: &[OsString]) -> Result<()> {
         unsafe { libc::_exit(126) };
     }
     drop((detach, to_parent)); // EOF should the program side die
+
+    // From here on, any failure must also end the program side (below).
     let served = (|| -> Result<()> {
         if let Some(left) = left {
             // Said at once, still as root; only a stop (job control, before
@@ -274,12 +313,17 @@ fn helper(args: &[OsString]) -> Result<()> {
             if !crate::sys::readable_within(&left, HELPER_TIMEOUT) {
                 return refuse(&ctl, anyhow!("the program side did not leave sudo's session in time"));
             }
+            // Its byte, or EOF if it failed first: then its report says why.
             let mut b = [0u8; 1];
             // SAFETY: plain read into a local buffer.
             unsafe { libc::read(left.as_raw_fd(), b.as_mut_ptr().cast(), 1) };
         }
+        // The request, as the program side took it from the client: checked
+        // before root acts on any of it.
         let req = read_report(&from_program).or_else(|e| refuse(&ctl, e))?;
         validate(&req, caller_pgrp).or_else(|e| refuse(&ctl, e))?;
+        // The program side, forked after `enter_namespace`, shares these
+        // namespaces: what is set up now is what the program will find.
         let ns = match netns::configure_namespace(req.fake_range, false, &req.forwards) {
             Ok(v) => v,
             Err(e) => {
@@ -290,8 +334,11 @@ fn helper(args: &[OsString]) -> Result<()> {
         // Join proxytun's group. Safe from the parent alone: the program
         // cannot exec (and so make setpgid fail) before the go-ahead, which
         // follows our report.
+        // With `use_pty` the program side has made itself a session leader in
+        // a session of its own, which setpgid refuses: it stays alone.
         // SAFETY: plain syscall.
         let joined = unsafe { libc::setpgid(pid, req.pgrp) } == 0 || crate::procfs::pgrp_of(pid) == Some(req.pgrp);
+        // Parsed by `client::spawn`.
         let report = format!("pid={pid} pgrp={}", if joined { "joined" } else { "alone" });
         send_ok(&ctl, &ns, &report)
     })();
@@ -311,6 +358,8 @@ fn read_report(from: &OwnedFd) -> Result<Request> {
     let deadline = std::time::Instant::now() + HELPER_TIMEOUT + Duration::from_secs(5);
     let mut got = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
+    // Read up to EOF: the program side closes its end after its one report
+    // (`tell`), or by dying.
     loop {
         let wait = deadline.saturating_duration_since(std::time::Instant::now());
         let mut p = libc::pollfd {
@@ -318,6 +367,8 @@ fn read_report(from: &OwnedFd) -> Result<Request> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // poll: 0 is the deadline passed; an error goes the way of a failed
+        // read, below (EINTR tries again).
         // SAFETY: plain syscalls on a local pollfd and buffer.
         let n = match unsafe { libc::poll(&mut p, 1, wait.as_millis() as libc::c_int) } {
             0 => bail!("no request from the client"),
@@ -333,6 +384,8 @@ fn read_report(from: &OwnedFd) -> Result<Request> {
             break;
         }
         got.extend_from_slice(&chunk[..n as usize]);
+        // A kind byte and at most REQUEST_MAX (the program side's buffer):
+        // anything longer is no report of ours.
         ensure!(got.len() <= 1 + REQUEST_MAX, "request too large");
     }
     match got.split_first() {
@@ -352,10 +405,14 @@ fn same_confinement(own_status: &str, caller_status: &str) -> Result<()> {
             .map(str::trim)
             .map(str::to_owned)
     };
+    // TracerPid: the pid tracing us, 0 for none. Seccomp: the mode (2:
+    // filtered); Seccomp_filters (Linux 5.9 on): how many filters.
     ensure!(
         field(own_status, "TracerPid:").as_deref() == Some("0"),
         "sudo runs its command traced (sudoers intercept or log_subcmds?)"
     );
+    // Compared, not required to be none: filters a container puts on every
+    // process are on the caller too.
     for name in ["Seccomp:", "Seccomp_filters:"] {
         ensure!(
             field(own_status, name) == field(caller_status, name),

@@ -77,9 +77,9 @@ async fn dial_node(
     let pass = node.cfg.password.as_deref();
     match node.cfg.kind {
         ProxyKind::Socks5 => {
+            let creds = socks5_creds(user, pass)?;
             // A destination no proxy can be asked for (an empty or overlong
             // name): found out before connecting, and nobody's fault.
-            let creds = socks5_creds(user, pass)?;
             let req = socks5_connect_request(t).map_err(|e| TargetRefused {
                 msg: format!("{e:#}"),
                 about_target: true,
@@ -96,6 +96,8 @@ async fn dial_node(
         }
         ProxyKind::Http => {
             let mut s = connect(node, connect_timeout).await?;
+            // No greeting in HTTP: the CONNECT and its answer are one exchange, and all of
+            // it waits on the destination.
             wait_for_target(node, t, handshake_timeout, http_handshake(&mut s, t, user, pass)).await?;
             Ok(s)
         }
@@ -148,6 +150,8 @@ enum Blame {
 }
 
 fn blame(e: &anyhow::Error) -> Blame {
+    // A refusal the handshake already classed (`TargetRefused`); any other error is told
+    // apart by the errno in its chain.
     if let Some(r) = e.downcast_ref::<TargetRefused>() {
         return if r.about_target {
             Blame::Target { answered: r.answered }
@@ -176,9 +180,15 @@ pub(crate) async fn dial_group(
     connect_timeout: Duration,
     handshake_timeout: Duration,
 ) -> Result<(TcpStream, ConnGuard, String)> {
+    // The `hash` strategy's key: the host without the port, so every port of a host
+    // goes through the same member.
     let key = t.host_key();
+    // Members already dialed for this connection: never picked twice.
     let mut tried: Vec<usize> = Vec::new();
+    // Returned as is when no member is healthy to begin with.
     let mut last_err = anyhow!("group '{}': no healthy proxy available", group.name);
+    // The first try, then up to `retries` more; stop early once no healthy, untried
+    // member is left.
     for _ in 0..=retries {
         let Some(i) = group.select(&key, &tried) else { break };
         tried.push(i);
@@ -193,12 +203,15 @@ pub(crate) async fn dial_group(
             }
             Err(e) => e,
         };
+        // Whose failure it was decides what follows (docs/architecture/operations_en.md
+        // 7.2). A proxy that answered is up: it gets a success though the dial failed.
         match blame(&e) {
             Blame::Target { answered } => {
                 if answered {
                     node.record_ok();
                 }
                 tracing::debug!(proxy = %node.name, "destination refused by the proxy: {e:#}");
+                // Every member would hit the same wall: give up without trying another.
                 return Err(e);
             }
             Blame::Unclear { answered } => {

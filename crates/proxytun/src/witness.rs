@@ -54,14 +54,21 @@ impl Witness {
             match libc::fork() {
                 -1 => bail!("fork: {}", std::io::Error::last_os_error()),
                 0 => {
+                    // The middle child. The witness must not hold our ends: a
+                    // copy of ctl_w kept there would never let it see EOF.
                     drop((ctl_w, back_r));
+                    // The witness is the grandchild; the middle child exits at
+                    // once, orphaning it (a failed fork too: we then read EOF).
                     match libc::fork() {
                         0 => witness_loop(ctl_r.as_raw_fd(), back_w.as_raw_fd(), &set),
                         _ => libc::_exit(0),
                     }
                 }
                 child => {
+                    // Likewise ours: with back_w still open here, a witness that
+                    // died would not give EOF below.
                     drop((ctl_r, back_w));
+                    // Reap the middle child.
                     let mut status = 0;
                     libc::waitpid(child, &mut status, 0);
                     // Blocks until the witness is ready (or EOF if it died).
@@ -102,6 +109,7 @@ impl Witness {
             // the answer to this question, and every later one be one behind.
             let mut stale = [0u8; 64];
             while libc::poll(&mut p, 1, 0) == 1 && libc::read(from.as_raw_fd(), stale.as_mut_ptr().cast(), 64) > 0 {}
+            // Ask (`q`), then wait at most a second for the 8-byte mask.
             libc::write(to.as_raw_fd(), b"q".as_ptr().cast(), 1) == 1
                 && libc::poll(&mut p, 1, 1000) == 1
                 && libc::read(from.as_raw_fd(), mask.as_mut_ptr().cast(), 8) == 8
@@ -128,6 +136,7 @@ impl Witness {
 /// the arguments we were started with.
 unsafe fn rename_self() {
     let name = WITNESS_NAME.as_bytes();
+    // comm holds at most 15 bytes and a NUL (TASK_COMM_LEN is 16).
     let mut comm = [0u8; 16];
     comm[..name.len()].copy_from_slice(name);
     libc::prctl(libc::PR_SET_NAME, comm.as_ptr(), 0, 0, 0);
@@ -138,21 +147,26 @@ unsafe fn rename_self() {
     let Some(rest) = stat.rfind(')').and_then(|i| stat.get(i + 2..)) else {
         return;
     };
+    // Counted from the last ')', as comm may hold spaces: `rest` starts at
+    // field 3 (state), so 45 skipped put us at field 48.
     let mut f = rest.split_whitespace().skip(45).map(|v| v.parse::<usize>().ok());
     let (Some(Some(start)), Some(Some(end))) = (f.next(), f.next()) else {
         return;
     };
+    // The kernel shows 0 for addresses it withholds.
     if start == 0 || end <= start {
         return;
     }
     // Our own (copied on fork) argument strings: overwritten in place.
     let args = std::slice::from_raw_parts_mut(start as *mut u8, end - start);
+    // Clear them all, so no old argument shows through, then write the name,
+    // keeping a final NUL.
     args.fill(0);
     let n = name.len().min(args.len() - 1);
     args[..n].copy_from_slice(&name[..n]);
 }
 
-/// Bit `sig` of a signal mask as /proc shows it.
+/// A signal set as the 64-bit mask /proc shows (signal `sig` is bit `sig - 1`).
 fn mask_of(set: &libc::sigset_t) -> u64 {
     (1..=64)
         .filter(|&s| unsafe { libc::sigismember(set, s) } == 1)
@@ -178,17 +192,22 @@ unsafe fn witness_loop(ctl: libc::c_int, back: libc::c_int, set: &libc::sigset_t
             libc::signal(sig, libc::SIG_IGN);
         }
     }
+    // Ready: report our pid, which proxytun cannot know otherwise (we are the
+    // child of its child).
     let pid = libc::getpid();
     libc::write(back, &pid as *const _ as *const _, std::mem::size_of_val(&pid));
     let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut b = [0u8; 1];
     while libc::read(ctl, b.as_mut_ptr() as *mut _, 1) == 1 {
         if b[0] == b'q' {
+            // Of the blocked signals, those sent to us and still pending.
             let mut pending: libc::sigset_t = std::mem::zeroed();
             libc::sigpending(&mut pending);
             let mask = mask_of(&pending).to_ne_bytes();
             libc::write(back, mask.as_ptr().cast(), 8);
         } else {
+            // Take each pending signal of `set` off the queue without waiting,
+            // until none is left.
             while libc::sigtimedwait(set, std::ptr::null_mut(), &zero) > 0 {}
         }
     }

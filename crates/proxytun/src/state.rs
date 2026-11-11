@@ -69,6 +69,7 @@ pub struct Rates {
 
 impl Snapshot {
     fn rates_since(&self, prev: &Snapshot) -> Rates {
+        // At least a millisecond: two dumps at the same instant would divide by zero.
         let seconds = self.at.duration_since(prev.at).as_secs_f64().max(1e-3);
         let per_s = |a: u64, b: u64| a.saturating_sub(b) as f64 / seconds;
         Rates {
@@ -169,6 +170,7 @@ pub(crate) fn count(c: &AtomicU64, n: usize) {
 pub fn log_stats(sh: &Shared, prev: &mut Snapshot) {
     let (s, d) = (&sh.stats, &sh.dns);
     let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+    // The counters that also get a rate; the rest are shown as totals only.
     let now = Snapshot {
         at: Instant::now(),
         connections: n(&s.connections),
@@ -204,6 +206,7 @@ pub fn log_stats(sh: &Shared, prev: &mut Snapshot) {
         dropped_dns_busy = n(&s.drop_dns_busy),
         "stats"
     );
+    // This dump becomes the base of the next one's rates.
     let prev = std::mem::replace(prev, now);
     let r = now.rates_since(&prev);
     tracing::info!(

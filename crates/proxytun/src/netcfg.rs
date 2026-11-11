@@ -1,6 +1,6 @@
 //! Network configuration inside the namespace with plain ioctls (no `ip`
 //! binary, no netlink): create the TUN device, give it an address and MTU,
-//! bring links up, add the default route. Every call needs CAP_NET_ADMIN in
+//! bring links up, add the default route. Every ioctl here needs CAP_NET_ADMIN in
 //! the user namespace owning the network namespace, which the namespace
 //! creator has until it execs the program.
 
@@ -28,6 +28,8 @@ const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 fn ifreq(name: &CStr) -> libc::ifreq {
     // SAFETY: ifreq is plain old data; all-zero is a valid value.
     let mut r: libc::ifreq = unsafe { std::mem::zeroed() };
+    // The interface name goes in ifr_name (IFNAMSIZ: 16 bytes with its NUL), which the
+    // zeroed bytes after it supply.
     for (d, s) in r.ifr_name.iter_mut().zip(name.to_bytes()) {
         *d = *s as libc::c_char;
     }
@@ -39,6 +41,7 @@ fn sockaddr(ip: Ipv4Addr) -> libc::sockaddr {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: 0,
         sin_addr: libc::in_addr {
+            // s_addr is in network byte order: the octets go into memory as they are.
             s_addr: u32::from_ne_bytes(ip.octets()),
         },
         sin_zero: [0; 8],
@@ -76,6 +79,8 @@ pub fn create_tun(name: &CStr) -> Result<OwnedFd> {
         return Err(anyhow::Error::new(Error::last_os_error()).context(HostRefused("open /dev/net/tun")));
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // TUNSETIFF creates the device `name` and attaches it to this fd. IFF_TUN: bare IP
+    // packets, no Ethernet header; IFF_NO_PI: no 4-byte flags/protocol prefix on each.
     let mut r = ifreq(name);
     r.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
     ioctl(&fd, TUNSETIFF, &mut r as *mut _ as *mut _, "TUNSETIFF")?;
@@ -85,6 +90,7 @@ pub fn create_tun(name: &CStr) -> Result<OwnedFd> {
 /// Bring a link up.
 pub fn link_up(name: &CStr) -> Result<()> {
     let s = ctl_socket()?;
+    // SIOCSIFFLAGS sets every flag at once: start from the current ones (SIOCGIFFLAGS).
     let mut r = ifreq(name);
     ioctl(&s, libc::SIOCGIFFLAGS, &mut r as *mut _ as *mut _, "SIOCGIFFLAGS")?;
     // SAFETY: SIOCGIFFLAGS filled the flags member of the union.
@@ -99,6 +105,8 @@ pub fn set_addr(name: &CStr, ip: Ipv4Addr, prefix: u8, mtu: u32) -> Result<()> {
     let mut r = ifreq(name);
     r.ifr_ifru.ifru_addr = sockaddr(ip);
     ioctl(&s, libc::SIOCSIFADDR, &mut r as *mut _ as *mut _, "SIOCSIFADDR")?;
+    // The same ifreq for each call, its union holding the value that call sets. Prefix 0
+    // would shift by 32, which overflows: an all-zero mask.
     let mask = Ipv4Addr::from(u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0));
     r.ifr_ifru.ifru_netmask = sockaddr(mask);
     ioctl(&s, libc::SIOCSIFNETMASK, &mut r as *mut _ as *mut _, "SIOCSIFNETMASK")?;
@@ -111,6 +119,8 @@ pub fn default_route(dev: &CStr) -> Result<()> {
     let s = ctl_socket()?;
     // SAFETY: rtentry is plain old data; all-zero is a valid value.
     let mut rt: libc::rtentry = unsafe { std::mem::zeroed() };
+    // 0.0.0.0/0 matches every address. With no gateway (0.0.0.0, no RTF_GATEWAY) the route
+    // is on-link: packets go straight out of `dev`.
     rt.rt_dst = sockaddr(Ipv4Addr::UNSPECIFIED);
     rt.rt_genmask = sockaddr(Ipv4Addr::UNSPECIFIED);
     rt.rt_gateway = sockaddr(Ipv4Addr::UNSPECIFIED);

@@ -39,6 +39,8 @@ pub async fn accept_with_slot(
                         throttle::EVERY.as_secs()
                     );
                 }
+                // The connection stays queued (out of fds, accept fails without taking it), so
+                // retrying at once would spin.
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             }
@@ -61,6 +63,7 @@ fn refuse_busy(sh: &Shared, stream: tokio::net::TcpStream) {
             throttle::EVERY.as_secs()
         );
     }
+    // Linger 0: dropping the stream, as this function returns, sends a reset instead of a FIN.
     let _ = stream.set_zero_linger();
 }
 
@@ -75,6 +78,7 @@ pub async fn run_relay(listener: TcpListener, sh: Arc<Shared>) {
         let sh = sh.clone();
         tokio::spawn(
             async move {
+                // Held for the task's life: the slot is freed however the relay ends.
                 let _slot = slot;
                 if let Err(e) = relay_one(&sh, stream, peer).await {
                     tracing::debug!("relay conn error: {e:#}");
@@ -115,6 +119,9 @@ async fn relay_one(sh: &Shared, stream: tokio::net::TcpStream, peer: SocketAddr)
     let SocketAddr::V4(peer) = peer else {
         bail!("not a captured connection: {peer}");
     };
+    // The peer is the NAT address and port the TUN loop rewrote the program's connection to:
+    // the table key that gives back where the program was going (and marks it accepted).
+    // A peer off the NAT addresses dialed the listener directly from inside the namespace.
     let dst = {
         let mut nat = sh.nat();
         if !nat.is_nat(*peer.ip()) {
@@ -123,6 +130,7 @@ async fn relay_one(sh: &Shared, stream: tokio::net::TcpStream, peer: SocketAddr)
         nat.accept(peer)
     }
     .ok_or_else(|| anyhow!("no address-rewriting entry for {peer}"))?;
+    // From here on the entry is closed, and `active` counted down, however this returns.
     let _relaying = Relaying::new(sh, Some(peer));
     tracing::trace!(nat = %peer, %dst, "accepted");
 

@@ -13,6 +13,8 @@ use anyhow::Result;
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr};
 
+/// A `[[rules]]` entry ready for matching: an ip-cidr value parsed into `net`,
+/// the action and group turned into the `Decision` a match returns.
 struct Rule {
     kind: RuleKind,
     value: String,
@@ -38,6 +40,8 @@ impl Policy {
                 }
             }
         }
+        // Parsed once here, not per connection (`Config::validate` has already
+        // checked every CIDR).
         let localnet = cfg
             .localnet
             .iter()
@@ -106,6 +110,8 @@ impl Policy {
                 return Decision::Direct;
             }
         }
+        // First match wins. Domain rules see only domain targets, ip-cidr rules only
+        // literal IPs: a domain is never resolved to try it against an ip-cidr rule.
         for r in &self.rules {
             let hit = match (r.kind, t) {
                 (RuleKind::DomainSuffix, Target::Domain(..)) => is_subdomain(&domain, &r.value),
@@ -180,6 +186,8 @@ where
         let Some((host, ports)) = proxy_endpoint(&v) else {
             continue;
         };
+        // An IP is let through by `is_passthrough`, before sniffing and the rules; a
+        // hostname (kept lowercase) only by `decide`, for a domain target on that port.
         for port in ports {
             if let Ok(ip) = host.parse::<IpAddr>() {
                 if !out.ips.contains(&(ip, port)) {
@@ -204,16 +212,19 @@ fn proxy_endpoint(v: &str) -> Option<(String, Vec<u16>)> {
         Some((s, r)) => (Some(s.to_ascii_lowercase()), r),
         None => (None, v),
     };
+    // Keep the authority: drop any path, then any `user:pass@` before the host.
     let rest = rest.split('/').next()?;
     let hostport = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
-    // Without a port, clients disagree: curl and git go to 1080 for any
-    // scheme, Python, Go, wget, npm and apt to 80 for http:// (443 for
-    // https://). Either is the program's own proxy.
+    // Without a port, clients disagree on http:// (or no scheme): curl and git
+    // go to 1080, Python, Go, wget, npm and apt to 80, so both count.
+    // https:// means 443, a SOCKS scheme 1080.
     let default_ports = match scheme.as_deref() {
         Some("https") => vec![443],
         Some("socks5" | "socks5h" | "socks4" | "socks4a" | "socks") => vec![1080],
         _ => vec![80, 1080],
     };
+    // `[v6addr]` or `[v6addr]:port`: the brackets keep the address's colons apart
+    // from the port's.
     if let Some(stripped) = hostport.strip_prefix('[') {
         let (h, tail) = stripped.split_once(']')?;
         let ports = match tail.strip_prefix(':') {
@@ -222,6 +233,8 @@ fn proxy_endpoint(v: &str) -> Option<(String, Vec<u16>)> {
         };
         return Some((h.to_string(), ports));
     }
+    // `host:port` (a port that is not a number drops the whole value), `:port` with
+    // no host is ignored, and a bare host gets the scheme's default ports.
     match hostport.rsplit_once(':') {
         Some((h, p)) if !h.is_empty() => Some((h.to_string(), vec![p.parse().ok()?])),
         Some(_) => None,

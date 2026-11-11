@@ -66,7 +66,9 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
     if req.message_type() != MessageType::Query {
         return None;
     }
+    // Only the first question is looked at: resolvers send one per message.
     let q = req.queries().first()?.clone();
+    // Other classes (CHAOS `version.bind` and the like) are not ours to fake.
     if q.query_class() != DNSClass::IN {
         return Some(Answer::Forward);
     }
@@ -83,6 +85,7 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
             // costs, and a flood of other queries needs none of it.
             let domain = name.to_ascii();
             let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            // localhost and its subdomains always mean this machine (RFC 6761): loopback.
             let ip = if domain == "localhost" || domain.ends_with(".localhost") {
                 Ipv4Addr::LOCALHOST
             } else {
@@ -101,6 +104,8 @@ pub fn answer(raw: &[u8], pool: &FakePool) -> Option<Answer> {
                                 crate::throttle::EVERY.as_secs()
                             );
                         }
+                        // Fail the lookup rather than reuse an address a program may still
+                        // use for another name.
                         return reply(base_response(&req, ResponseCode::ServFail));
                     }
                 }
@@ -137,6 +142,7 @@ fn base_response(req: &Message, code: ResponseCode) -> Message {
     resp.set_recursion_desired(req.recursion_desired());
     resp.set_recursion_available(true);
     resp.set_response_code(code);
+    // Echo the question section: resolvers check that a reply answers the question they asked.
     for q in req.queries() {
         resp.add_query(q.clone());
     }
@@ -156,6 +162,7 @@ where
     // Every read and write has a deadline: a client that sends a length and
     // then nothing, or never reads, must not keep the task forever.
     loop {
+        // The next query's 2-byte length; a client closing between queries ends the loop here.
         let mut lenbuf = [0u8; 2];
         let read = tokio::time::timeout(TCP_IDLE, stream.read_exact(&mut lenbuf)).await;
         if !matches!(read, Ok(Ok(_))) {
@@ -168,6 +175,8 @@ where
         ) {
             return;
         }
+        // No reply to send (an unparseable query, or no upstream answer): hang up rather
+        // than leave the client waiting for one.
         let Some(resp) = respond(&q, pool, upstream, Transport::Tcp, stats).await else {
             return;
         };
@@ -209,6 +218,7 @@ pub async fn respond(
     match answer(raw, pool)? {
         Answer::Reply(r) => Some(r),
         Answer::Forward => {
+            // Take a forwarding slot without waiting; `_slot` holds it until this arm ends.
             let Ok(_slot) = stats.upstream_slots.try_acquire() else {
                 tracing::debug!(%upstream, "dns: {MAX_FORWARDS} queries already forwarded and waiting, dropping one");
                 return None;
@@ -259,6 +269,8 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 /// NOTIMP, REFUSED, ...) may carry no question; one is accepted on the ID
 /// alone, since forging it can only fail a lookup, not poison it.
 pub fn is_reply_to(query: &[u8], resp: &[u8]) -> bool {
+    // DNS header, 12 bytes: ID (2), flags (2: QR is the top bit of byte 2, RCODE the low
+    // 4 bits of byte 3), then QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT (2 each).
     if query.len() < 12 || resp.len() < 12 || query[..2] != resp[..2] || resp[2] & 0x80 == 0 {
         return false;
     }
@@ -271,15 +283,20 @@ pub fn is_reply_to(query: &[u8], resp: &[u8]) -> bool {
 
 /// Compare the question sections (from offset 12) of two messages. Names
 /// compare case-insensitively: resolvers may randomise the case of a query
-/// (DNS 0x20) and servers echo it, but not all do. A question is the first
-/// thing in a message, so it never holds a compression pointer.
+/// (DNS 0x20) and servers echo it, but not all do. The first question is the
+/// first name in a message, so it holds no compression pointer; a later one
+/// may point back at it, and is then taken as a mismatch.
 fn same_questions(q: &[u8], r: &[u8], count: u16) -> bool {
+    // One offset walks both messages: while they match, their questions line up byte for byte.
     let mut i = 12;
     for _ in 0..count {
+        // QNAME: labels, each a length byte and that many bytes, ended by a zero length.
         loop {
             let (Some(&len), Some(&rlen)) = (q.get(i), r.get(i)) else {
                 return false;
             };
+            // A length byte whose top two bits are not 00 is no label length: 11 marks a
+            // compression pointer, 01 and 10 are reserved.
             if len != rlen || len & 0xC0 != 0 {
                 return false;
             }
@@ -319,6 +336,8 @@ async fn forward_udp(raw: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
     // Room for the largest datagram, not zero-filled: recv_buf writes into the
     // spare capacity.
     let mut buf = Vec::with_capacity(65535);
+    // Skip datagrams that do not answer the query; one deadline covers all the reads, so
+    // strays cannot stretch the wait.
     loop {
         buf.clear();
         tokio::time::timeout_at(deadline, sock.recv_buf(&mut buf))
@@ -334,6 +353,8 @@ async fn forward_udp(raw: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
 
 /// Forward over TCP (2-byte length prefix), with the same reply check.
 async fn forward_tcp(raw: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
+    // A connection per query: send it framed, read one framed reply. One timeout covers
+    // all of it, connecting included.
     let work = async {
         let mut s = tokio::net::TcpStream::connect(upstream).await.context("connect")?;
         s.write_all(&tcp_framed(raw)).await.context("send")?;

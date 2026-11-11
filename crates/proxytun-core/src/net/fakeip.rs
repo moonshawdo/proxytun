@@ -40,19 +40,23 @@ pub struct FakePool(Arc<Mutex<Inner>>);
 
 struct Entry {
     domain: String,
+    /// Recency (larger = more recent), and the entry's key in `Inner::lru` while unpinned.
     tick: u64,
     /// When it was last handed out or used.
     used: Instant,
+    /// Live connections pinning it (one per `FakeGuard`); while non-zero it is not in `lru`.
     active: u32,
 }
 
 struct Inner {
+    /// The range's network address; a mapping is stored under its offset from it.
     base: u32,
-    /// Number of usable host offsets: 1..=usable (offset 0 and the last
-    /// address of the range are skipped).
+    /// Number of usable host offsets: 1..=usable (offset 0, the reserved tail
+    /// and the address just below it are skipped; see `with_reserved_tail`).
     usable: u32,
     /// Next never-used offset; `> usable` means the range has been exhausted.
     next_free: u32,
+    /// The last tick handed out; ticks only grow, starting at 1.
     clock: u64,
     entries: HashMap<u32, Entry>,
     by_domain: HashMap<String, u32>,
@@ -81,12 +85,15 @@ impl Drop for FakeGuard {
 
 impl Inner {
     fn touch(&mut self, off: u32, now: Instant) {
+        // Make the entry the most recently used: re-key it in `lru` under a fresh tick. A new
+        // entry (tick 0) or a pinned one is not in `lru`, and removing it does nothing.
         self.clock += 1;
         let tick = self.clock;
         if let Some(e) = self.entries.get_mut(&off) {
             self.lru.remove(&e.tick);
             e.tick = tick;
             e.used = now;
+            // A pinned entry stays out of the recycling order until its last guard drops.
             if e.active == 0 {
                 self.lru.insert(tick, off);
             }
@@ -142,11 +149,13 @@ impl FakePool {
     pub(crate) fn alloc_at(&self, domain: &str, now: Instant) -> Result<Ipv4Addr, PoolFull> {
         let domain = domain.to_ascii_lowercase();
         let mut g = self.lock();
+        // A name already mapped keeps its address, now as the most recently used.
         if let Some(&off) = g.by_domain.get(&domain) {
             g.touch(off, now);
             return Ok(g.ip(off));
         }
 
+        // A new name: the next never-used address while the range lasts.
         let off = if g.next_free <= g.usable {
             let o = g.next_free;
             g.next_free += 1;
@@ -155,15 +164,19 @@ impl FakePool {
             // Recycle the oldest mapping no live connection is using, if no
             // program can still hold it from our answer.
             let (&tick, &victim) = g.lru.iter().next().ok_or(PoolFull)?;
+            // Only the oldest needs checking: if even it was used within REUSE_AFTER, so
+            // were all the others.
             if now.saturating_duration_since(g.entries[&victim].used) < REUSE_AFTER {
                 return Err(PoolFull);
             }
+            // Drop the old mapping from all three maps; its offset goes to the new name.
             g.lru.remove(&tick);
             let old = g.entries.remove(&victim).expect("lru entry exists");
             g.by_domain.remove(&old.domain);
             victim
         };
 
+        // Record the mapping both ways; `touch` gives it its tick and its place in `lru`.
         g.entries.insert(
             off,
             Entry {
@@ -193,6 +206,7 @@ impl FakePool {
         let mut g = self.lock();
         let off = g.off_of(ip)?;
         let e = g.entries.get_mut(&off)?;
+        // One pin per connection; the guard's drop takes it back.
         e.active += 1;
         let domain = e.domain.clone();
         g.touch(off, Instant::now()); // pinned: out of the recycling order

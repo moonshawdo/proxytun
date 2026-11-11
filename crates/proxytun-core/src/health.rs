@@ -37,11 +37,14 @@ pub async fn probe_and_record(node: &Node, cfg: &HealthCfg) {
             }
         }
         Err(e) if crate::errno::is_local_shortage(&e) => {
+            // Our own shortage says nothing about the proxy: its health is left as it was.
             tracing::debug!(proxy = %node.name, "probe skipped for lack of local resources: {e:#}");
         }
         Err(e) => {
             let was_up = node.is_healthy();
             node.record_failure(cfg.fail_threshold);
+            // Warn once, for the failure that marks it DOWN; the ones before it and the
+            // ones while it stays DOWN go to debug.
             if was_up && !node.is_healthy() {
                 tracing::warn!(proxy = %node.name, "proxy marked DOWN: {e:#}");
             } else {
@@ -60,6 +63,7 @@ pub async fn probe_round(nodes: &[Arc<Node>], cfg: &HealthCfg) {
         let (n, cfg) = (n.clone(), cfg.clone());
         set.spawn(async move { probe_and_record(&n, &cfg).await });
     }
+    // Wait for every probe: the next round is timed from the end of this one.
     while set.join_next().await.is_some() {}
 }
 

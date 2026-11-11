@@ -6,7 +6,7 @@
 //!
 //! Capacity: `NAT_ADDRS` addresses (the first is `Addrs::nat`) times `PORTS`.
 //! A closed connection keeps its NAT address and port for `LINGER`, so this
-//! also bounds the rate of new connections: about 13 700 a second, sustained.
+//! also bounds the rate of new connections: about 13 800 a second, sustained.
 //!
 //! Lifecycle of an entry:
 //!   * created by the program's SYN; a SYN on the same flow with another
@@ -47,6 +47,7 @@ pub const NAT_ADDRS: u8 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
+    /// The program's SYN went to the listener, not yet answered; since when.
     Embryonic(Instant),
     /// Answered by the listener, waiting to be accepted. `server_next`: the
     /// sequence number the program expects next from it, which a reset must
@@ -56,6 +57,8 @@ enum State {
         server_next: u32,
     },
     Accepted,
+    /// Ended (relay done, a reset, or `QUEUED` up), since when: kept for
+    /// `LINGER`, still translating.
     Closed(Instant),
 }
 
@@ -77,13 +80,17 @@ type Key = u32;
 pub struct Reset {
     pub from: SocketAddrV4,
     pub to: SocketAddrV4,
+    /// The sequence number the program expects next from `from`.
     pub seq: u32,
 }
 
 pub struct Nat {
     first: u32,
     addrs: u32,
+    /// The program's flow `(src, dst)` to the key of its latest connection;
+    /// older entries of the same flow are only in `by_key`.
     by_flow: HashMap<(SocketAddrV4, SocketAddrV4), Key>,
+    /// Every entry, live, waiting or lingering, by its NAT address and port.
     by_key: HashMap<Key, Entry>,
     /// How many keys were ever handed out: those never used come first (see
     /// `take_key`), with no list of a million unused keys kept for them.
@@ -145,6 +152,8 @@ impl Nat {
     ) -> Option<SocketAddrV4> {
         if let Some(&key) = self.by_flow.get(&(src, dst)) {
             let e = &self.by_key[&key];
+            // A SYN with the entry's ISN is a retransmission, unless the entry is closed: then,
+            // like a SYN with another ISN, it opens a new connection.
             let new = syn.is_some_and(|isn| isn != e.isn || matches!(e.state, State::Closed(_)));
             if !new {
                 return Some(self.addr(key)); // a retransmitted SYN too
@@ -155,6 +164,7 @@ impl Nat {
             // and the old relay's close would end the new one.
             self.by_flow.remove(&(src, dst));
         }
+        // A new entry: only a SYN makes one, and only while a key is free.
         let isn = syn?;
         let key = self.take_key()?;
         self.by_flow.insert((src, dst), key);
@@ -182,10 +192,14 @@ impl Nat {
         let Some(key) = self.key(nat) else { return };
         let Some(e) = self.by_key.get_mut(&key) else { return };
         match (e.state, syn_ack) {
+            // Refused before accept: no relay will close it, so it ends now rather than
+            // waiting out its timeout.
             (State::Embryonic(_) | State::Queued { .. }, _) if rst => {
                 e.state = State::Closed(now);
                 self.closed.push_back((now + LINGER, key));
             }
+            // The listener answered: the program's side becomes established and the connection
+            // waits in the accept queue. The SYN takes one sequence number, hence the + 1.
             (State::Embryonic(_), Some(seq)) => {
                 e.state = State::Queued {
                     since: now,
@@ -193,6 +207,8 @@ impl Nat {
                 };
                 self.queued.push_back((now + QUEUED, key));
             }
+            // A retransmitted SYN-ACK, or anything once accepted (the relay closes those) or
+            // closed: no change.
             _ => {}
         }
     }
@@ -250,14 +266,20 @@ impl Nat {
     /// for a quarter of a second. Returns how many entries went, and whether
     /// everything due by `now` was looked at.
     pub fn sweep_some(&mut self, now: Instant, budget: usize) -> (usize, bool) {
+        // A queue item may be stale: its entry has since moved on to another state, or entered
+        // this one again later. So the entry's current state, and how long it has been in it,
+        // decide, not the item's deadline.
         let up = |since: Instant, limit: Duration| now.saturating_duration_since(since) >= limit;
         let (mut gone, mut left) = (0, budget);
+        // Never answered by the listener: dropped.
         for key in due(&mut self.embryonic, now, &mut left) {
             if matches!(self.state(key), Some(State::Embryonic(t)) if up(t, EMBRYONIC)) {
                 self.remove(key);
                 gone += 1;
             }
         }
+        // Never accepted: closed, and the program reset, unless a newer connection has taken
+        // over its flow (the reset, on the same 4-tuple, would end that one).
         for key in due(&mut self.queued, now, &mut left) {
             if let Some(State::Queued { since, server_next }) = self.state(key) {
                 if up(since, QUEUED) {
@@ -281,6 +303,7 @@ impl Nat {
                 gone += 1;
             }
         }
+        // Done when no queue has a due item left; else the budget ran out first.
         let rest = [&self.embryonic, &self.queued, &self.closed];
         (gone, rest.iter().all(|q| q.front().is_none_or(|&(t, _)| t > now)))
     }

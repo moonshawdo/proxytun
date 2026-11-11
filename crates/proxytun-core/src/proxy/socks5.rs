@@ -12,6 +12,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 fn socks5_greeting(with_auth: bool) -> &'static [u8] {
+    // VER 5, NMETHODS, then METHODS: 0x00 (no authentication) always, and 0x02
+    // (username/password, RFC 1929) only when credentials are configured.
     if with_auth {
         &[0x05, 0x02, 0x00, 0x02]
     } else {
@@ -20,6 +22,8 @@ fn socks5_greeting(with_auth: bool) -> &'static [u8] {
 }
 
 fn socks5_auth_request(user: &str, pass: &str) -> Result<Vec<u8>> {
+    // RFC 1929 request: VER 0x01 (the subnegotiation's version, not 5), ULEN, UNAME, PLEN,
+    // PASSWD. ULEN and PLEN are one byte each, so neither field can exceed 255 bytes.
     if user.len() > 255 || pass.len() > 255 {
         bail!("socks5: username/password longer than 255 bytes");
     }
@@ -31,9 +35,12 @@ fn socks5_auth_request(user: &str, pass: &str) -> Result<Vec<u8>> {
 }
 
 pub(super) fn socks5_connect_request(t: &Target) -> Result<Vec<u8>> {
+    // VER 5, CMD 0x01 (CONNECT), RSV 0; then ATYP, DST.ADDR and DST.PORT (big-endian).
     let mut req = vec![0x05, 0x01, 0x00];
     match t {
         Target::Domain(d, p) => {
+            // ATYP 0x03: one length byte, then the name, left for the proxy to resolve.
+            // The length byte caps it at 255; an empty name is no destination at all.
             if d.is_empty() || d.len() > 255 {
                 bail!("socks5: domain length {} not in 1..=255", d.len());
             }
@@ -43,6 +50,7 @@ pub(super) fn socks5_connect_request(t: &Target) -> Result<Vec<u8>> {
             req.extend_from_slice(&p.to_be_bytes());
         }
         Target::V4(ip, p) => {
+            // ATYP 0x01: the four IPv4 address bytes.
             req.push(0x01);
             req.extend_from_slice(&ip.octets());
             req.extend_from_slice(&p.to_be_bytes());
@@ -52,6 +60,7 @@ pub(super) fn socks5_connect_request(t: &Target) -> Result<Vec<u8>> {
 }
 
 fn socks5_rep_name(rep: u8) -> &'static str {
+    // The REP codes of a connect reply, as RFC 1928 section 6 names them.
     match rep {
         0x01 => "general failure",
         0x02 => "not allowed by ruleset",
@@ -87,15 +96,20 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     s.write_all(socks5_greeting(creds.is_some())).await?;
+    // Method selection reply: VER (5) and the METHOD the proxy chose.
     let mut sel = [0u8; 2];
     s.read_exact(&mut sel).await.context("socks5: method selection")?;
     if sel[0] != 0x05 {
         bail!("socks5: bad version {:#x} in method selection", sel[0]);
     }
+    // 0x00: no authentication; 0x02: username/password; 0xff: none of the offered methods
+    // is acceptable. A refused or malformed answer here counts against the proxy.
     match sel[1] {
         0x00 => {}
         0x02 => {
             let auth = creds.ok_or_else(|| anyhow!("socks5: proxy demands auth but none configured"))?;
+            // RFC 1929 exchange: send the request, read VER and STATUS; any STATUS but 0x00
+            // is a rejection.
             s.write_all(&auth).await?;
             let mut ar = [0u8; 2];
             s.read_exact(&mut ar).await.context("socks5: auth reply")?;
@@ -134,11 +148,13 @@ where
             }
             .into());
         }
+        // Any other read error is left to `blame`: the proxy's, or a local shortage.
         return Err(anyhow::Error::new(e).context("socks5: connect reply"));
     }
     if head[0] != 0x05 {
         bail!("socks5: bad version {:#x} in reply", head[0]);
     }
+    // Any REP but 0x00 (succeeded) is a refusal, classed by whose problem it is (`Blame`).
     if head[1] != 0x00 {
         let msg = format!(
             "socks5: connect failed: {} (rep={:#x})",
@@ -165,6 +181,8 @@ where
             .into()),
         };
     }
+    // Drain BND.ADDR and BND.PORT so the stream is left at the first tunnelled byte. ATYP
+    // gives the address length: 0x01 IPv4, 0x04 IPv6, 0x03 a length byte and a domain.
     let bnd = match head[3] {
         0x01 => 4,
         0x04 => 16,

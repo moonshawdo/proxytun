@@ -14,6 +14,7 @@ use std::time::Duration;
 /// Did the drop to the user leave no capability, as `status` (our
 /// /proc/self/status) shows? Unreadable (an fd limit of 0) counts as no.
 fn capabilities_gone(status: Option<&str>) -> bool {
+    // CapPrm and CapEff are hex masks: empty once the zeros are stripped.
     let zero = |name: &str| {
         status
             .and_then(|s| s.lines().find_map(|l| l.strip_prefix(name)))
@@ -27,12 +28,15 @@ fn capabilities_gone(status: Option<&str>) -> bool {
 /// limit root cannot restore (without CAP_SYS_RESOURCE: a container) stays
 /// lower.
 fn adopt_limits(limits: &[libc::rlimit]) -> std::result::Result<(), String> {
+    // Indexed by resource number, as `limits_of` read them.
     for (r, l) in limits.iter().enumerate() {
         // SAFETY: plain syscalls on local structs.
         unsafe {
             if libc::setrlimit(r as _, l) == 0 {
                 continue;
             }
+            // Refused: raising a hard limit needs CAP_SYS_RESOURCE. Set the
+            // caller's values capped at our current hard limit instead.
             let mut now = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -92,6 +96,8 @@ fn own_session_keyring(uid: libc::uid_t) -> std::result::Result<(), String> {
             buf.len(),
         )
     };
+    // n: the description's length, its NUL included; capped in case it is
+    // longer than the buffer.
     let described = if n < 0 {
         Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
     } else {
@@ -125,6 +131,8 @@ fn tell(to_parent: OwnedFd, kind: u8, body: &[u8]) {
     msg.push(kind);
     msg.extend_from_slice(body);
     let mut rest = &msg[..];
+    // Any error but EINTR gives up. The parent gone is EPIPE, not death by
+    // SIGPIPE: Rust's runtime ignores SIGPIPE, and the fork keeps that.
     while !rest.is_empty() {
         // SAFETY: plain write of our own buffer.
         let n = unsafe { libc::write(to_parent.as_raw_fd(), rest.as_ptr().cast(), rest.len()) };
@@ -144,6 +152,7 @@ fn tell(to_parent: OwnedFd, kind: u8, body: &[u8]) {
 /// may have (`own_session_keyring`); no capability left; and no_new_privs.
 /// The error says why it failed.
 fn drop_to_user(who: &Identity) -> std::result::Result<(), String> {
+    // Groups and gid while still root: once no uid is 0, neither may change.
     // SAFETY: plain syscalls on our own credentials; the helper is
     // single-threaded, so the child may use the allocator.
     unsafe {
@@ -157,12 +166,17 @@ fn drop_to_user(who: &Identity) -> std::result::Result<(), String> {
                 std::io::Error::last_os_error()
             ));
         }
+        // Checked, not assumed: all three uids the user's, and setuid(0)
+        // refused (it succeeding would mean root can be had back).
         let (mut r, mut e, mut s) = (0, 0, 0);
         libc::getresuid(&mut r, &mut e, &mut s);
         if (r, e, s) != (who.uid, who.uid, who.uid) || libc::setuid(0) == 0 {
             return Err("privileges were not dropped".into());
         }
+        // Now, as the user: a new session keyring made here is the user's.
         own_session_keyring(who.uid)?;
+        // The kernel clears the permitted and effective capabilities once no
+        // uid is 0, unless securebits say otherwise: checked in /proc.
         if !capabilities_gone(std::fs::read_to_string("/proc/self/status").ok().as_deref()) {
             return Err("capabilities survived the drop to the user, or cannot be checked".into());
         }
@@ -204,6 +218,9 @@ fn restore_inherited(numbers: &[RawFd], fds: &[RawFd]) -> std::result::Result<()
         };
         moved.push((n, m));
     }
+    // Only now onto the targets: no copy sits on one, so no dup2 closes an fd
+    // still to be moved. dup2's new fd does not close on exec: the program
+    // inherits it.
     for (n, m) in moved {
         // SAFETY: as above.
         if unsafe { libc::dup2(m, n) } < 0 {
@@ -231,6 +248,8 @@ pub(super) fn become_program(
     to_parent: OwnedFd,
 ) -> String {
     let mut to_parent = Some(to_parent);
+    // Until the report is sent, a failure is the report (`E`), and the
+    // parent tells proxytun; after it, the caller prints the reason.
     let mut fail = |why: String| -> String {
         match to_parent.take() {
             Some(p) => {
@@ -240,6 +259,8 @@ pub(super) fn become_program(
             None => why,
         }
     };
+    // First, out of sudo's pty session (`use_pty`), telling the helper, which
+    // waits for that before it reports back.
     // SAFETY: plain syscalls; the helper is single-threaded, so the child
     // may use the environment and the allocator.
     unsafe {
@@ -250,12 +271,17 @@ pub(super) fn become_program(
             libc::write(w.as_raw_fd(), b"s".as_ptr().cast(), 1);
         }
     }
+    // Limits while still root: raising a hard limit back to the caller's
+    // needs CAP_SYS_RESOURCE.
     if let Err(e) = adopt_limits(limits) {
         return fail(e);
     }
     if let Err(e) = drop_to_user(who) {
         return fail(e);
     }
+    // The user from here on, for good. Only now are the request and its fds
+    // taken off the socket: closing an fd of theirs may block, and must never
+    // block root.
     let mut buf = vec![0u8; REQUEST_MAX];
     let (n, fds) = match recv_with_fds(ctl, &mut buf) {
         Ok(v) => v,
@@ -267,6 +293,8 @@ pub(super) fn become_program(
     let Some(req) = Request::decode(&buf[..n]) else {
         return fail("malformed request".into());
     };
+    // stdin, stdout, stderr, the working directory, then one per inherited
+    // number (see `send_request`).
     if fds.len() != 4 + req.inherit.len() {
         return fail(format!("expected {} fds", 4 + req.inherit.len()));
     }
@@ -279,6 +307,7 @@ pub(super) fn become_program(
     if let Err(e) = set_timeouts(ctl, Duration::ZERO) {
         return fail(format!("{e:#}"));
     }
+    // The report: the raw request, for the helper to check and act on.
     if let Some(p) = to_parent.take() {
         tell(p, b'R', &buf[..n]);
     }
@@ -287,6 +316,8 @@ pub(super) fn become_program(
     // SAFETY: plain syscalls on fds we hold.
     unsafe {
         libc::umask(req.umask);
+        // The received fds close on exec (MSG_CMSG_CLOEXEC); the dup2 copies
+        // on 0-2 do not.
         for (i, &fd) in stdio.iter().enumerate() {
             if libc::dup2(fd, i as libc::c_int) < 0 {
                 return format!("taking your stdio: {}", std::io::Error::last_os_error());
@@ -306,7 +337,11 @@ pub(super) fn become_program(
             libc::putenv(e.as_ptr() as *mut _);
         }
     }
+    // proxytun's go-ahead (`Child::go`) comes on the helper's socket, ours
+    // too since the fork.
     wait_go(ctl);
+    // Only after the go-ahead: a target number may be ctl's, needed until
+    // then.
     if let Err(why) = restore_inherited(&req.inherit, inherit) {
         return why;
     }

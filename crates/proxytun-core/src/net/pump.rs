@@ -55,6 +55,8 @@ pub async fn finish(
     let (moved, r) = match out {
         Ok(mut out) => {
             let (moved, r) = pump(&mut inbound, &mut out, traffic).await;
+            // The copy broke midway: with a zero linger, closing `out` (it drops at the end
+            // of this arm) sends an RST instead of a FIN, so the target sees an abort.
             if r.is_err() {
                 let _ = out.set_zero_linger();
             }
@@ -62,6 +64,8 @@ pub async fn finish(
         }
         Err(e) => (Transfer::default(), Err(e)),
     };
+    // Dial failed or the copy broke: the program's side is reset too when `inbound` drops,
+    // so it never sees a clean end.
     if r.is_err() {
         let _ = inbound.set_zero_linger();
     }
@@ -76,6 +80,7 @@ pub async fn finish(
 /// splice only adds to it). See docs/DESIGN.md.
 async fn pump(a: &mut TcpStream, b: &mut TcpStream, traffic: &Traffic) -> (Transfer, Result<()>) {
     a.set_nodelay(true).ok();
+    // Counted in wrappers as bytes pass: the copy's own counts are lost when it fails.
     let mut a = Counted {
         s: a,
         n: 0,
@@ -86,6 +91,8 @@ async fn pump(a: &mut TcpStream, b: &mut TcpStream, traffic: &Traffic) -> (Trans
         n: 0,
         total: &traffic.down,
     };
+    // Each direction runs until its reader hits EOF, then shuts down the other side's
+    // writing half (a FIN); the first error ends both directions.
     // 64 KiB buffers: the 8 KiB default costs throughput on fast links.
     let r = copy_bidirectional_with_sizes(&mut a, &mut b, 64 * 1024, 64 * 1024).await;
     (Transfer { up: a.n, down: b.n }, r.map(|_| ()).map_err(Into::into))
@@ -102,6 +109,7 @@ struct Counted<'a> {
 
 impl AsyncRead for Counted<'_> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        // Count only what this read appended to `buf`.
         let before = buf.filled().len();
         let r = Pin::new(&mut *self.s).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = r {
@@ -113,6 +121,7 @@ impl AsyncRead for Counted<'_> {
     }
 }
 
+// Writes pass straight through: every byte was already counted when read from its source.
 impl AsyncWrite for Counted<'_> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         Pin::new(&mut *self.s).poll_write(cx, buf)

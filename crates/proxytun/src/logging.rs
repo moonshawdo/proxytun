@@ -29,6 +29,7 @@ struct LogSink {
 
 impl LogSink {
     fn stderr() -> LogSink {
+        // What fd 2 is (0 if fstat fails) decides how to write to it.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: fstat fills a local struct.
         let kind = if unsafe { libc::fstat(2, &mut st) } == 0 {
@@ -41,6 +42,8 @@ impl LogSink {
             return sink(2, true, false);
         }
         if kind == libc::S_IFIFO || kind == libc::S_IFCHR {
+            // Opening /proc/self/fd/2 makes a new open file description, so its
+            // O_NONBLOCK does not reach the one the program shares.
             let flags = libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
             // SAFETY: plain open; the fd is ours for good (logging lasts as
             // long as the process).
@@ -60,6 +63,9 @@ impl std::io::Write for LogSink {
         let mut rest = buf;
         while !rest.is_empty() {
             let mut chunk = rest;
+            // fd 2 itself, blocking: write only while poll reports room, and no
+            // more than PIPE_BUF at a time (a pipe that polls writable has room
+            // for that much).
             if self.gated {
                 let mut p = libc::pollfd {
                     fd: self.fd,
@@ -72,6 +78,8 @@ impl std::io::Write for LogSink {
                 }
                 chunk = &rest[..rest.len().min(libc::PIPE_BUF)];
             }
+            // A socket gets non-blocking per call (MSG_DONTWAIT), leaving fd 2's
+            // description as the program has it.
             // SAFETY: plain writes of our own buffer.
             let n = unsafe {
                 if self.socket {
@@ -93,6 +101,8 @@ impl std::io::Write for LogSink {
             }
             rest = &rest[n as usize..];
         }
+        // All of it counts as written, the dropped rest included: a short count
+        // would have the caller (write_all) try again.
         Ok(buf.len())
     }
 
@@ -122,6 +132,8 @@ pub fn init_logging(filter: &str, file: Option<&Path>) -> Result<()> {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(path)
                 .with_context(|| format!("open log file {}", path.display()))?;
+            // Checked on the opened file itself, so it cannot be swapped between
+            // the check and the writes.
             let meta = f.metadata()?;
             ensure!(
                 meta.is_file() && meta.uid() == nix::unistd::geteuid().as_raw(),

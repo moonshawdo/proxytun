@@ -22,6 +22,7 @@ pub fn pgrp_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 /// "pid (comm) state ppid pgrp session ...": comm may hold spaces and
 /// parentheses, so fields are counted from the last ')'.
 fn parse_stat(stat: &str) -> Option<ProcStat> {
+    // Past ") ": the state letter (skipped), then ppid, pgrp and session.
     let mut f = stat.get(stat.rfind(')')? + 2..)?.split_whitespace().skip(1);
     let mut next = || f.next()?.parse().ok();
     Some(ProcStat {

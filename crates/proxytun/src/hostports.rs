@@ -26,6 +26,7 @@ use tracing::Instrument;
 pub const MAX_FORWARDS: usize = 250;
 const _: () = assert!(2 + MAX_FORWARDS <= crate::ctl::SCM_MAX_FDS);
 
+/// TCP_LISTEN as the `st` column of /proc/net/tcp shows it (hex).
 const LISTEN: &str = "0A";
 
 /// Listening sockets in /proc/net/tcp (`v6` false) or tcp6 format.
@@ -34,11 +35,14 @@ pub fn listening(table: &str, v6: bool) -> Vec<SocketAddr> {
         .lines()
         .skip(1)
         .filter_map(|line| {
+            // After the header line, one socket per line: `sl`, `local_address`, `rem_address`,
+            // `st` (the state), ...: the local address is the 2nd field, the state the 4th.
             let mut f = line.split_whitespace();
             let local = f.nth(1)?;
             if f.nth(1)? != LISTEN {
                 return None;
             }
+            // `local_address` is `ADDR:PORT` in hex; the port reads as a plain number.
             let (ip, port) = local.split_once(':')?;
             let port = u16::from_str_radix(port, 16).ok()?;
             // The kernel prints the address as 32-bit words in host order.
@@ -61,12 +65,15 @@ pub fn listening(table: &str, v6: bool) -> Vec<SocketAddr> {
 pub fn forwards(listening: &[SocketAddr], exclude: &[u16]) -> Vec<SocketAddr> {
     let v4 = |p| SocketAddr::new(Ipv4Addr::LOCALHOST.into(), p);
     let v6 = |p| SocketAddr::new(Ipv6Addr::LOCALHOST.into(), p);
+    // A set: one forward per address however many listeners map to it (127.0.0.1:P and
+    // 0.0.0.0:P), in a stable order.
     let mut out = BTreeSet::new();
     for a in listening {
         let p = a.port();
         if p == 53 || exclude.contains(&p) {
             continue;
         }
+        // An IPv4-mapped IPv6 address (::ffff:127.0.0.1) is the IPv4 address it carries.
         let ip = match a.ip() {
             IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
             ip => ip,
@@ -81,6 +88,7 @@ pub fn forwards(listening: &[SocketAddr], exclude: &[u16]) -> Vec<SocketAddr> {
             IpAddr::V6(ip) if ip.is_loopback() => {
                 out.insert(v6(p));
             }
+            // Taken as dual-stack (the usual default): `[::]` takes IPv4 connections too.
             IpAddr::V6(ip) if ip.is_unspecified() => {
                 out.insert(v4(p));
                 out.insert(v6(p));
@@ -94,6 +102,7 @@ pub fn forwards(listening: &[SocketAddr], exclude: &[u16]) -> Vec<SocketAddr> {
 /// Read the host's listeners now and work out the forwards, at most
 /// `MAX_FORWARDS` (the rest are named in a warning).
 pub fn scan(exclude: &[u16]) -> Vec<SocketAddr> {
+    // A table that cannot be read (no tcp6 on a kernel without IPv6) counts as no listeners.
     let read = |p| std::fs::read_to_string(p).unwrap_or_default();
     let mut found = listening(&read("/proc/net/tcp"), false);
     found.extend(listening(&read("/proc/net/tcp6"), true));
@@ -119,6 +128,8 @@ pub async fn serve(listener: TcpListener, addr: SocketAddr, sh: Arc<Shared>) {
         let sh = sh.clone();
         tokio::spawn(
             async move {
+                // Held until the task ends. No table entry to close: these connections never
+                // pass the TUN device.
                 let _slot = slot;
                 let _relaying = Relaying::new(&sh, None);
                 tracing::info!("routing to the host's own port");

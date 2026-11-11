@@ -15,7 +15,10 @@ fn http_connect_request(t: &Target, user: Option<&str>, pass: Option<&str>) -> S
         Target::Domain(d, p) => format!("{d}:{p}"),
         Target::V4(ip, p) => format!("{ip}:{p}"),
     };
+    // CONNECT takes host:port (the authority form) as its target; Host repeats it, as
+    // HTTP/1.1 requires a Host header in every request.
     let mut req = format!("CONNECT {hostport} HTTP/1.1\r\nHost: {hostport}\r\n");
+    // Basic auth: base64 of "user:password".
     if let Some(u) = user {
         let token = base64_encode(format!("{u}:{}", pass.unwrap_or("")).as_bytes());
         req.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
@@ -34,6 +37,8 @@ where
     let mut buf = Vec::with_capacity(256);
     let mut b = [0u8; 1];
     loop {
+        // A hang-up before the header is complete counts against the proxy, unlike a
+        // SOCKS5 proxy hanging up on the connect request (see `socks5_request`).
         if s.read(&mut b).await? == 0 {
             bail!("http connect: eof before end of headers");
         }
@@ -45,6 +50,8 @@ where
             bail!("http connect: response header too large");
         }
     }
+    // Only the status line counts ("HTTP/1.1 <code> <reason>"): its second word is the
+    // status code. The header fields after it are ignored.
     let head = String::from_utf8_lossy(&buf);
     let status_line = head.lines().next().unwrap_or("");
     match status_line
@@ -79,8 +86,11 @@ where
 fn base64_encode(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    // Every 3 input bytes become 4 characters of 6 bits each. A last chunk of 1 or 2 bytes
+    // is zero-filled, and the characters made only of that filler are written as '='.
     for chunk in input.chunks(3) {
         let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        // The chunk as one 24-bit number, cut below into four 6-bit indices into `T`.
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);

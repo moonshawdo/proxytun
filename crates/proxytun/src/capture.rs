@@ -46,12 +46,16 @@ impl Drop for Answering {
 /// happens in our writes, so this is where the CPU goes. `rt` runs the DNS
 /// lookups, which may take seconds.
 pub fn run_tun(tun: Arc<OwnedFd>, sh: Arc<Shared>, rt: Handle) -> Result<()> {
+    // One buffer, reused for every packet: room for the largest IPv4 packet (64 KiB), so for
+    // any packet at tun0's MTU of 65520.
     let mut buf = vec![0u8; 65536];
     loop {
         // SAFETY: read into our own buffer from a blocking fd.
         let n = unsafe { libc::read(tun.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
+            // EINTR: a signal came before any packet; read again. Any other error ends the
+            // loop, and with it the program's network.
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
@@ -71,6 +75,8 @@ fn on_packet(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &mut [u8]) 
     match p.proto {
         PROTO_TCP => on_tcp(tun, sh, pkt, &p),
         PROTO_UDP if p.dst.port() == 53 => on_dns(tun, sh, rt, pkt, &p),
+        // Other UDP is not relayed: refused rather than dropped, so the program fails at once
+        // instead of waiting out a timeout, and QUIC falls back to TCP.
         PROTO_UDP => {
             count(&sh.stats.udp_refused, 1);
             tracing::trace!(src = %p.src, dst = %p.dst, "udp refused");
@@ -95,6 +101,8 @@ fn from_listener(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
     let rst = p.flags & TCP_RST != 0;
     let back = {
         let mut nat = sh.nat();
+        // A SYN-ACK's sequence number: should the sweep later owe the program a reset, that
+        // reset carries this + 1 (see `nat::State::Queued`).
         let syn_ack = (p.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK).then(|| packet::tcp_seq(pkt, p));
         // Only these change an entry's state: no second lookup per data packet.
         if syn_ack.is_some() || rst {
@@ -103,6 +111,7 @@ fn from_listener(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
         nat.inbound(p.dst)
     };
     match back {
+        // `listener -> nat` becomes `the address the program dialed -> the program`.
         Some((src, dst)) => {
             packet::rewrite_tcp(pkt, p, src, dst);
             write_packet(tun, sh, &pkt[..p.len]);
@@ -123,6 +132,8 @@ fn from_listener(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
 /// ECONNRESET rather than retransmitting for a quarter of an hour.
 fn from_program(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
     let syn = p.is_syn().then(|| packet::tcp_seq(pkt, p));
+    // One hold of the table: find the entry (a SYN may make one) and, for a reset, end it if
+    // not yet accepted. The reset itself is still forwarded to the listener below.
     let nat = {
         let mut table = sh.nat();
         let nat = table.outbound(p.src, p.dst, syn, Instant::now());
@@ -132,6 +143,7 @@ fn from_program(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
         nat
     };
     match (nat, syn) {
+        // `program -> dst` becomes `nat -> listener`, where the namespace's kernel terminates it.
         (Some(nat), _) => {
             if syn.is_some() {
                 tracing::trace!(src = %p.src, dst = %p.dst, %nat, "syn");
@@ -140,9 +152,12 @@ fn from_program(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
             write_packet(tun, sh, &pkt[..p.len]);
         }
         (None, syn) => {
+            // Answered as RFC 793 says for a segment of no connection (never a reset for a
+            // reset), from the address the program dialed.
             if let Some(r) = packet::reset_answering(pkt, p) {
                 write_packet(tun, sh, &r);
             }
+            // A SYN finds no entry only when no NAT address and port is free: the table is full.
             if syn.is_some() {
                 // Every retried SYN lands here (`dropped_table_full` counts
                 // them all).
@@ -164,6 +179,8 @@ fn from_program(tun: &OwnedFd, sh: &Shared, pkt: &mut [u8], p: &Packet) {
 }
 
 fn on_dns(tun: &Arc<OwnedFd>, sh: &Arc<Shared>, rt: &Handle, pkt: &[u8], p: &Packet) {
+    // Counted in before the check, with its guard made at once: the early return below
+    // counts it out again too.
     let counted = sh.stats.dns_in_flight.fetch_add(1, Ordering::Relaxed);
     let answering = Answering(sh.clone());
     if counted >= MAX_DNS_IN_FLIGHT {
@@ -221,6 +238,7 @@ const SWEEP_BATCH: usize = 4096;
 /// TUN thread have the table in between.
 async fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
     loop {
+        // Under the lock: one batch, and the resets it leaves owed. Released before writing.
         let (n, done, resets) = {
             let mut nat = sh.nat();
             let (n, done) = nat.sweep_some(now, SWEEP_BATCH);
@@ -229,6 +247,8 @@ async fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
         if n > 0 {
             tracing::debug!(expired = n, reset = resets.len(), "swept address-rewriting entries");
         }
+        // From the address the program dialed, at the sequence number it expects next and
+        // with no ACK: its established side takes it as ECONNRESET.
         for r in resets {
             tracing::debug!(program = %r.to, dst = %r.from, "never accepted: resetting the program's connection");
             write_packet(tun, sh, &packet::build_tcp_reset(r.from, r.to, r.seq, None));
@@ -236,6 +256,7 @@ async fn sweep(tun: &OwnedFd, sh: &Shared, now: Instant) {
         if done {
             return;
         }
+        // More is due: pause so the TUN thread gets the table between batches.
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }

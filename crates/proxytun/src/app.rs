@@ -41,6 +41,8 @@ pub struct Args {
 fn take_env_secret(name: &str) -> Option<String> {
     let value = std::env::var(name).ok().filter(|v| !v.is_empty());
     let c = std::ffi::CString::new(name).ok()?;
+    // getenv points into the environment block itself, not a copy: zero the
+    // value's bytes there (`value` above is our own copy).
     unsafe {
         let p = libc::getenv(c.as_ptr());
         if !p.is_null() {
@@ -57,6 +59,8 @@ fn take_env_secret(name: &str) -> Option<String> {
 /// otherwise read from /proc/<our pid>/environ or /proc/<pid>/mem. Must run
 /// before other threads exist.
 pub fn take_proxy_override(cli: Option<&str>) -> Option<String> {
+    // Non-dumpable: our /proc/<pid> files (environ, mem) become root's, and
+    // processes of the same user can no longer ptrace us.
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
     let env_proxy = take_env_secret("PROXYTUN_PROXY");
     if cli.is_some_and(url_has_credentials) {
@@ -100,6 +104,8 @@ pub fn run(args: Args) -> Result<Exit> {
     let proxy_override = take_proxy_override(args.proxy.as_deref());
     // Before any thread exists (see `signals::exit_signal_fd`).
     let ignored = signals::ignored_signals(&[libc::SIGHUP, libc::SIGUSR1, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]);
+    // The exit signals we take over: those the caller does not ignore (an
+    // ignored one stays ignored, for the program too).
     let exit_sigs: Vec<libc::c_int> = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]
         .into_iter()
         .filter(|s| !ignored.contains(s))
@@ -115,6 +121,8 @@ pub fn run(args: Args) -> Result<Exit> {
             .map(Arc::new),
         None => None,
     };
+    // `witness` goes to the signal task; `wait_tree` lets the witness go once
+    // the program is reaped.
     let tree_witness = witness.clone();
     let cfg = load_config(&args.config, proxy_override.as_deref()).context("load config")?;
     // A load from a missing file only succeeds through the --proxy fallback.
@@ -124,9 +132,13 @@ pub fn run(args: Args) -> Result<Exit> {
         tracing::info!(path = %args.config.display(), "no config file; using the defaults and the proxy from --proxy / $PROXYTUN_PROXY");
     }
 
+    // proxytun's own addresses take the top /24 of fake_ip_range; the fake-ip
+    // pool hands out the rest.
     let fake_net: Ipv4Net = cfg.fake_ip_range.parse().context("parse fake_ip_range")?;
     let addrs = Addrs::new(fake_net);
     let pool = FakePool::with_reserved_tail(fake_net, Addrs::RESERVED);
+    // Non-A queries are forwarded from the host side, so the host's own
+    // resolv.conf (not the namespace's) names the upstream.
     let host_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     let upstream_dns = cfg.upstream_dns_addr(&host_resolv)?;
     let from = if cfg.upstream_dns.is_some() {
@@ -150,6 +162,7 @@ pub fn run(args: Args) -> Result<Exit> {
         },
     };
     let (child, ns) = spawn_program(&setup, args.no_sudo)?;
+    // Only after the fork, so the program keeps the original open-file limit.
     let relays = relay_capacity(raise_fd_limit(), ns.forwards.len());
     // A caller that ignores SIGCHLD (that survives exec) would have the kernel
     // reap our children unasked, the program's exit status with them. The
@@ -169,6 +182,8 @@ pub fn run(args: Args) -> Result<Exit> {
         let list: Vec<String> = forwards.iter().map(|(a, _)| a.to_string()).collect();
         tracing::info!("host ports reachable inside: {}", list.join(", "));
     }
+    // The program's pid, set to 0 by `wait_tree` once it is reaped: from then
+    // on the signal task forwards nothing and exits on the next signal.
     let main_pid = Arc::new(AtomicI32::new(child.pid));
     let SocketAddr::V4(listen) = listener.local_addr()? else {
         anyhow::bail!("the capture listener is not IPv4");
@@ -192,6 +207,8 @@ pub fn run(args: Args) -> Result<Exit> {
         .max_blocking_threads(64)
         .build()
         .context("build tokio runtime")?;
+    // The async side (spawned from inside the runtime, as tokio::spawn needs),
+    // then the TUN thread: both must be serving before the program runs.
     rt.block_on(async {
         let prober = start_services(&sh, &tun, listener, forwards, cfg.health.clone())?;
         spawn_signal_handlers(sh.clone(), args.config.clone(), proxy_override, prober);
@@ -200,6 +217,8 @@ pub fn run(args: Args) -> Result<Exit> {
         }
         Ok::<_, anyhow::Error>(())
     })?;
+    // The packet loop has a thread of its own; `handle` lets it run DNS work
+    // on the runtime.
     let (tun_sh, handle) = (sh.clone(), rt.handle().clone());
     std::thread::Builder::new()
         .name("tun".into())
@@ -210,9 +229,12 @@ pub fn run(args: Args) -> Result<Exit> {
         })
         .context("start the TUN thread")?;
     tracing::info!(tun = %addrs.tun, dns = %addrs.dns, "namespace up");
+    // Everything is serving: let the program exec.
     child.go()?;
 
     let exit = signals::wait_tree(child.pid, &main_pid, tree_witness.as_deref());
+    // Don't wait for blocking tasks still running (a slow host name lookup),
+    // as dropping the runtime would.
     rt.shutdown_background();
     Ok(exit)
 }
@@ -239,6 +261,8 @@ fn spawn_program(setup: &Setup, no_sudo: bool) -> Result<(ctl::Child, ctl::Hando
             }
             Ok((child, ns))
         }
+        // Started, or failed for a reason other than user namespaces: sudo
+        // would not help.
         r => r,
     }
 }
@@ -253,9 +277,12 @@ fn start_services(
     forwards: Vec<(SocketAddr, std::net::TcpListener)>,
     health_cfg: HealthCfg,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    // tokio's from_std leaves non-blocking mode to us: a blocking accept
+    // would stall a runtime worker.
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     tokio::spawn(accept::run_relay(listener, sh.clone()));
+    // One accept loop per host port bound inside the namespace.
     for (addr, l) in forwards {
         l.set_nonblocking(true)?;
         tokio::spawn(hostports::serve(
@@ -277,11 +304,13 @@ fn raise_fd_limit() -> u64 {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    // The kernel's ceiling for any open-file limit.
     let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
         .ok()
         .and_then(|s| s.trim().parse().ok());
     // SAFETY: plain syscalls on a local struct.
     unsafe {
+        // Unreadable: assume the usual soft limit.
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) != 0 {
             return 1024;
         }
@@ -294,6 +323,7 @@ fn raise_fd_limit() -> u64 {
                     std::io::Error::last_os_error()
                 );
             }
+            // Read back what is in effect now (unchanged if setrlimit failed).
             libc::getrlimit(libc::RLIMIT_NOFILE, &mut l);
         }
     }
@@ -358,10 +388,15 @@ fn spawn_signal_handlers(
         loop {
             tokio::select! {
                 _ = hup.recv() => {
+                    // Load the file (the --proxy override still applies) and build the new
+                    // state in full before swapping anything in.
                     match load_config(&cfg_path, proxy_override.as_deref()).and_then(|c| build_live(&c).map(|l| (c, l))) {
                         Ok((c, live)) => {
                             let nodes = live.registry.nodes.clone();
+                            // New connections get the new state; those being relayed
+                            // keep the `Live` they started with.
                             *sh.live.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(live);
+                            // Probe the new proxies: the old prober holds the old nodes.
                             prober.abort();
                             prober = health::spawn(nodes, c.health.clone());
                             tracing::info!("configuration reloaded (rules, localnet, proxies, groups; fake_ip_range and upstream_dns need a restart)");

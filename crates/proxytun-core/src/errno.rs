@@ -16,6 +16,9 @@ pub(crate) fn is_local_shortage(e: &anyhow::Error) -> bool {
         c.downcast_ref::<std::io::Error>()
             .and_then(|io| io.raw_os_error())
             .is_some_and(|n| {
+                // EMFILE / ENFILE: our own or the system's fd table is full; ENOBUFS /
+                // ENOMEM: no kernel buffers or memory; EADDRNOTAVAIL from connect():
+                // no local port left towards that destination.
                 matches!(
                     n,
                     libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EADDRNOTAVAIL

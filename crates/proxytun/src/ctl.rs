@@ -87,9 +87,11 @@ pub fn send_with_fds(ctl: &OwnedFd, msg: &[u8], fds: &[RawFd]) -> Result<()> {
 /// at most `SCM_MAX_FDS`). A message or fd list that did not fit is an error,
 /// not something to act on in part.
 pub fn recv_with_fds(ctl: &OwnedFd, buf: &mut [u8]) -> Result<(usize, Vec<OwnedFd>)> {
+    // Room for as many fds as one message can carry.
     let mut cmsg = nix::cmsg_space!([RawFd; SCM_MAX_FDS]);
     let mut iov = [IoSliceMut::new(buf)];
     let msg = recvmsg::<()>(ctl.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::MSG_CMSG_CLOEXEC)?;
+    // Owned before the truncation check, so that an error closes them too.
     let mut fds = Vec::new();
     for c in msg.cmsgs().context("reading passed fds")? {
         if let ControlMessageOwned::ScmRights(r) = c {
@@ -105,8 +107,9 @@ pub fn recv_with_fds(ctl: &OwnedFd, buf: &mut [u8]) -> Result<(usize, Vec<OwnedF
 }
 
 /// The longest building the namespace may take. sudo's helper gives up on
-/// its own within about 15 s (`HELPER_TIMEOUT` and a little): past this,
-/// whoever builds it is stuck, not slow.
+/// its own within about 25 s (with `use_pty`, `HELPER_TIMEOUT` for the program
+/// side to leave sudo's session, then `HELPER_TIMEOUT` and 5 s for its report):
+/// past this, whoever builds it is stuck, not slow.
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Read the setup's answer on `ctl`, waiting `within` at most.
@@ -118,6 +121,9 @@ pub fn recv_setup(ctl: &OwnedFd, within: Duration) -> Result<Handover> {
     let mut buf = vec![0u8; 16 * 1024];
     let (n, fds) = recv_with_fds(ctl, &mut buf).context("waiting for the namespace setup")?;
     let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+    // `OK fwd=<host ports bound> [report]`, with the TUN device, the capture
+    // listener and one listener per host port attached, in that order (see
+    // `send_ok`): an answer whose fds do not add up is not taken.
     let ok = reply.strip_prefix("OK ").and_then(|rest| {
         let mut forwards = None;
         let mut report = Vec::new();
@@ -154,6 +160,7 @@ pub fn recv_setup(ctl: &OwnedFd, within: Duration) -> Result<Handover> {
             if let Some(why) = reply.strip_prefix("ERR userns ") {
                 return Err(UsernsUnusable(why.to_string()).into());
             }
+            // An empty message is EOF: the other end closed without answering.
             match reply.strip_prefix("ERR ") {
                 Some(why) => bail!("{why}"),
                 None => bail!("namespace setup failed (the setup process exited)"),
@@ -176,6 +183,8 @@ pub fn send_ok(ctl: &OwnedFd, ns: &Namespace, report: &str) -> Result<()> {
         msg.push(' ');
         msg.push_str(report);
     }
+    // In the order `recv_setup` pairs them up: TUN, listener, then the host
+    // ports' listeners in `fwd=` order.
     let mut fds = vec![ns.tun.as_raw_fd(), ns.listener.as_raw_fd()];
     fds.extend(ns.forwards.iter().map(|(_, l)| l.as_raw_fd()));
     send_with_fds(ctl, msg.as_bytes(), &fds).context("handing the namespace over")

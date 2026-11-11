@@ -37,7 +37,10 @@ fn inheritable_fds() -> Result<Vec<RawFd>> {
 pub fn find_sudo(path: &OsStr) -> Result<PathBuf> {
     let mut passed = Vec::new();
     for p in std::env::split_paths(path).map(|d| d.join("sudo")) {
+        // metadata follows symlinks: a link to the real sudo qualifies.
         let Ok(m) = std::fs::metadata(&p) else { continue };
+        // Wrappers (devtoolset's) are not setuid, and only root can make a
+        // root-owned setuid file.
         if m.uid() == 0 && m.mode() & libc::S_ISUID != 0 {
             return Ok(p);
         }
@@ -57,10 +60,13 @@ pub fn find_sudo(path: &OsStr) -> Result<PathBuf> {
 /// process group (not when sudo gave it a terminal session of its own:
 /// `use_pty`).
 pub fn spawn(s: &Setup) -> Result<(Child, Handover, bool)> {
+    // mkdtemp makes the directory 0700: only we, and root, can reach the
+    // socket inside it.
     let dir = TempDir::new()?;
     let ctl = start_helper(&dir.path().join("ctl"))?;
     send_request(&ctl, s)?;
     let handover = recv_setup(&ctl, SETUP_TIMEOUT)?;
+    // The helper's report: `pid=<the program's pid> pgrp=joined|alone`.
     let report = &handover.report;
     let value = |key: &str| report.split(' ').find_map(|t| t.strip_prefix(key));
     let pid = value("pid=")
@@ -84,6 +90,8 @@ fn start_helper(path: &Path) -> Result<OwnedFd> {
     })?;
     bind(l.as_raw_fd(), &addr).context("bind the helper socket")?;
     listen(&l, Backlog::new(1)?).context("listen")?;
+    // Our absolute path (read from /proc/self/exe): what a sudoers rule for
+    // the helper names.
     let exe = std::env::current_exe().context("locate our own executable for sudo")?;
     let sudo = find_sudo(&std::env::var_os("PATH").unwrap_or_default())?;
     tracing::debug!("sudo: {}", sudo.display());
@@ -157,6 +165,8 @@ fn send_request(ctl: &OwnedFd, s: &Setup) -> Result<()> {
             })
             .collect(),
     };
+    // The working directory goes as an fd (O_PATH: no read permission
+    // needed), entered with fchdir by the program side once it is the user.
     // SAFETY: plain syscall; the fd is owned right away.
     let cwd = unsafe { libc::open(c".".as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if cwd < 0 {
@@ -165,6 +175,8 @@ fn send_request(ctl: &OwnedFd, s: &Setup) -> Result<()> {
     // SAFETY: open just returned it (not -1: checked above), and nothing
     // else owns it.
     let cwd = unsafe { OwnedFd::from_raw_fd(cwd) };
+    // The order the program side takes them in: stdin, stdout, stderr, the
+    // working directory, then the inherited fds in `req.inherit` order.
     let fds: Vec<RawFd> = [0, 1, 2, cwd.as_raw_fd()]
         .into_iter()
         .chain(req.inherit.iter().copied())

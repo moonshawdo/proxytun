@@ -46,6 +46,8 @@ pub fn main(path: &Path, proxy: Option<&str>, no_sudo: bool) -> Result<i32> {
         Ok(c) => (c, None),
         // Still check the host, with the default settings and no proxy.
         Err(e) => {
+            // A valid config needs a proxy: parse one with a placeholder, then
+            // drop it so that no proxy is probed.
             let mut c = Config::parse("[proxy]\ntype=\"socks5\"\naddr=\"127.0.0.1:1\"\n")?;
             c.proxies.clear();
             (c, Some(format!("{e:#}")))
@@ -128,6 +130,8 @@ fn userns_knobs() -> String {
             "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
         ),
     ];
+    // Not every kernel has each of these (some are distribution additions):
+    // only those present are shown.
     let found: Vec<String> = knobs
         .iter()
         .filter_map(|(name, path)| Some(format!("{name}={}", std::fs::read_to_string(path).ok()?.trim())))
@@ -155,6 +159,8 @@ fn check_mode(cfg: &Config, no_sudo: bool) -> Vec<Check> {
     // trial passing for a good one. (The trial is `true`: nothing to keep.)
     // SAFETY: plain syscall.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    // The trial: the namespace a run would get, the go-ahead, and `true` must
+    // then exit 0.
     match netns::spawn(&setup).and_then(|(child, _ns)| {
         child.go()?;
         let mut status = 0;
@@ -177,6 +183,7 @@ fn check_mode(cfg: &Config, no_sudo: bool) -> Vec<Check> {
             "rootless: user namespace + network namespace + TUN work",
         )],
         Err(e) => match e.downcast_ref::<UsernsUnusable>() {
+            // No user namespaces: a run would fall back to sudo; can it?
             Some(u) => {
                 let mut out = vec![check("namespace", Status::Warn, format!("{u} ({})", userns_knobs()))];
                 out.push(check_sudo(no_sudo));
@@ -210,6 +217,8 @@ fn check_sudo(no_sudo: bool) -> Check {
 }
 
 fn check_yama() -> Check {
+    // proxytun does not trace the program, so whether a debugger may attach to
+    // it is up to Yama's ptrace_scope alone.
     match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").map(|s| s.trim().to_string()) {
         Ok(v) if v == "0" => check(
             "gdb -p / strace -p",

@@ -56,6 +56,7 @@ impl Addrs {
     const DNS_OFFSET: u32 = 53;
 
     pub fn new(range: Ipv4Net) -> Self {
+        // The range's last /24: its broadcast address with the low 8 bits cleared.
         let block = u32::from(range.broadcast()) & !(Self::RESERVED - 1);
         Addrs {
             tun: Ipv4Addr::from(block + Self::TUN_OFFSET),
@@ -93,6 +94,7 @@ pub fn resolv_conf(host: &str, dns: Ipv4Addr) -> String {
                     out.push_str(&format!("options {}\n", kept.join(" ")));
                 }
             }
+            // Anything else, the host's nameserver lines above all: ours is the only server.
             _ => {}
         }
     }
@@ -110,6 +112,7 @@ impl TempDir {
     pub fn new_in(base: &Path) -> Result<Self> {
         let template = base.join("proxytun-XXXXXX");
         let mut raw = CString::new(template.as_os_str().as_encoded_bytes())?.into_bytes_with_nul();
+        // mkdtemp fills in the XXXXXX and creates the directory, mode 0700.
         // SAFETY: a writable NUL-terminated template, as mkdtemp requires.
         if unsafe { libc::mkdtemp(raw.as_mut_ptr() as *mut libc::c_char) }.is_null() {
             bail!("mkdtemp {}: {}", template.display(), std::io::Error::last_os_error());
@@ -213,6 +216,7 @@ pub fn spawn(s: &Setup) -> Result<(Child, Handover)> {
             libc::_exit(127);
         }
     }
+    // The child's end is the child's alone now: should it die, ours reads EOF.
     drop(theirs);
     match recv_setup(&ours, SETUP_TIMEOUT) {
         Ok(handover) => Ok((Child::new(pid, ours), handover)),
@@ -260,9 +264,13 @@ pub fn setup_main(args: &[OsString]) -> ! {
     if send_ok(&ctl, &ns, "").is_err() {
         std::process::exit(126);
     }
+    // Handed over: our copies go, so only proxytun holds the TUN device and
+    // the listeners.
     drop(ns);
     wait_go(&ctl);
     drop(ctl);
+    // SIGPIPE as proxytun's caller left it: `spawn` set it so before
+    // re-executing us.
     std::process::exit(exec(&s.argv, sigpipe_was_ignored()))
 }
 
@@ -329,6 +337,8 @@ pub fn configure_namespace(
 }
 
 fn enter_user_namespace() -> Result<()> {
+    // Read before the unshare: until uid_map is written, the new namespace
+    // shows every id as the overflow id (65534).
     let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS)
         .map_err(|e| anyhow!("cannot create a user namespace: {e}"))?;
@@ -338,6 +348,8 @@ fn enter_user_namespace() -> Result<()> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e).context("write /proc/self/setgroups"),
         _ => {}
     }
+    // `<id inside> <id outside> <count>`: our one uid and gid, mapped to
+    // themselves.
     std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).context("write /proc/self/uid_map")?;
     std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).context("write /proc/self/gid_map")?;
     Ok(())
@@ -352,6 +364,7 @@ fn configure(range: Ipv4Net) -> Result<(OwnedFd, TcpListener)> {
     netcfg::link_up(TUN_NAME)?;
     netcfg::default_route(TUN_NAME)?;
     raise_somaxconn();
+    // The capture listener: on the TUN address, at a port the kernel picks.
     let listener = netcfg::listen(SocketAddrV4::new(addrs.tun, 0).into())?;
     Ok((tun, listener))
 }
@@ -376,6 +389,7 @@ fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
     use nix::mount::{mount, MsFlags};
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // The host's, read before ours covers it.
     let host = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     // As root, never under $TMPDIR: a directory the user controls would let
     // them swap ours for a link to /etc between our creating and writing it.
@@ -398,6 +412,9 @@ fn private_resolv_conf(dns: Ipv4Addr) -> Result<()> {
         .context("write resolv.conf")?;
     // Through the fd, whatever the umask: readable by the program.
     f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    // Without a user namespace of its own (root, sudo), a new mount namespace's
+    // copies of the host's shared mounts stay their peers (systemd makes /
+    // shared): the bind mount below would then show up on the host too.
     mount(
         None::<&str>,
         "/",
@@ -433,6 +450,8 @@ extern "C" fn note_sigpipe() {
     }
 }
 
+/// Makes `note_sigpipe` an ELF constructor: the C runtime calls what
+/// `.init_array` lists before `main`, so before Rust's runtime touches SIGPIPE.
 #[used]
 #[link_section = ".init_array"]
 static NOTE_SIGPIPE: extern "C" fn() = note_sigpipe;

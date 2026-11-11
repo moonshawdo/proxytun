@@ -2,7 +2,7 @@
 //!
 //! Selection is lock-free and O(members): it only reads atomics. A `Node`
 //! tracks its own health (passive: dial results; active: the health prober),
-//! live connection count and an EWMA of handshake latency.
+//! live connection count and an EWMA of the health probe's round trip.
 
 use crate::config::{Config, ProxyCfg, Strategy};
 use anyhow::{anyhow, Context, Result};
@@ -18,9 +18,12 @@ pub struct Node {
     pub cfg: ProxyCfg,
     pub addr: SocketAddr,
     pub weight: u32,
+    /// Connections relayed through this node right now (see `ConnGuard`).
     active: AtomicUsize,
-    /// EWMA of connect+handshake latency in microseconds; 0 = never measured.
+    /// EWMA of the health probe round trip (connect, plus the SOCKS5 greeting and
+    /// authentication) in microseconds; 0 = never measured.
     latency_us: AtomicU64,
+    /// Failures in a row; any success resets it.
     fails: AtomicU32,
     healthy: AtomicBool,
     ok_total: AtomicU64,
@@ -49,6 +52,7 @@ pub struct NodeStats {
 impl Node {
     pub fn new(cfg: ProxyCfg) -> Result<Arc<Node>> {
         let addr = cfg.socket_addr()?;
+        // A node starts healthy and unmeasured: it can be picked before its first probe reports.
         Ok(Arc::new(Node {
             name: cfg.name.clone(),
             weight: cfg.weight.max(1),
@@ -81,6 +85,7 @@ impl Node {
     /// A health probe succeeded: clear the failure streak, revive, and fold the
     /// round trip to the proxy into the latency EWMA (alpha = 0.3).
     pub fn record_success(&self, rtt: Duration) {
+        // 0 means "never measured", so samples and the average are kept at 1 us or more.
         let sample = (rtt.as_micros() as u64).max(1);
         let old = self.latency_us.load(Ordering::Relaxed);
         let new = if old == 0 { sample } else { (old * 7 + sample * 3) / 10 };
@@ -123,7 +128,10 @@ pub struct Group {
     pub name: String,
     pub strategy: Strategy,
     pub nodes: Vec<Arc<Node>>,
+    /// Turn counter: round-robin, weighted-round-robin, least-conn's tie-break,
+    /// and least-latency until a probe has measured a member.
     rr: AtomicUsize,
+    /// State of the `random` strategy's generator (splitmix64).
     rng: AtomicU64,
     /// Node indices repeated by weight, for weighted-round-robin (empty for
     /// the other strategies).
@@ -198,6 +206,7 @@ impl Group {
                 ties[self.next_rr() % ties.len()]
             }
             Strategy::LeastLatency => {
+                // Lowest probe latency among the members measured so far (0 = not yet).
                 let best = cands
                     .iter()
                     .copied()
@@ -210,6 +219,8 @@ impl Group {
                 }
             }
             Strategy::WeightedRoundRobin => {
+                // Take the schedule's next slot; when its member is down or already tried,
+                // the first slot after it whose member is a candidate.
                 let start = self.next_rr();
                 let n = self.schedule.len();
                 (0..n)
@@ -238,6 +249,8 @@ fn urandom_u64() -> std::io::Result<u64> {
 }
 
 fn fnv1a(key: &str, salt: &str) -> u64 {
+    // 64-bit FNV-1a (offset basis, prime) over key, 0xff, salt. 0xff never occurs in UTF-8,
+    // so the separator keeps ("ab", "c") and ("a", "bc") apart.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in key.bytes().chain(std::iter::once(0xff)).chain(salt.bytes()) {
         h ^= b as u64;
@@ -254,6 +267,8 @@ pub struct Registry {
 
 impl Registry {
     pub fn build(cfg: &Config) -> Result<Registry> {
+        // One `Node` per proxy, shared by every group that lists it: its health and
+        // counters are the same in all of them.
         let mut by_name: HashMap<String, Arc<Node>> = HashMap::new();
         let mut nodes = Vec::new();
         for p in &cfg.proxies {
@@ -261,6 +276,7 @@ impl Registry {
             by_name.insert(n.name.clone(), n.clone());
             nodes.push(n);
         }
+        // Each group names its members by proxy name; resolve them to those nodes.
         let mut groups = HashMap::new();
         for g in &cfg.groups {
             let members = g

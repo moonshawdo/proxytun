@@ -35,6 +35,8 @@ impl Config {
                 renamed.join(", ")
             );
         }
+        // The config was loaded unchecked (it may come from no file, or name no proxy):
+        // the whole of it is checked only now, the URL's address included.
         self.validate()
     }
 }
@@ -53,6 +55,8 @@ fn redact_url(url: &str) -> String {
         Some((s, r)) => (Some(s), r),
         None => (None, url),
     };
+    // Up to the last `@`, as `parse_proxy_url` splits it: whatever it would take
+    // as credentials is hidden, an unescaped `@` in the password included.
     let rest = match rest.rsplit_once('@') {
         Some((_, host)) => format!("***@{host}"),
         None => rest.to_string(),
@@ -66,11 +70,15 @@ fn redact_url(url: &str) -> String {
 /// Decode `%XX` escapes in URL userinfo (RFC 3986), so passwords containing
 /// `@`, `:` or `/` can be written as `%40`, `%3A`, `%2F`.
 fn percent_decode(s: &str) -> Result<String> {
+    // Decode into bytes: one character may be escaped as several `%XX` (its UTF-8
+    // bytes), so the result is checked as UTF-8 only at the end.
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' {
+            // Two hex digits must follow; `get` is None past the end of the string or
+            // when the two bytes cut a multi-byte character.
             let hex = s.get(i + 1..i + 3).filter(|h| h.len() == 2);
             let v = hex.and_then(|h| u8::from_str_radix(h, 16).ok());
             match v {
@@ -94,16 +102,21 @@ fn parse_proxy_url(url: &str) -> Result<ProxyCfg> {
     let (scheme, rest) = url
         .split_once("://")
         .with_context(|| format!("proxy url {:?} needs a scheme (socks5:// or http://)", redact_url(url)))?;
+    // socks5h ("the proxy resolves names") is plain socks5 here: proxytun never
+    // resolves a name for a SOCKS5 proxy, it sends the name itself (ATYP 3).
     let kind = match scheme.to_ascii_lowercase().as_str() {
         "socks5" | "socks5h" => ProxyKind::Socks5,
         "http" => ProxyKind::Http,
         other => bail!("unsupported proxy scheme {other:?}"),
     };
     let rest = rest.trim_end_matches('/');
+    // The credentials end at the last `@`: an unescaped `@` in the password stays in it.
     let (userinfo, hostport) = match rest.rsplit_once('@') {
         Some((u, h)) => (Some(u), h),
         None => (None, rest),
     };
+    // The first `:` ends the username, so a password may hold more (`bob:s3:cret`);
+    // a username alone gets an empty password.
     let (username, password) = match userinfo {
         Some(u) => match u.split_once(':') {
             Some((a, b)) => (Some(percent_decode(a)?), Some(percent_decode(b)?)),
@@ -111,6 +124,8 @@ fn parse_proxy_url(url: &str) -> Result<ProxyCfg> {
         },
         None => (None, None),
     };
+    // Name and address are left to `override_proxy`: it names the proxy `default`,
+    // and its `validate` requires an ip:port.
     Ok(ProxyCfg {
         name: String::new(),
         kind,

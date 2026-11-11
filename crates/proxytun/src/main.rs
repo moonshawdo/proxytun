@@ -106,6 +106,8 @@ impl Cli {
     /// A bare level applies to proxytun only (both of its crates), never to
     /// its libraries.
     fn log_filter(&self, env: Option<String>) -> String {
+        // At most one of -q, -v / -vv and --log-level is set (clap rejects
+        // the combinations); None when none is.
         let level = match (self.quiet, self.verbose, self.log_level) {
             (true, ..) => Some(LogLevel::Error),
             (_, 0, l) => l,
@@ -129,6 +131,8 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
+    // argv[1] may name an internal role, each a fresh run of this binary:
+    // the sudo root helper, or the namespace setup process. Neither returns.
     let mode = std::env::args_os().nth(1);
     if mode.as_deref() == Some(std::ffi::OsStr::new(sudo::HELPER_ARG)) {
         // The root helper, run through sudo (it checks that itself).
@@ -177,6 +181,8 @@ fn main() -> Result<()> {
             tracing::error!("{e:#}");
         }
     })?;
+    // Never returns: exit with the program's code, or by the signal that
+    // killed it.
     signals::finish(exit);
 }
 
