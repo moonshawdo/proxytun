@@ -81,7 +81,7 @@ pub fn load_config(path: &Path, proxy_override: Option<&str>) -> Result<Config> 
         tracing::warn!("{w}");
     }
     for key in &cfg.ignored_keys {
-        tracing::warn!(%key, "config key has no effect in proxytun (a typo, or a proxyhook-only setting); ignored");
+        tracing::warn!(%key, "config key has no effect in proxytun (a typo, or an unknown setting); ignored");
     }
     if let Some(url) = proxy_override {
         cfg.override_proxy(url)?;

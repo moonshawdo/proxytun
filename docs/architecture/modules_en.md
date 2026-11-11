@@ -10,7 +10,7 @@
 
 | crate | Responsibility | Relation to how traffic is captured |
 |---|---|---|
-| `crates/proxytun-core` | Proxy side: config, rules, load balancing and health checks, SOCKS5 / HTTP handshakes, fake IP pool, fake DNS answers and forwarding, sniffing, relay | Does not know how traffic is captured; comes from proxyhook, with the ptrace-related parts removed |
+| `crates/proxytun-core` | Proxy side: config, rules, load balancing and health checks, SOCKS5 / HTTP handshakes, fake IP pool, fake DNS answers and forwarding, sniffing, relay | Independent of the capture method: it only takes what the capture side hands over, connections (`relay::route()`: an accepted connection and its original target) and DNS queries (`dns::respond` / `serve_tcp`); capture details such as the TUN and namespaces stay in `crates/proxytun` |
 | `crates/proxytun` | Capture side and the binary: namespaces, TUN, address rewriting, sudo helper, witness process, host port forwarding, self-check, command line | Hands captured connections and DNS queries to core |
 
 ```mermaid

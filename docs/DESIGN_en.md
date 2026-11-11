@@ -11,7 +11,7 @@
 - **No ptrace**, so strace / gdb / ltrace can be used at the same time (including `proxytun -- strace -f prog`, `proxytun -- gdb prog`, and `gdb -p` from outside).
 - **Must support CentOS 7** (kernel 3.10, glibc 2.17).
 
-Why not proxyhook: proxyhook intercepts system calls with ptrace, and a process can have only one tracer at a time, so it cannot coexist with strace/gdb.
+Why not ptrace (graftcp, for one): a ptrace-based tool intercepts system calls, and a process can have only one tracer at a time, so it cannot coexist with strace/gdb.
 Why not tun2proxy: its `--unshare` depends on the `unshare` command of a recent util-linux (CentOS 7's 2.23.2 lacks `--map-current-user`, `--keep-caps`, `--kill-child`)
 and on unprivileged user namespaces (off by default on CentOS 7), and it has no sudo mode that drops privileges; all TCP goes through the proxy, with no direct connections and no handling of local loopback.
 
@@ -119,8 +119,7 @@ The TUN has no persist flag, so the kernel deletes it when the fd is closed; the
 
   On the main path plain copy is about a third faster; host port forwarding is half as fast, but 1.35 GB/s is enough for local services, and keeping splice just for it is not worth it.
   The main path tops out at about 1 GB/s (a single TUN read/write loop), far above the throughput of a real proxy, so there are no optimizations such as multi-queue TUN or checksum offload.
-  The extra cost per connection is about 0.5 ms (compared with the client doing the SOCKS5 handshake itself; see [PERFORMANCE.md](PERFORMANCE_en.md)). When proxyhook later switches to depending on core, splice can be copied back from the proxyhook repository as `net/splice.rs`,
-  and `pump` in `net::pump` given a parameter to choose it.
+  The extra cost per connection is about 0.5 ms (compared with the client doing the SOCKS5 handshake itself; see [PERFORMANCE.md](PERFORMANCE_en.md)).
 - Relay buffers are 64 KiB per direction (each connection takes 128 KiB as soon as it is established). Measured with a 3 GB download through the TUN: 64 KiB about 990 MB/s, 32 KiB about 915 (−8%),
   16 KiB about 750 (−24%), 8 KiB about 545 (−45%); by the criterion "throughput drops by no more than 5%" they are not reduced.
 - When a relay ends with an error (dial failure, an RST from one end, a read/write error), both ends are closed with RST (host port forwarding likewise): with a FIN, a program whose download was cut short would read a clean EOF,
@@ -210,13 +209,13 @@ The TUN has no persist flag, so the kernel deletes it when the fd is closed; the
 
 - **Non-DNS UDP (including QUIC)**: answered with ICMP port unreachable, so it fails fast and browsers fall back to TCP. UDP is not proxied.
 - **ICMP**: dropped (ping does not work).
-- **IPv6**: not supported. No IPv6 route is configured in the namespace (only `::1`), so connections to literal IPv6 addresses get "network unreachable" immediately; AAAA returns empty (as in proxyhook).
+- **IPv6**: not supported. No IPv6 route is configured in the namespace (only `::1`), so connections to literal IPv6 addresses get "network unreachable" immediately; AAAA returns empty.
   HTTPS (65) and SVCB (64) also return empty: their answers carry real IP hints and ECH keys, which would let browsers bypass the fake IPs, and forwarding them upstream would leak the queries outside the proxy.
 - **Address plan**: the last /24 of `fake_ip_range` is kept for the namespace's internal use (default `198.19.255.0/24`: `.1` the TUN itself, `.53` the fake DNS, `.2`–`.17` source addresses for rewriting),
   the rest serves as fake IPs, hence `fake_ip_range` must be at least /22. 198.18.0.0/15 is the range RFC 2544 reserves for testing and does not collide with real destinations.
 - **MTU**: 65520. Packets only travel between the local kernel and proxytun; the larger the packets, the fewer packets user space has to handle.
-- **localnet / the program's own proxy**: proxyhook's `Policy::is_passthrough` is kept; matching targets are connected to directly by proxytun, bypassing rules and proxies (avoiding a proxy behind a proxy).
-  `localnet` is empty by default (proxyhook defaults to `127.0.0.0/8`, which does nothing in proxytun: the namespace's loopback cannot reach proxytun).
+- **localnet / the program's own proxy**: `Policy::is_passthrough` decides; matching targets are connected to directly by proxytun, bypassing rules and proxies (avoiding a proxy behind a proxy).
+  `localnet` is empty by default: `127.0.0.0/8` in the namespace is the namespace's own loopback, which never reaches proxytun, so listing it does nothing.
   Proxies in the program's environment variables (`http_proxy`, `https_proxy`, `all_proxy`) are passed through as well; without a port, `http://` and scheme-less ones register both 80 and 1080
   (curl and git connect to 1080; pip, Go, wget, npm and apt connect to 80), socks registers 1080, `https://` registers 443.
   `direct_to_proxies` (on by default): the IP+port of each `[[proxies]]` entry is added to the same passthrough table, so when the program itself connects to these proxies (its own proxy settings, `curl -x`)
@@ -246,7 +245,7 @@ The namespace's `127.0.0.1` is isolated from the host's. At startup the host's T
   (as `timeout`, sudo and strace do): bash's "wait and cooperative exit" only stops a loop when the child is WIFSIGNALED, and when systemd stops a service, `128+15` would be recorded as a failure.
   When proxytun itself exits because of a signal (Ctrl+C after the program has exited, a second SIGTERM, however long after the first), it likewise ends with that signal.
 - Ctrl+C goes to the program; TERM/INT/QUIT sent only to proxytun are forwarded to the program, while those sent to the whole process group are not duplicated; SIGHUP hot-reloads; SIGUSR1 prints stats.
-- **How "those sent to the whole process group are not duplicated" works**: proxyhook sees through ptrace that the program received a signal; proxytun has no ptrace, and `kill <pid>` and
+- **How "those sent to the whole process group are not duplicated" works**: proxytun does not use ptrace, so it cannot see which signals the program received, and `kill <pid>` and
   `kill -- -<pgid>`/`kill %1`/systemd's per-process sending all look like `SI_USER` to proxytun. For this, a **witness process** is started:
   - It is in the same process group as proxytun and blocks INT/QUIT/TERM (all other signals are ignored, so a terminal hangup or Ctrl+Z will not kill/stop it).
   - After receiving an `SI_USER` signal, proxytun waits 50 ms and asks the witness over a pipe which signals it has pending (`q` → 8-byte mask): if the witness got it too and the program is still in this process group
@@ -256,7 +255,7 @@ The namespace's `127.0.0.1` is isolated from the host's. At startup the host's T
     which would look like a group-wide signal and not be forwarded.
   - The witness double-forks (it is not a child of proxytun, so it does not affect "wait for the whole tree to exit") and exits as soon as the pipe breaks. When proxytun is process 1 of its pid namespace
     (a container without `--init`) or was made a subreaper beforehand, the orphaned witness is re-parented back to it, so once the program has been reaped the witness's pipe is closed, letting it exit and be reaped.
-  - It covers one case more than proxyhook: a program that receives signals with `sigwait`/`signalfd` does not get them twice either when its whole group is killed.
+  - A program that receives signals with `sigwait`/`signalfd` does not get them twice either when its whole group is killed.
 - When the program has left proxytun's process group itself (`setsid`, shell job control, or sudo mode under sudo `use_pty`), group-wide signals do not reach it, and they are forwarded as usual.
   `SI_KERNEL` signals from the terminal work the same way: not forwarded while the program is still in this process group, forwarded when it is not; when the program is in a group of its own (it is the group leader), they are forwarded to its whole process group,
   so the processes in its pipeline receive them too, the same as the terminal would have done. Group-wide signals sent by a process are forwarded to the program itself only: when systemd stops a service, it sends to each process in the cgroup one by one,
@@ -269,15 +268,15 @@ The namespace's `127.0.0.1` is isolated from the host's. At startup the host's T
   SIGPIPE is the exception: the Rust runtime sets it to ignored before `main`, so an ELF constructor (`.init_array`, which runs before the runtime) records the disposition at the start of the process image;
   in userns mode the setup process sets the caller's disposition back before the re-exec, so its own constructor can read it; in sudo mode it is passed to the helper with the request.
 - If proxytun exits abnormally (`kill -9`, a crash): **the program is not killed**. The TUN disappears when its fd is closed, leaving the program with only loopback, i.e. cut off from the network; it does not bypass the proxy and connect directly. The logs and docs say so.
-- Hot reload covers the same scope as in proxyhook; host port forwarding, the address plan, `fake_ip_range` and `upstream_dns` need a restart.
-- Credential protection as in proxyhook: `PROXYTUN_PROXY` is removed from the program's environment (the original value zeroed in place), and proxytun is made non-dumpable; `--proxy` carrying a password triggers a warn.
+- What hot reload covers is in the "Takes effect after" column of the [CONFIG.md quick reference](CONFIG_en.md#1-quick-reference); host port forwarding, the address plan, `fake_ip_range` and `upstream_dns` need a restart.
+- Credential protection: `PROXYTUN_PROXY` is removed from the program's environment (the original value zeroed in place), and proxytun is made non-dumpable; `--proxy` carrying a password triggers a warn.
   `--doctor` does the same.
 - `--proxy` / `PROXYTUN_PROXY`: with an override, the config file is first parsed without validation and validated after the override is applied, so the config file may be missing, or may contain only rules and no proxies
   (credentials kept in the environment variable); the override replaces all proxies, rules that name other groups also use the override proxy, and a warn is logged once at startup. A SIGHUP reload is handled the same way.
 
 ## 6. Logging and monitoring
 
-- As in proxyhook: levels off/error/warn/info/debug/trace, `-q`, `-v`/`-vv`, `--log-level`, `--log-file` (append, 600, no color; `O_NOFOLLOW`,
+- Levels off/error/warn/info/debug/trace, `-q`, `-v`/`-vv`, `--log-level`, `--log-file` (append, 600, no color; `O_NOFOLLOW`,
   an existing file must be owned by the user, so that nobody else can pre-create a readable file in `/tmp`; opened non-blocking, so a FIFO pre-created by someone else cannot make it hang),
   environment variable `PROXYTUN_LOG`. A panic is additionally written to the log only when `--log-file` is used (otherwise it would appear twice on stderr).
 - Logging to stderr never blocks and never fails: when the reader stalls (Ctrl+S, a pipe nobody reads), the threads that log (relay, DNS, signal handling) must not stall with it;
@@ -290,7 +289,7 @@ The namespace's `127.0.0.1` is isolated from the host's. At startup the host's T
   Byte counts are accumulated during forwarding by counters wrapped around the two sockets, so they are there even when an error occurs midway; they are also added to the global `relayed_up/down`, so a long-lived connection shows up in the stats before it ends.
 - **DNS**: `-v` logs one line per query (fake IP / local empty answer / forwarded, with the upstream's latency); counters `dns_queries`, `dns_forwarded`, `dns_forward_failed`;
   the first time the upstream does not answer, a warn is logged once, after that at debug.
-- **Proxy health**: health checks and failover as in proxyhook; only the proxy's own problems count against its health: cannot connect to the proxy, SOCKS5 greeting/authentication failure or timeout, protocol errors.
+- **Proxy health**: only the proxy's own problems count against its health: cannot connect to the proxy, SOCKS5 greeting/authentication failure or timeout, protocol errors.
   - A proxy answers the connect request only once it has a result for the target (squid, ssh -D, dante), so a timeout after the request has been sent is the target's problem: not counted, and no retry with another proxy;
     otherwise connecting to a single black-hole address could mark a whole group of proxies DOWN, and the program would also wait for every member to time out once. The cost: an HTTP proxy that "accepts the TCP connection but never answers CONNECT"
     is not marked DOWN through connection failures (health probes of HTTP proxies only make a TCP connection).
@@ -312,11 +311,11 @@ The namespace's `127.0.0.1` is isolated from the host's. At startup the host's T
 
 ## 7. Command line and configuration
 
-- The command line matches proxyhook: `proxytun [options] program args...` (`--` optional), `-c` (default `proxytun.toml`), `--proxy`, `-q`, `-v`/`-vv`,
+- Command line: `proxytun [options] program args...` (`--` optional), `-c` (default `proxytun.toml`), `--proxy`, `-q`, `-v`/`-vv`,
   `--log-level`, `--log-file`, `--doctor`; in addition `--no-sudo`, `--no-host-ports`. Environment variables `PROXYTUN_PROXY`, `PROXYTUN_LOG`.
   Arguments after the program name are passed to the program unchanged; arguments and environment variables are passed as bytes (UTF-8 not required).
-- The config file format is the same as `proxyhook.toml`, which can be used as is; keys proxytun has no use for (`verify_peer_uid`, `block_quic`, `dns_udp_unconnected`, `splice`)
-  and misspelled keys get a warn at startup and are ignored. The only incompatibility is `fake_ip_range`: the last /24 is kept for the namespace's own addresses, and the prefix is limited to /8–/22 (proxyhook allows up to /30);
+- Config keys proxytun does not know (usually typos) get a warn at startup and are ignored rather than refused. The last /24 of `fake_ip_range`
+  is kept for the namespace's own addresses, so the prefix is limited to /8–/22;
   the error says why. The example `proxytun.toml` contains only the required `[[proxies]]`; everything else is given in comments with its default value.
 - `--doctor`: reports which mode will be used (userns / sudo / root). Rather than guessing from sysctls, it creates the namespaces once along the real run path and runs `true` as the program to completion;
   when userns is unavailable it gives the reason and lists the relevant sysctls (`max_user_namespaces`, `unprivileged_userns_clone`, AppArmor restrictions),
@@ -326,12 +325,12 @@ The namespace's `127.0.0.1` is isolated from the host's. At startup the host's T
 ## 8. Code organization
 
 - workspace: `crates/proxytun-core` (shared library) + `crates/proxytun` (the binary).
-- core comes from proxyhook: `config`, `types`, `policy`, `balancer`, `health`, `proxy`, `sniff`, `net::{fakeip, dns, relay}`;
-  with ptrace, ticket, uid verification (`peer`), `doctor` and `app` removed. DNS keeps only the answer/forward logic and `serve_tcp` (no listening server),
-  and the relay keeps only the parts decoupled from tickets. It was modified for proxytun's needs and split into small modules with narrow interfaces: `proxy::{socks5, http}` are the two handshakes,
-  and `proxy` itself only handles dialing, switching members and attributing failures; `live` (`Live`, `build_live`) and `net::pump` (bidirectional copy and teardown, also used by host port forwarding) were split out of the relay,
+- core (`config`, `types`, `policy`, `balancer`, `health`, `proxy`, `sniff`, `net::{fakeip, dns, relay}`) only deals with a connection once it has been captured, whatever the capture method:
+  the relay's entry point `relay::route()` gets just an accepted connection and its original target; DNS has only the answer/forward logic (`respond`) and `serve_tcp`, no listening server,
+  and is handed the queries the capture side receives. core is split into small modules with narrow interfaces: `proxy::{socks5, http}` are the two handshakes,
+  and `proxy` itself only handles dialing, switching members and attributing failures; `live` (`Live`, `build_live`) and `net::pump` (bidirectional copy and teardown, also used by host port forwarding) are separate from the relay,
   leaving the relay with only `route()`; `config::proxy_url` parses the `--proxy` URL. For how the modules on the binary side (`crates/proxytun`) divide the work, see
   [architecture/modules.md](architecture/modules_en.md).
 - Proxy protocols and load balancing strategies are closed sets, so they use enums with exhaustive `match`, not traits: adding a protocol is one new file and one enum variant, plus the `match` arms the compiler points out.
-- License GPL-2.0 (the code comes from proxyhook). Docs default to Chinese; the English versions are the `*_en.md` files alongside, kept in sync. Code comments in English. x86-64 only (gnu + musl static), no architecture-specific code.
+- License GPL-2.0. Docs default to Chinese; the English versions are the `*_en.md` files alongside, kept in sync. Code comments in English. x86-64 only (gnu + musl static), no architecture-specific code.
 - No heavy new dependencies: the TUN and address configuration use ioctl; the NAT table's capacity and timeouts take reasonable defaults, which are documented.

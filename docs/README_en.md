@@ -17,7 +17,7 @@ proxytun --proxy socks5://172.25.32.1:7897 gdb --args ./my-program
 | Existing approach | Problem |
 |---|---|
 | proxychains-ng (LD_PRELOAD) | No effect on statically linked programs; a program that clears `LD_PRELOAD` when it starts a child process escapes |
-| proxyhook / graftcp (ptrace) | A process can have only one tracer at a time, so it cannot be used together with strace / gdb / ltrace |
+| graftcp (ptrace) | A process can have only one tracer at a time, so it cannot be used together with strace / gdb / ltrace |
 | tun2proxy `--unshare` | Depends on the `unshare` command from a recent util-linux and on unprivileged user namespaces; CentOS 7 has neither. All TCP goes through the proxy; loopback services on the local machine are not handled |
 | Global TUN / transparent proxy | Needs root, and takes over the whole machine's traffic |
 
@@ -44,12 +44,12 @@ How it works (with a primer, flow diagrams and a description of each module): [d
 - **Debugging tools work**: `proxytun -- strace -f ...`, `proxytun -- gdb ...`, `proxytun -- ltrace ...`; also `strace -f proxytun -- ...`, or `gdb -p` from outside.
 - **No root needed**: unprivileged user namespaces are used directly when available; when not (CentOS 7), a short-lived privileged helper is started through `sudo` automatically. The program still runs as you (uid, gid, supplementary groups), and no root process remains afterwards.
 - **All DNS taken over**: UDP and TCP, `/etc/resolv.conf` and a hard-coded `8.8.8.8` are all answered by the fake DNS; AAAA, HTTPS and SVCB get an empty local answer so they cannot bypass the fake IP; MX/TXT and the like are forwarded from the host to the upstream.
-- **Rules and load balancing** (from proxyhook): `domain-suffix` / `domain-keyword` / `domain` / `ip-cidr` / `final`, actions `proxy` / `direct` / `block`;
+- **Rules and load balancing**: `domain-suffix` / `domain-keyword` / `domain` / `ip-cidr` / `final`, actions `proxy` / `direct` / `block`;
   6 balancing strategies, active health checks, failover, disconnect when none is available (**never a silent direct connection**). A target refused by the proxy does not count as a proxy failure.
 - **Local services reachable**: at startup, TCP ports listening on the host's loopback addresses are forwarded into the namespace, and the program connects to `127.0.0.1:5432` as usual.
 - **Behaves as if run directly**: exit status (including death by signal), Ctrl+C, `kill` and ignored signals all behave the program's own way; a proxy the program configures itself is not proxied a second time.
 - **Leaves no trace**: the TUN is not persistent and the namespaces are anonymous; the kernel reclaims them on exit (including a crash or `kill -9`). The host's interfaces, routes and `resolv.conf` are untouched. If proxytun exits unexpectedly, the program loses the network; it does not bypass the proxy and connect directly.
-- **Operations**: `--doctor` self-check; `SIGHUP` hot reload; `SIGUSR1` prints stats; log levels and a log file (as in proxyhook); `--proxy` / `PROXYTUN_PROXY` override the proxy address.
+- **Operations**: `--doctor` self-check; `SIGHUP` hot reload; `SIGUSR1` prints stats; log levels and a log file; `--proxy` / `PROXYTUN_PROXY` override the proxy address.
 
 ## Tech stack
 
@@ -129,7 +129,7 @@ and systemd does not count stopping the service as a failure), without leaving a
 ### Config file
 
 An annotated example: [proxytun.toml](../proxytun.toml) (only the required `[[proxies]]`; most other keys are given as comments with their defaults). **Every key (default, allowed values, hot-reloadable or not, common errors)
-is described in [docs/CONFIG.md](CONFIG_en.md)**. The format is the same as proxyhook's, and a `proxyhook.toml` works as is (widen `fake_ip_range` if it is narrower than /22). Highlights:
+is described in [docs/CONFIG.md](CONFIG_en.md)**. Highlights:
 
 ```toml
 # Top-level keys must come before any [table] (TOML rule)
@@ -435,4 +435,4 @@ proxytun.toml          annotated example config
 
 ## License
 
-GPL-2.0 (the code comes from proxyhook).
+GPL-2.0.

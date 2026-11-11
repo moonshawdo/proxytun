@@ -87,7 +87,7 @@ through proxytun about 1.2 GB/s, which is enough for local services (databases, 
 
 ### 4.3 Why not zero-copy (splice)
 
-In proxyhook both ends of the relay are ordinary sockets, and `splice(2)` gives a clear gain; when proxytun was implemented the two were compared (same machine, 2 GiB download):
+`splice(2)` moves the data inside the kernel and saves the user-space copy; when proxytun was implemented it was compared with a plain copy (same machine, 2 GiB download):
 
 | Path | splice | Plain copy (64 KiB buffer) | Without proxytun |
 |---|---|---|---|

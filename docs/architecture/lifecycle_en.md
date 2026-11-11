@@ -7,7 +7,7 @@
 ## 6. Processes, signals and lifecycle
 
 proxytun aims to "behave like running the program directly": exit status, Ctrl+C, `kill` and ignored signals all behave the way the program itself does.
-proxyhook relies on ptrace to see what the program receives; proxytun has no ptrace and makes up for it with the pieces below.
+proxytun does not use ptrace, so it cannot see which signals the program receives; it gets there with the pieces below.
 
 ### 6.1 Process tree
 

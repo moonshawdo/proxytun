@@ -10,7 +10,7 @@
 
 | crate | 职责 | 与捕获方式的关系 |
 |---|---|---|
-| `crates/proxytun-core` | 代理侧：配置、规则、负载均衡与健康检查、SOCKS5 / HTTP 握手、假 IP 池、假 DNS 应答与转发、嗅探、中继 | 不知道流量是怎么捕获的;来自 proxyhook,去掉了 ptrace 相关的部分 |
+| `crates/proxytun-core` | 代理侧：配置、规则、负载均衡与健康检查、SOCKS5 / HTTP 握手、假 IP 池、假 DNS 应答与转发、嗅探、中继 | 与捕获方式无关：只接收捕获侧交来的连接(`relay::route()`:一条已 accept 的连接和它的原目标)与 DNS 查询(`dns::respond` / `serve_tcp`);TUN、命名空间等捕获细节都在 `crates/proxytun` |
 | `crates/proxytun` | 捕获侧与程序：命名空间、TUN、地址改写、sudo 助手、见证进程、主机端口转发、自检、命令行 | 把捕获到的连接和 DNS 查询交给 core |
 
 ```mermaid

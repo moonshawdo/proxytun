@@ -12,7 +12,7 @@ while not getting in the way of strace, gdb or ltrace, and working on CentOS 7 (
 | Approach | Why it does not work |
 |---|---|
 | proxychains-ng (LD_PRELOAD) | No effect on statically linked programs; a program that clears `LD_PRELOAD` when starting a child process escapes |
-| proxyhook (ptrace) | A process can have only one tracer at a time, so it cannot coexist with strace / gdb / ltrace |
+| graftcp (ptrace) | A process can have only one tracer at a time, so it cannot coexist with strace / gdb / ltrace |
 | tun2proxy `--unshare` | Needs a recent util-linux and unprivileged user namespaces, neither of which CentOS 7 has; all TCP goes through the proxy, with no handling of local loopback services |
 | Global TUN / transparent proxy | Needs root, and takes over the whole machine's traffic |
 

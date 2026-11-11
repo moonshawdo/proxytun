@@ -11,7 +11,7 @@
 - **不使用 ptrace**,因此 strace / gdb / ltrace 可以同时使用(包括 `proxytun -- strace -f prog`、`proxytun -- gdb prog`、从外部 `gdb -p`)。
 - **必须支持 CentOS 7**(内核 3.10、glibc 2.17)。
 
-为什么不是 proxyhook:proxyhook 用 ptrace 拦截系统调用，一个进程同一时刻只能有一个 tracer,所以不能与 strace/gdb 共存。
+为什么不用 ptrace(如 graftcp):ptrace 方案拦截系统调用，一个进程同一时刻只能有一个 tracer,所以不能与 strace/gdb 共存。
 为什么不是 tun2proxy:`--unshare` 依赖新版 util-linux 的 `unshare` 命令(CentOS 7 的 2.23.2 缺 `--map-current-user`、`--keep-caps`、`--kill-child`),
 且依赖非特权 user namespace(CentOS 7 默认关闭),没有 sudo 降权模式;所有 TCP 都经代理，没有直连与本机回环处理。
 
@@ -119,8 +119,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
 
   主路径普通拷贝快约三分之一;主机端口转发慢一半，但 1.35 GB/s 对本地服务足够，为它单留 splice 不值得。
   主路径的上限约 1 GB/s(单个 TUN 收发循环),远高于真实代理的吞吐，不做多队列 TUN、校验和卸载等优化。
-  每条连接的额外开销约 0.5 ms(与客户端自己做 SOCKS5 握手相比，见 [PERFORMANCE.md](PERFORMANCE.md))。将来 proxyhook 改为依赖 core 时,splice 可以从 proxyhook 仓库拷回 `net/splice.rs`,
-  再给 `net::pump` 里的 `pump` 加一个选择参数。
+  每条连接的额外开销约 0.5 ms(与客户端自己做 SOCKS5 握手相比，见 [PERFORMANCE.md](PERFORMANCE.md))。
 - 中继缓冲每方向 64 KiB(每条连接一建立就占 128 KiB)。经 TUN 下载 3 GB 实测:64 KiB 约 990 MB/s,32 KiB 约 915(−8%),
   16 KiB 约 750(−24%),8 KiB 约 545(−45%);按"吞吐下降不超过 5%"的标准不缩小。
 - 中继以错误结束(拨号失败、一端 RST、读写出错)时两端都用 RST 关闭(主机端口转发同样):发 FIN 的话，下载被截断的程序读到干净的 EOF,
@@ -210,13 +209,13 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
 
 - **非 DNS 的 UDP(含 QUIC)**:回 ICMP 端口不可达，快速失败，浏览器回落 TCP。不代理 UDP。
 - **ICMP**:丢弃(ping 不通)。
-- **IPv6**:不支持。命名空间内不配 IPv6 路由(只有 `::1`),字面 IPv6 连接立即"网络不可达";AAAA 返回空(同 proxyhook)。
+- **IPv6**:不支持。命名空间内不配 IPv6 路由(只有 `::1`),字面 IPv6 连接立即"网络不可达";AAAA 返回空。
   HTTPS(65)、SVCB(64)也返回空：它们的答案带真实 IP 提示和 ECH 密钥，会让浏览器绕开假 IP,转发上游又会把查询漏到代理之外。
 - **地址规划**:`fake_ip_range` 末尾的 /24 留给命名空间内部(默认 `198.19.255.0/24`:`.1` TUN 自身、`.53` 假 DNS、`.2`–`.17` 改写用源地址),
   其余作 fake IP,因此 `fake_ip_range` 至少 /22。198.18.0.0/15 是 RFC 2544 测试保留段，不会与真实目标冲突。
 - **MTU**:65520。包只在本机内核与 proxytun 之间流转，包越大用户态处理的包数越少。
-- **localnet / 程序自己的代理**:沿用 proxyhook 的 `Policy::is_passthrough`,命中的目标由 proxytun 直连，不走规则与代理(避免代理套代理)。
-  `localnet` 默认为空(proxyhook 默认 `127.0.0.0/8`,在 proxytun 里不起作用：命名空间的回环到不了 proxytun)。
+- **localnet / 程序自己的代理**:由 `Policy::is_passthrough` 判定，命中的目标由 proxytun 直连，不走规则与代理(避免代理套代理)。
+  `localnet` 默认为空：命名空间里的 `127.0.0.0/8` 是它自己的回环，到不了 proxytun,写进去也不起作用。
   程序环境变量里的代理(`http_proxy`、`https_proxy`、`all_proxy`)照样放行;不写端口时 `http://` 与无 scheme 的同时登记 80 和 1080
   (curl、git 连 1080,pip、Go、wget、npm、apt 连 80),socks 为 1080,`https://` 为 443。
   `direct_to_proxies`(默认开):`[[proxies]]` 的 IP+端口并入同一张放行表，程序自己连这些代理(它自己的代理设置、`curl -x`)
@@ -246,7 +245,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
   (`timeout`、sudo、strace 的做法):bash 的"等待并协同退出"只在子进程 WIFSIGNALED 时停下循环,systemd 停止服务时 `128+15` 会被记为失败。
   proxytun 自己因信号退出(程序已退出后的 Ctrl+C、收到第二个 SIGTERM,不论间隔多久)同样以该信号结束。
 - Ctrl+C 交给程序;只发给 proxytun 的 TERM/INT/QUIT 转发给程序，发给整个进程组的不重复;SIGHUP 热加载;SIGUSR1 打印统计。
-- **"发给整个进程组的不重复"怎么做到**:proxyhook 靠 ptrace 看见程序收到信号;proxytun 没有 ptrace,而 `kill <pid>` 与
+- **"发给整个进程组的不重复"怎么做到**:proxytun 不用 ptrace,看不见程序收到了哪些信号，而 `kill <pid>` 与
   `kill -- -<pgid>`/`kill %1`/systemd 逐进程发送，在 proxytun 看来都是 `SI_USER`。为此启动一个**见证进程**:
   - 与 proxytun 同一进程组、屏蔽 INT/QUIT/TERM(其余信号一律忽略，终端挂断或 Ctrl+Z 不会杀死/停住它)。
   - proxytun 收到 `SI_USER` 信号后等 50 ms,经管道问见证有哪些待处理信号(`q` → 8 字节掩码):见证也收到且程序仍在本进程组
@@ -256,7 +255,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
     看起来像整组信号而不转发。
   - 见证 double-fork(不是 proxytun 的子进程，不影响"等整棵树退出"),管道断开即退出。proxytun 是 pid 命名空间的 1 号进程
     (容器没加 `--init`)或预先被设为 subreaper 时，孤儿见证会被过继回来，所以程序被回收后关闭见证的管道，让它退出、被回收。
-  - 比 proxyhook 多覆盖一种情况：用 `sigwait`/`signalfd` 收信号的程序被整组 kill 时也不会收到两次。
+  - 用 `sigwait`/`signalfd` 收信号的程序被整组 kill 时同样不会收到两次。
 - 程序自己离开了 proxytun 的进程组(`setsid`、shell 作业控制，或 sudo `use_pty` 下的 sudo 模式)时，整组信号到不了它，照常转发。
   终端发的 `SI_KERNEL` 信号同理：程序还在本进程组就不转发，不在就转发;程序自成一组(是组长)时转给它的整个进程组，
   管道里的进程也收到，与终端本来的效果一致。进程发的整组信号只转给程序本身:systemd 停服务时逐个给 cgroup 里的每个进程发，
@@ -269,15 +268,15 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
   SIGPIPE 例外:Rust 运行时在 `main` 之前把它设为忽略，所以用 ELF 构造函数(`.init_array`,在运行时之前执行)记下进程映像启动时的处置;
   userns 模式下准备进程 re-exec 前先设回调用方的处置，它自己的构造函数就能读到;sudo 模式下随请求传给助手。
 - proxytun 异常退出(`kill -9`、崩溃):**不杀程序**。TUN 随 fd 关闭消失，程序只剩回环，等于断网，不会绕过代理直连;日志与文档写明。
-- 热加载范围同 proxyhook;主机端口转发、地址规划、`fake_ip_range`、`upstream_dns` 需要重启。
-- 凭据保护同 proxyhook:程序环境里去掉 `PROXYTUN_PROXY`(原值就地清零),proxytun 设为 non-dumpable;`--proxy` 带密码时 warn。
+- 热加载的范围见 [CONFIG.md 速查表](CONFIG.md#1-速查表)的"生效方式"一列;主机端口转发、地址规划、`fake_ip_range`、`upstream_dns` 需要重启。
+- 凭据保护:程序环境里去掉 `PROXYTUN_PROXY`(原值就地清零),proxytun 设为 non-dumpable;`--proxy` 带密码时 warn。
   `--doctor` 同样处理。
 - `--proxy` / `PROXYTUN_PROXY`:有覆盖时配置文件先解析不校验，覆盖之后再校验，所以配置文件可以不存在，也可以只写规则不写代理
   (凭据放在环境变量里);覆盖替换全部代理，指定其他分组的规则也走覆盖的代理，启动时 warn 一次。SIGHUP 重载同样处理。
 
 ## 6. 日志与监控
 
-- 沿用 proxyhook:级别 off/error/warn/info/debug/trace,`-q`、`-v`/`-vv`、`--log-level`、`--log-file`(追加、600、无颜色;`O_NOFOLLOW`,
+- 级别 off/error/warn/info/debug/trace,`-q`、`-v`/`-vv`、`--log-level`、`--log-file`(追加、600、无颜色;`O_NOFOLLOW`,
   已存在的文件必须属于自己，防止别人在 `/tmp` 里预先建好可读的文件;以非阻塞方式打开，别人预先建好的 FIFO 不会让它卡住),
   环境变量 `PROXYTUN_LOG`。panic 只在用了 `--log-file` 时额外写进日志(否则 stderr 上会出现两遍)。
 - 写 stderr 的日志从不阻塞、从不失败：读端停住(Ctrl+S、没人读的管道)时，写日志的线程(中继、DNS、信号处理)不能跟着卡住;
@@ -290,7 +289,7 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
   字节数由包在两个 socket 外的计数器边转发边累加，中途出错也有;同时累加进全局的 `relayed_up/down`,长连接在结束前就能在统计里看到。
 - **DNS**:`-v` 每条查询一行(fake IP / 本地空应答 / 转发及上游耗时);计数 `dns_queries`、`dns_forwarded`、`dns_forward_failed`,
   上游第一次不应答时 warn 一次，之后记 debug。
-- **代理健康**:健康检查、故障转移同 proxyhook,只有代理自己的问题才计入健康：连不上代理、SOCKS5 问候/认证失败或超时、协议错误。
+- **代理健康**:只有代理自己的问题才计入健康：连不上代理、SOCKS5 问候/认证失败或超时、协议错误。
   - 代理只在目标有了结果后才回连接请求(squid、ssh -D、dante),所以请求发出后的超时算目标的问题：不计入、不换代理重试，
     否则连一个黑洞地址就能把整组代理标成 DOWN,程序还要等每个成员各超时一次。代价是"连得上 TCP 却永不回应 CONNECT"的
     HTTP 代理不会因连接失败被标成 DOWN(健康探测对 HTTP 代理只做 TCP 连接)。
@@ -312,11 +311,11 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
 
 ## 7. 命令行与配置
 
-- 命令行与 proxyhook 一致:`proxytun [选项] 程序 参数...`(`--` 可选),`-c`(默认 `proxytun.toml`)、`--proxy`、`-q`、`-v`/`-vv`、
+- 命令行:`proxytun [选项] 程序 参数...`(`--` 可选),`-c`(默认 `proxytun.toml`)、`--proxy`、`-q`、`-v`/`-vv`、
   `--log-level`、`--log-file`、`--doctor`;另有 `--no-sudo`、`--no-host-ports`。环境变量 `PROXYTUN_PROXY`、`PROXYTUN_LOG`。
   程序名之后的参数原样交给程序，参数与环境变量按字节传递(不要求 UTF-8)。
-- 配置文件格式与 `proxyhook.toml` 相同，可直接拿来用;proxytun 用不到的键(`verify_peer_uid`、`block_quic`、`dns_udp_unconnected`、`splice`)
-  和拼错的键，启动时 warn 并忽略。不兼容的只有 `fake_ip_range`:最后一个 /24 留给命名空间自己的地址，前缀限 /8–/22(proxyhook 允许到 /30),
+- 配置文件里不认识的键(多半是拼错的)启动时 warn 并忽略，不拒绝运行。`fake_ip_range` 的最后一个 /24
+  留给命名空间自己的地址，所以前缀限 /8–/22,
   报错时说明原因。示例 `proxytun.toml` 只有必填的 `[[proxies]]`,其余以注释给出默认值。
 - `--doctor`:报告将使用哪种模式(userns / sudo / root)。不靠猜 sysctl,而是按真实运行的路径建一次命名空间、以 `true` 为程序跑完;
   userns 不可用时说明原因并列出相关 sysctl(`max_user_namespaces`、`unprivileged_userns_clone`、AppArmor 限制),
@@ -326,12 +325,12 @@ TUN 不设持久标志,fd 关闭即由内核删除;命名空间没有名字，�
 ## 8. 代码组织
 
 - workspace:`crates/proxytun-core`(共享库)+ `crates/proxytun`(程序)。
-- core 来自 proxyhook:`config`、`types`、`policy`、`balancer`、`health`、`proxy`、`sniff`、`net::{fakeip, dns, relay}`;
-  去掉了 ptrace、ticket、uid 校验(`peer`)、`doctor`、`app`。DNS 只保留应答/转发逻辑和 `serve_tcp`(无监听服务器),
-  中继只保留与 ticket 解耦的部分。按 proxytun 的需要修改，并拆成接口窄的小模块：`proxy::{socks5, http}` 是两种握手，
-  `proxy` 本身只管拨号、换成员与失败归属;`live`(`Live`、`build_live`)与 `net::pump`(双向拷贝与收尾，主机端口转发也用)从中继分出，
-  中继只剩 `route()`;`config::proxy_url` 解析 `--proxy` 的 URL。程序一侧(`crates/proxytun`)各模块的分工见
+- core(`config`、`types`、`policy`、`balancer`、`health`、`proxy`、`sniff`、`net::{fakeip, dns, relay}`)只管连接被捕获之后的事，与捕获方式无关：
+  中继的入口 `relay::route()` 拿到的只是一条已 accept 的连接和它的原目标;DNS 只有应答/转发逻辑(`respond`)和 `serve_tcp`,没有监听服务器，
+  查询由捕获侧收下后交给它。core 拆成接口窄的小模块:`proxy::{socks5, http}` 是两种握手，
+  `proxy` 本身只管拨号、换成员与失败归属;`live`(`Live`、`build_live`)与 `net::pump`(双向拷贝与收尾，主机端口转发也用)独立于中继，
+  中继只有 `route()`;`config::proxy_url` 解析 `--proxy` 的 URL。程序一侧(`crates/proxytun`)各模块的分工见
   [architecture/modules.md](architecture/modules.md)。
 - 代理协议、负载均衡策略是封闭的集合，用枚举加穷尽的 `match`,不用 trait:加一种协议是一个新文件、一个枚举成员，再补编译器指出的 `match` 分支。
-- 许可证 GPL-2.0(代码来自 proxyhook)。文档默认中文，英文版是同目录下的 `*_en.md`,两者同步维护;代码注释英文。只做 x86-64(gnu + musl 静态),不写架构相关代码。
+- 许可证 GPL-2.0。文档默认中文，英文版是同目录下的 `*_en.md`,两者同步维护;代码注释英文。只做 x86-64(gnu + musl 静态),不写架构相关代码。
 - 不引入重量级新依赖:TUN 与地址配置用 ioctl;改写表的容量与超时取合理默认值并写入文档。

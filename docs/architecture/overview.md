@@ -12,7 +12,7 @@
 | 方案 | 为什么不行 |
 |---|---|
 | proxychains-ng(LD_PRELOAD) | 静态链接程序无效;程序启动子进程时清空 `LD_PRELOAD` 就逃出去了 |
-| proxyhook(ptrace) | 一个进程同一时刻只能有一个 tracer,不能与 strace / gdb / ltrace 共存 |
+| graftcp(ptrace) | 一个进程同一时刻只能有一个 tracer,不能与 strace / gdb / ltrace 共存 |
 | tun2proxy `--unshare` | 依赖新版 util-linux 和非特权 user namespace,CentOS 7 上都没有;所有 TCP 都经代理，不处理本机回环服务 |
 | 全局 TUN / 透明代理 | 需要 root,并且接管整台机器的流量 |
 

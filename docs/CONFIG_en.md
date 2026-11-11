@@ -58,13 +58,10 @@ for the mechanisms behind each setting see [ARCHITECTURE.md](ARCHITECTURE_en.md)
 **Location.** By default proxytun reads `proxytun.toml` in the current directory; `-c <file>` gives another path. With `--proxy` or `PROXYTUN_PROXY`, the config file may be missing
 (every other setting then takes its default), or may contain only rules and no proxies (see section 8); with no proxy given and no config file found, proxytun exits with an error.
 
-**Compatible with proxyhook.** The format is the same as `proxyhook.toml`, which can be used as is. proxyhook keys that proxytun has no use for (`verify_peer_uid`, `block_quic`,
-`dns_udp_unconnected`, `splice`) get a warn at startup and are ignored. The only incompatibility is the prefix range of `fake_ip_range` (see 3.1).
-
 **TOML order.** Top-level keys (all keys in section 3) must come before the first `[table]` / `[[table]]`. A key written after a table is taken as a field of that table.
 
 **Unknown keys get a warning and are ignored.** A misspelled key (such as `sniff_port`, `proxies.0.usrname`) logs a warn at startup
-(`config key has no effect in proxytun (a typo, or a proxyhook-only setting); ignored`), and the setting keeps its default.
+(`config key has no effect in proxytun (a typo, or an unknown setting); ignored`), and the setting keeps its default.
 
 **Whole-file validation.** At startup and on hot reload the whole file is validated once; any invalid item is an error (see section 10), and the file never takes effect partially.
 An error at startup makes proxytun exit, and the target program never runs; an error on hot reload keeps the old config running, with `reload failed` in the log.
@@ -94,7 +91,7 @@ This is how domain names are kept all the way to the proxy (see [Core flows](arc
 
 - Type: IPv4 CIDR string; default `"198.18.0.0/15"`; prefix length /8–/22; changing it needs a restart.
 - **The last /24 is reserved for the namespace itself**: in the default `198.19.255.0/24`, `.1` is the TUN device, `.53` is the fake DNS, and `.2`–`.17` are the source addresses used for address rewriting.
-  Hence the prefix must be at least /22 (proxyhook allowed up to /30; a range narrower than /22 must be widened, and the error message says so).
+  Hence the prefix must be at least /22; a narrower range is an error, and the message says why.
 - The remaining addresses go to domain names. There are at most 2^20 (about 1.05 million) mappings, however large the range; DNS answers have a TTL of 60 seconds. When addresses run out, the least recently used mapping is reclaimed
   among those that no connection is using and that were last answered or used more than 120 seconds ago; when none can be reclaimed, the new query gets `SERVFAIL`, and a mapping in use is never overwritten. Mappings live only in memory and are lost on restart.
 - **Choosing a range: it must not overlap any address the program really needs to reach.** The default 198.18.0.0/15 is the benchmarking range reserved by RFC 2544 and never appears on the public internet; it usually needs no change.
@@ -518,16 +515,6 @@ addr = "127.0.0.1:7890"
 
 When a service on the host listens on port 8080, that port is forwarded into the namespace by default; exclude it when the program itself needs to listen on 8080.
 
-### 9.6 Migrating from proxyhook
-
-`proxyhook.toml` can usually be used as is. The only things to watch:
-
-- A `fake_ip_range` narrower than /22 must be widened (proxytun takes the last /24).
-- `127.0.0.0/8` in `localnet` has no effect in proxytun (host loopback services are handled by host port forwarding) and can be removed.
-- `verify_peer_uid`, `block_quic`, `dns_udp_unconnected`, `splice` get a warning and are ignored.
-- When `upstream_dns` is not set, the default is the host's nameserver, not `1.1.1.1:53`.
-- When `[health] timeout_ms` is not set, it defaults to 10 seconds (proxyhook: 3 seconds); a value that is set is used as is.
-
 ## 10. Common errors
 
 Config errors at startup or on hot reload, with their messages and causes:
@@ -547,7 +534,7 @@ Config errors at startup or on hot reload, with their messages and causes:
 | `health.interval_secs must be between 1 and 3600` etc. | A `[health]` value is out of range |
 | `sniff_timeout_ms must be between 1 and 10000` | Same as above |
 | `connect_timeout_ms must be between 100 and 60000` / `handshake_timeout_ms must be between 100 and 60000` | Same as above |
-| `bad fake_ip_range …` / `fake_ip_range prefix must be between /8 and /22 …` | Not an IPv4 CIDR, or the prefix length is out of range (a range narrower than /22 in a proxyhook config must be widened) |
+| `bad fake_ip_range …` / `fake_ip_range prefix must be between /8 and /22 …` | Not an IPv4 CIDR, or the prefix length is out of range (a range narrower than /22 must be widened) |
 | `bad upstream_dns …` | Not `IP:port` |
 | `bad localnet entry …` | Not a valid CIDR |
 | `rule #N: bad ip-cidr …` | The `ip-cidr` value is not a CIDR (for example the `/32` is missing) |

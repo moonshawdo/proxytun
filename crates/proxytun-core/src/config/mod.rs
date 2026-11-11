@@ -491,7 +491,7 @@ impl Config {
         if net.prefix_len() < 8 || net.prefix_len() > 22 {
             bail!(
                 "fake_ip_range prefix must be between /8 and /22, got /{} (proxytun keeps the last /24 \
-                 for itself, so a proxyhook range narrower than /22 needs widening)",
+                 for itself, so a range narrower than /22 needs widening)",
                 net.prefix_len()
             );
         }
@@ -729,9 +729,12 @@ mod tests {
         ] {
             assert!(Config::parse(&bad).is_err(), "should reject:\n{bad}");
         }
-        // A proxyhook config's range: say why it no longer fits.
+        // A range narrower than /22: the error says why it does not fit.
         let e = Config::parse(&format!("fake_ip_range = \"198.18.0.0/24\"\n{MINIMAL}")).unwrap_err();
-        assert!(format!("{e:#}").contains("proxyhook range narrower than /22"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("range narrower than /22 needs widening"),
+            "{e:#}"
+        );
     }
 
     #[test]

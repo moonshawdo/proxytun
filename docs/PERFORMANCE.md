@@ -87,7 +87,7 @@ cargo test --release --test bench -- --ignored --nocapture --test-threads=1
 
 ### 4.3 为什么不用零拷贝(splice)
 
-proxyhook 的中继两端都是普通 socket,`splice(2)` 收益明显;proxytun 实现时对比过(同一台机器,2 GiB 下载):
+`splice(2)` 在内核里直接搬运数据，省掉用户态的拷贝;proxytun 实现时把它和普通拷贝对比过(同一台机器,2 GiB 下载):
 
 | 路径 | splice | 普通拷贝(64 KiB 缓冲) | 不经 proxytun |
 |---|---|---|---|

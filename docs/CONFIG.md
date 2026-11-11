@@ -58,13 +58,10 @@
 **位置。** 默认读当前目录下的 `proxytun.toml`,用 `-c <文件>` 指定其他路径。给了 `--proxy` 或 `PROXYTUN_PROXY` 时，配置文件可以不存在
 (其余各项全部取默认值),也可以只写规则、不写代理(见第 8 节);没给代理又找不到配置文件则报错退出。
 
-**与 proxyhook 兼容。** 格式与 `proxyhook.toml` 相同，可以直接拿来用。proxytun 用不到的 proxyhook 键(`verify_peer_uid`、`block_quic`、
-`dns_udp_unconnected`、`splice`)启动时 warn 并忽略。唯一不兼容的是 `fake_ip_range` 的前缀范围(见 3.1)。
-
 **TOML 顺序。** 顶层键(第 3 节的所有键)必须写在第一个 `[表]` / `[[表]]` 之前。写在某个表后面的键会被当成该表的字段。
 
 **未知的键会警告并忽略。** 拼错的键名(如 `sniff_port`、`proxies.0.usrname`)启动时记一条 warn
-(`config key has no effect in proxytun (a typo, or a proxyhook-only setting); ignored`),该项保持默认值。
+(`config key has no effect in proxytun (a typo, or an unknown setting); ignored`),该项保持默认值。
 
 **整体校验。** 启动和热加载时对整个文件做一次校验，任何一项不合法都会报错(见第 10 节),不会只生效一部分。
 启动时报错则 proxytun 退出，目标程序不会运行;热加载时报错则保留旧配置继续运行，日志里有 `reload failed`。
@@ -94,7 +91,7 @@
 
 - 类型:IPv4 CIDR 字符串;默认 `"198.18.0.0/15"`;前缀长度 /8 ~ /22;修改需重启。
 - **最后一个 /24 留给命名空间自己**:默认 `198.19.255.0/24` 里,`.1` 是 TUN 设备,`.53` 是假 DNS,`.2`–`.17` 是地址改写用的源地址。
-  所以前缀至少 /22(proxyhook 允许到 /30,比 /22 更窄的段要放宽，报错里会说明)。
+  所以前缀至少 /22,更窄的段会报错并说明原因。
 - 其余地址分给域名。映射最多 2^20(约 105 万)条，再大的网段也一样;DNS 应答的 TTL 为 60 秒。地址用完后，回收最久未使用、
   且当前没有连接在用、距上次应答或使用超过 120 秒的映射;回收不了时新的查询得到 `SERVFAIL`,不会覆盖正在使用的映射。映射只在内存里，重启后失效。
 - **选段要求：不能与程序真正要访问的地址重叠。** 默认的 198.18.0.0/15 是 RFC 2544 规定的基准测试保留段，公网上不会出现，通常不需要改。
@@ -518,16 +515,6 @@ addr = "127.0.0.1:7890"
 
 主机上 8080 端口有服务在监听时，默认会被转发进命名空间;程序自己要监听 8080 时把它排除。
 
-### 9.6 从 proxyhook 迁移
-
-`proxyhook.toml` 一般可以直接用。需要注意的只有:
-
-- `fake_ip_range` 比 /22 窄时要放宽(proxytun 要占用最后一个 /24)。
-- `localnet` 里的 `127.0.0.0/8` 在 proxytun 里不起作用(主机回环服务由主机端口转发处理),可以删掉。
-- `verify_peer_uid`、`block_quic`、`dns_udp_unconnected`、`splice` 会被警告并忽略。
-- `upstream_dns` 不写时默认用主机的 nameserver,而不是 `1.1.1.1:53`。
-- `[health] timeout_ms` 不写时默认 10 秒(proxyhook 是 3 秒);写了的照用。
-
 ## 10. 常见报错
 
 启动或热加载时的配置错误，报错信息及原因:
@@ -547,7 +534,7 @@ addr = "127.0.0.1:7890"
 | `health.interval_secs must be between 1 and 3600` 等 | `[health]` 的值超出范围 |
 | `sniff_timeout_ms must be between 1 and 10000` | 同上 |
 | `connect_timeout_ms must be between 100 and 60000` / `handshake_timeout_ms must be between 100 and 60000` | 同上 |
-| `bad fake_ip_range …` / `fake_ip_range prefix must be between /8 and /22 …` | 不是 IPv4 CIDR,或前缀长度超出范围(proxyhook 配置里比 /22 更窄的段要放宽) |
+| `bad fake_ip_range …` / `fake_ip_range prefix must be between /8 and /22 …` | 不是 IPv4 CIDR,或前缀长度超出范围(比 /22 更窄的段要放宽) |
 | `bad upstream_dns …` | 不是 `IP:端口` |
 | `bad localnet entry …` | 不是合法的 CIDR |
 | `rule #N: bad ip-cidr …` | `ip-cidr` 的值不是 CIDR(比如漏了 `/32`) |

@@ -17,7 +17,7 @@ proxytun --proxy socks5://172.25.32.1:7897 gdb --args ./my-program
 | 现有方案 | 问题 |
 |---|---|
 | proxychains-ng(LD_PRELOAD) | 静态链接程序无效;程序启动子进程时清空 `LD_PRELOAD` 就逃出去了 |
-| proxyhook / graftcp(ptrace) | 一个进程同一时刻只能有一个 tracer,不能与 strace / gdb / ltrace 同时使用 |
+| graftcp(ptrace) | 一个进程同一时刻只能有一个 tracer,不能与 strace / gdb / ltrace 同时使用 |
 | tun2proxy `--unshare` | 依赖新版 util-linux 的 `unshare` 命令和非特权 user namespace,CentOS 7 上两者都没有;所有 TCP 都经代理，不处理本机回环服务 |
 | 全局 TUN / 透明代理 | 需要 root,并且接管整台机器的流量 |
 
@@ -44,12 +44,12 @@ proxytun(主机网络，普通用户)
 - **调试工具可用**:`proxytun -- strace -f ...`、`proxytun -- gdb ...`、`proxytun -- ltrace ...`,也可以 `strace -f proxytun -- ...`,或从外部 `gdb -p`。
 - **无需 root**:有非特权 user namespace 时直接用;没有时(CentOS 7)自动通过 `sudo` 启动一个短命的特权助手，程序仍以你自己的身份(uid、gid、附加组)运行，之后没有任何 root 进程。
 - **DNS 全接管**:UDP 与 TCP、`/etc/resolv.conf` 与硬编码的 `8.8.8.8` 都由假 DNS 应答;AAAA、HTTPS、SVCB 本地答空，避免绕过假 IP;MX/TXT 等从主机转发给上游。
-- **规则与负载均衡**(来自 proxyhook):`domain-suffix` / `domain-keyword` / `domain` / `ip-cidr` / `final`,动作 `proxy` / `direct` / `block`;
+- **规则与负载均衡**:`domain-suffix` / `domain-keyword` / `domain` / `ip-cidr` / `final`,动作 `proxy` / `direct` / `block`;
   6 种均衡策略，主动健康检查，故障转移，全部不可用时断开(**不会静默直连**)。目标被代理拒绝不算代理故障。
 - **本机服务可达**:启动时把主机上监听回环地址的 TCP 端口转发进命名空间，程序照常连 `127.0.0.1:5432`。
 - **行为与直接运行一致**:退出码(含被信号杀死)、Ctrl+C、`kill`、被忽略的信号都按程序自己的方式表现;程序自己配置的代理不会被二次代理。
 - **不留痕迹**:TUN 不持久、命名空间匿名，退出(包括崩溃、`kill -9`)后内核自动回收;主机的网卡、路由、`resolv.conf` 都不动。proxytun 意外退出时程序断网，不会绕过代理直连。
-- **运维**:`--doctor` 自检;`SIGHUP` 热加载;`SIGUSR1` 打印统计;日志分级与日志文件(同 proxyhook);`--proxy` / `PROXYTUN_PROXY` 覆盖代理地址。
+- **运维**:`--doctor` 自检;`SIGHUP` 热加载;`SIGUSR1` 打印统计;日志分级与日志文件;`--proxy` / `PROXYTUN_PROXY` 覆盖代理地址。
 
 ## 开发栈
 
@@ -129,7 +129,7 @@ systemd 停止服务时不算失败),不留 core。只要程序的进程树里�
 ### 配置文件
 
 带注释的示例见 [proxytun.toml](proxytun.toml)(只有必填的 `[[proxies]]`,其余大多以注释给出默认值);**每一项的说明(默认值、取值范围、能否热加载、常见报错)
-见 [docs/CONFIG.md](docs/CONFIG.md)**。格式与 proxyhook 相同,`proxyhook.toml` 可以直接用(`fake_ip_range` 比 /22 窄时要放宽)。要点:
+见 [docs/CONFIG.md](docs/CONFIG.md)**。要点:
 
 ```toml
 # 顶层键必须写在任何 [表] 之前 (TOML 规则)
@@ -435,4 +435,4 @@ proxytun.toml          带注释的示例配置
 
 ## 许可证
 
-GPL-2.0(代码来自 proxyhook)。
+GPL-2.0。

@@ -7,7 +7,7 @@
 ## 6. 进程、信号与生命周期
 
 proxytun 的目标是"用起来和直接运行程序一样":退出码、Ctrl+C、`kill`、被忽略的信号都按程序自己的方式表现。
-proxyhook 靠 ptrace 看见程序收到了什么;proxytun 没有 ptrace,用下面几样东西补上。
+proxytun 不用 ptrace,看不见程序收到了哪些信号，所以靠下面几样东西做到这一点。
 
 ### 6.1 进程树
 
