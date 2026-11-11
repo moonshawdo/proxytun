@@ -1,5 +1,7 @@
 # proxytun 配置说明
 
+**简体中文** · [English](CONFIG_en.md)
+
 本文逐项说明配置文件里的每个键：作用、类型、默认值、取值范围、能否热加载，以及与其他项的关系。
 带注释的示例见 [proxytun.toml](../proxytun.toml);命令行参数和日志选项见 [README](../README.md#命令行参数);
 各项背后的机制见 [ARCHITECTURE.md](ARCHITECTURE.md)。

@@ -1,5 +1,7 @@
 # 在 CentOS 7 真机上验证 proxytun
 
+**简体中文** · [English](CENTOS7_en.md)
+
 开发机上已经用"外层 user namespace + `max_user_namespaces=0` + setuid 的假 sudo"模拟了 CentOS 7 的 sudo 模式,
 端到端测试全部通过(gnu 与 musl 静态版本都跑过)。模拟覆盖不到、只能在真机上确认的是:
 

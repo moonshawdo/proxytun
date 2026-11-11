@@ -1,5 +1,7 @@
 # proxytun
 
+**简体中文** · [English](docs/README_en.md)
+
 让**指定的程序及其全部子进程**走 SOCKS5 / HTTP 代理，并且**把域名一路带到代理**,Clash、sing-box 等就能按域名分流。
 不使用 ptrace,所以 **strace、gdb、ltrace 照常可用**;普通用户即可运行，也支持 CentOS 7。
 
@@ -393,7 +395,7 @@ cargo test --release --test bench -- --ignored --nocapture --test-threads=1   # 
 **功能**
 - 热加载(`SIGHUP`)不改变 `fake_ip_range`、`upstream_dns` 和主机端口转发。
 - fake-ip 映射不落盘，重启后失效。
-- 地址改写表最多约 103 万条(含关闭后保留 75 秒的),即持续每秒约 1.37 万条新连接;同时中继的连接最多 8192 条(fd 上限低时更少)。
+- 地址改写表最多约 103 万条(含关闭后保留 75 秒的),即持续每秒约 1.38 万条新连接;同时中继的连接最多 8192 条(fd 上限低时更少)。
   超出时新连接立即收到 RST,不会卡住重试。
 - 信号的几种边界情况(50 ms 内连发两次 SIGTERM 等)见 [ARCHITECTURE 第 6 节](docs/architecture/lifecycle.md)。
 - **CentOS 7 真机**尚未验证，见上文。
@@ -407,7 +409,8 @@ crates/proxytun/       捕获侧与程序: 命名空间与 TUN、地址改写、
   tests/bench.rs       性能基准
 scripts/               build-static.sh 静态构建
 docs/                  ARCHITECTURE.md 技术架构索引(正文分篇在 architecture/), CONFIG.md 配置项说明,
-                       PERFORMANCE.md 性能测试, DESIGN.md 设计决策, CENTOS7.md CentOS 7 验证步骤
+                       PERFORMANCE.md 性能测试, DESIGN.md 设计决策, CENTOS7.md CentOS 7 验证步骤;
+                       英文版是同目录下的 *_en.md(README 的英文版是 docs/README_en.md)
 proxytun.toml          带注释的示例配置
 ```
 

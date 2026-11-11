@@ -1,5 +1,7 @@
 # proxytun 技术架构 · 3.0–3.2 核心流程
 
+**简体中文** · [English](flow_en.md)
+
 > [索引](../ARCHITECTURE.md) · [0 入门](primer.md) · [1–2 总览](overview.md) · **3.0–3.2 核心流程** · [3.3–3.6 流程细节](flow-details.md) · [4 模块](modules.md) · [5 运行模式与 sudo 助手](privilege.md) · [6 进程、信号与生命周期](lifecycle.md) · [7–8 负载均衡与运维](operations.md)
 
 ## 3. 核心流程
@@ -84,7 +86,7 @@ sequenceDiagram
   重新 exec 后的新映像里没有凭据，也恢复为 dumpable。
 - **为什么要等放行。** 程序 exec 之前,proxytun 必须已经在读 TUN、能 accept,否则程序的第一个包会无人处理。
 - 没有非特权 user namespace 时，第 2–5 步(建准备进程、建并配置命名空间、交回 fd)改由 sudo 启动的特权助手完成，
-  第 6–7 步(放行、exec)由助手 fork 出、已经降权的程序一侧完成，流程见[第 5 节](privilege.md)。以 root 运行时不建 user namespace。
+  第 6 步的放行仍由 proxytun 发出，接收它并在第 7 步 exec 的是助手 fork 出、已经降权的程序一侧，流程见[第 5 节](privilege.md)。以 root 运行时不建 user namespace。
 
 ### 3.2 一次 HTTPS 访问的完整时序
 

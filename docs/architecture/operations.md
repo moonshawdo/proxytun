@@ -1,5 +1,7 @@
 # proxytun 技术架构 · 7–8 负载均衡与运维
 
+**简体中文** · [English](operations_en.md)
+
 > [索引](../ARCHITECTURE.md) · [0 入门](primer.md) · [1–2 总览](overview.md) · [3.0–3.2 核心流程](flow.md) · [3.3–3.6 流程细节](flow-details.md) · [4 模块](modules.md) · [5 运行模式与 sudo 助手](privilege.md) · [6 进程、信号与生命周期](lifecycle.md) · **7–8 负载均衡与运维**
 
 ## 7. 选路、故障转移与健康检查
@@ -89,7 +91,7 @@ stateDiagram-v2
 |---|---|---|
 | proxytun 的打开文件数 | 启动程序后把软上限提到 min(硬上限, `fs.nr_open`);程序拿到的仍是原值 | 见下面两行 |
 | 同时中继的连接 | 8192;两个 fd 一条，先留出 64 + 主机端口数 + 256 + 32 个 fd(最多留一半),fd 上限低时更少(启动时 warn) | 新连接立即 RST(`relays_refused`),程序马上失败 |
-| 地址改写表 | 约 103 万条(含关闭后保留 75 秒的),持续约每秒 1.37 万条新连接;满表约 200–280 MB | 新连接的 SYN 立即 RST(ECONNREFUSED,`dropped_table_full`) |
+| 地址改写表 | 约 103 万条(含关闭后保留 75 秒的),持续约每秒 1.38 万条新连接;满表约 200–280 MB | 新连接的 SYN 立即 RST(ECONNREFUSED,`dropped_table_full`) |
 | 排队等 accept 的连接 | 30 秒 | 向程序发 RST |
 | 同时处理的 DNS 查询 | 1024 | 丢弃(`dropped_dns_busy`),解析器重试 |
 | 同时转发上游的 DNS 查询 | 256,每个最长 3 秒 | 丢弃，解析器重试 |

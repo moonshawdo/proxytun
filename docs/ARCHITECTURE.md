@@ -1,10 +1,12 @@
 # proxytun 技术架构
 
+**简体中文** · [English](ARCHITECTURE_en.md)
+
 > 面向使用者和后续研发人员。读完应当能回答：程序的一次连接从发出到抵达代理，中间经过了什么;每个模块负责什么;
 > 哪些设计是被内核或安全约束逼出来的，改动前要小心。
 >
 > **阅读顺序建议**:第一次接触网络命名空间、TUN 的读者先读[第 0 节](architecture/primer.md)和术语表;
-> 只想知道"数据怎么流"的读[第 1~3 节](architecture/overview.md);要改代码的再读[第 4~8 节](architecture/modules.md);
+> 只想知道"数据怎么流"的从[第 1 节](architecture/overview.md)读到第 3 节;要改代码的再从[第 4 节](architecture/modules.md)读到第 8 节;
 > 做部署或安全评估的读[第 5 节](architecture/privilege.md)。每项设计取舍的理由集中在 [DESIGN.md](DESIGN.md)。
 
 正文按章节分成下面几篇，每篇开头有同样的导航。为了让图表都能正常渲染，每篇最多三张图。

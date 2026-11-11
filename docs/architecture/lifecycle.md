@@ -1,5 +1,7 @@
 # proxytun 技术架构 · 6 进程、信号与生命周期
 
+**简体中文** · [English](lifecycle_en.md)
+
 > [索引](../ARCHITECTURE.md) · [0 入门](primer.md) · [1–2 总览](overview.md) · [3.0–3.2 核心流程](flow.md) · [3.3–3.6 流程细节](flow-details.md) · [4 模块](modules.md) · [5 运行模式与 sudo 助手](privilege.md) · **6 进程、信号与生命周期** · [7–8 负载均衡与运维](operations.md)
 
 ## 6. 进程、信号与生命周期
