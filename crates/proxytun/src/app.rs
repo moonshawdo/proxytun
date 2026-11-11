@@ -103,7 +103,7 @@ pub fn run(args: Args) -> Result<Exit> {
     );
     let proxy_override = take_proxy_override(args.proxy.as_deref());
     // Before any thread exists (see `signals::exit_signal_fd`).
-    let ignored = signals::ignored_signals(&[libc::SIGHUP, libc::SIGUSR1, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]);
+    let ignored = signals::ignored_signals(&[libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]);
     // The exit signals we take over: those the caller does not ignore (an
     // ignored one stays ignored, for the program too).
     let exit_sigs: Vec<libc::c_int> = [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM]
@@ -150,7 +150,7 @@ pub fn run(args: Args) -> Result<Exit> {
     let live = Arc::new(build_live(&cfg)?);
 
     // Orphans of the program's tree are re-parented to us, so we can wait for
-    // all of it (as proxyhook does).
+    // all of it.
     unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
     let setup = Setup {
         argv: args.argv.clone(),

@@ -2,8 +2,8 @@
 //! every process of a cgroup, as systemd does), so the program got it too, or
 //! to proxytun alone, so it must be passed on? Both arrive as SI_USER.
 //!
-//! proxyhook watched the program receive it through ptrace. Without ptrace we
-//! keep a witness: a tiny process in our process group that keeps the three
+//! proxytun does not trace the program, so it cannot see what the program
+//! receives. Instead we keep a witness: a tiny process in our process group that keeps the three
 //! signals blocked, so one sent to the group stays pending there, and tells
 //! us on its pipe (not through /proc, which `hidepid` may hide it from).
 //!

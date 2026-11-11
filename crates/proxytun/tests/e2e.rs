@@ -1051,7 +1051,7 @@ fn block_rules_and_a_dead_proxy_fail_closed() {
 }
 
 #[test]
-fn proxyhook_only_and_misspelt_config_keys_are_warned_about() {
+fn unknown_and_misspelt_config_keys_are_warned_about() {
     require!();
     let dir = tmp_dir("keys");
     let cfg = write_cfg(
@@ -1520,8 +1520,8 @@ fn a_group_signal_is_not_duplicated_however_the_program_takes_it() {
     let script = dir.join("sig.py");
     std::fs::write(&script, PY_SIGNAL).unwrap();
     for (sig, n) in [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)] {
-        // proxyhook could not avoid a duplicate for "sigwait" (nothing to see
-        // through ptrace); the witness sees every group signal.
+        // Both ways of taking a signal, a handler thread and sigwait: the
+        // witness sees every group signal, so neither gets a duplicate.
         for style in ["thread", "sigwait"] {
             let (code, out) = interrupt_run(&script, &[sig, style], |pgid| unsafe {
                 libc::kill(-pgid, n);
@@ -1739,7 +1739,7 @@ fn ctrl_c_stops_proxytun_once_the_main_program_has_exited() {
         Some(libc::SIGINT),
         "ended by the signal, as the program would have been\n{status:?}"
     );
-    // Unlike proxyhook, the tree is not killed (DESIGN.md 5): it keeps
+    // The tree is not killed with proxytun (DESIGN.md 5): it keeps
     // running, cut off from the network.
     assert!(alive(orphan), "the background child must survive proxytun");
 }

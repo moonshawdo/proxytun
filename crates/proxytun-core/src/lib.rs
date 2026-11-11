@@ -1,9 +1,10 @@
 //! proxytun-core: the proxy side of proxytun, independent of how traffic is
-//! captured. Copied from proxyhook (commit e0be192) and trimmed of everything
-//! tied to ptrace: `config`/`policy` (rules), `balancer`/`health` (upstream
-//! selection), `proxy` (SOCKS5/HTTP dialers), `live` (what each connection
-//! reads, swapped on reload), `net` (fake-ip pool and DNS answers, relay
-//! routing and copying), `sniff` (TLS SNI / HTTP Host).
+//! captured: it is handed accepted connections and DNS queries, and never sees
+//! the TUN device or the namespace. Modules: `config`/`policy` (rules),
+//! `balancer`/`health` (upstream selection), `proxy` (SOCKS5/HTTP dialers),
+//! `live` (what each connection reads, swapped on reload), `net` (fake-ip
+//! pool and DNS answers, relay routing and copying), `sniff` (TLS SNI /
+//! HTTP Host).
 
 pub mod balancer;
 pub mod config;

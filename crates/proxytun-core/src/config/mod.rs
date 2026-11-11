@@ -118,8 +118,8 @@ pub struct Config {
     #[serde(default)]
     pub rules: Vec<RuleCfg>,
 
-    /// Keys in the file that no field takes (typos, or proxyhook keys that mean
-    /// nothing here), e.g. `verify_peer_uid` or `proxies.0.usrname`. Not an
+    /// Keys in the file that no field takes (typos, or settings proxytun does
+    /// not have), e.g. `sniff_port` or `proxies.0.usrname`. Not an
     /// error: the caller warns about them.
     #[serde(skip)]
     pub ignored_keys: Vec<String>,
@@ -680,8 +680,8 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_reported_not_rejected() {
-        // A proxyhook.toml must load as is; its ptrace-only switches and any
-        // typo are named so the user learns they have no effect.
+        // Unknown keys do not stop a config from loading: each is named so the
+        // user learns it has no effect.
         let text = format!(
             "verify_peer_uid = true\nblock_quic = false\ndns_udp_unconnected = true\nsplice = true\nsnif = false\n{MINIMAL}usrname = \"u\"\n"
         );
